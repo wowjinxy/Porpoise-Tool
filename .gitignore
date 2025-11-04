@@ -1,0 +1,41 @@
+# Build artifacts
+bin/
+build/
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# Generated transpiler output (optional - may want to commit these)
+# Uncomment if you don't want to track generated .c/.h files
+# Test Asm/*.c
+# Test Asm/*.h
+
+# Editor/IDE files
+.vscode/
+.vs/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS files
+Thumbs.db
+desktop.ini
+
+# Backup files
+*.bak
+*.orig
+*.rej
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+

@@ -1,0 +1,51 @@
+# Porpoise Tool - Function Skip List Example
+# 
+# List functions to skip during transpilation (one per line)
+# Useful for SDK functions, system calls, and library functions
+# that you don't want to transpile.
+#
+# Lines starting with # are comments and will be ignored
+# Empty lines are also ignored
+
+# Common SDK Functions
+OSReport
+OSPanic
+__assert
+DCFlushRange
+DCInvalidateRange
+ICInvalidateRange
+
+# Memory functions
+memcpy
+memset
+memmove
+malloc
+free
+
+# String functions
+strlen
+strcmp
+strcpy
+strcat
+sprintf
+snprintf
+
+# Math functions  
+sqrt
+sin
+cos
+tan
+pow
+
+# GameCube/Wii SDK
+GXSetVtxDesc
+GXSetVtxAttrFmt
+GXBegin
+GXEnd
+GXPosition3f32
+GXColor4u8
+GXTexCoord2f32
+
+# Add your game-specific functions below:
+# ...
+
