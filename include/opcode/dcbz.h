@@ -34,10 +34,11 @@ static inline bool decode_dcbz(uint32_t inst, DCBZ_Instruction *d) {
 
 static inline int transpile_dcbz(const DCBZ_Instruction *d, char *o, size_t s) {
     // Clear 32 bytes at EA (typical cache line size)
+    // Use inline loop instead of memset to avoid compiler intrinsic conflicts
     if (d->rA == 0) {
-        return snprintf(o, s, "memset(mem + (r%u & ~0x1F), 0, 32);", d->rB);
+        return snprintf(o, s, "{ uint32_t addr = r%u & ~0x1F; for (int i = 0; i < 32; i++) mem[addr + i] = 0; }", d->rB);
     }
-    return snprintf(o, s, "memset(mem + ((r%u + r%u) & ~0x1F), 0, 32);", d->rA, d->rB);
+    return snprintf(o, s, "{ uint32_t addr = (r%u + r%u) & ~0x1F; for (int i = 0; i < 32; i++) mem[addr + i] = 0; }", d->rA, d->rB);
 }
 
 static inline int comment_dcbz(const DCBZ_Instruction *d, char *o, size_t s) {

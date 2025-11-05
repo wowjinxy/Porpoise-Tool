@@ -52,6 +52,7 @@ static inline bool is_reserved_name(const char *name) {
         "__va_copy",     // Variable argument copy
         "__builtin",     // GCC builtins (prefix check)
         // Standard C library functions that conflict with declarations
+        "main",          // Program entry point (reserved)
         "printf",        // stdio.h
         "fprintf",       // stdio.h
         "sprintf",       // stdio.h
@@ -86,6 +87,8 @@ static inline bool is_reserved_name(const char *name) {
         "strtod",        // stdlib.h
         "strtol",        // stdlib.h
         "strtoul",       // stdlib.h
+        "rand",          // stdlib.h - random number
+        "srand",         // stdlib.h - seed random
         "memcpy",        // string.h
         "memmove",       // string.h
         "memset",        // string.h
@@ -177,6 +180,7 @@ typedef struct {
     char original[MAX_LINE_LENGTH]; // Original line
     bool is_label;              // Is this a label line?
     bool is_function;           // Is this a function start?
+    bool is_local_function;     // Is this a local/static function?
     bool is_data;               // Is this data section?
     bool is_comment;            // Is this a comment?
     bool is_directive;          // Is this an assembler directive?
@@ -196,10 +200,20 @@ typedef struct {
     uint32_t end_address;
     uint32_t size;
     bool is_global;
+    bool is_local;              // Is this a local/static function?
     bool skip;                  // Skip transpiling this function
     int instruction_count;      // Number of instructions in function
     bool is_trampoline;         // Is this a trampoline (single branch)?
     uint32_t trampoline_target; // Target address for trampoline
+    bool returns_value;         // Does this function return a value in r3?
+    
+    // Parameter detection
+    bool has_params;            // Does this function have parameters?
+    bool param_r3, param_r4, param_r5, param_r6;
+    bool param_r7, param_r8, param_r9, param_r10;
+    bool param_f1, param_f2;    // Float parameters (first 2 for now)
+    int num_int_params;         // Number of integer parameters
+    int num_float_params;       // Number of float parameters
 } Function_Info;
 
 /**
@@ -389,10 +403,11 @@ static inline LabelMap* build_label_map(const char *filename) {
         if (parsed.is_label && in_function && current_function[0] != '\0') {
             // Extract address from label name (e.g., L_8043D430 -> 0x8043D430)
             const char *label = parsed.label_name;
-            // Label name has '.' already stripped by parser, so check for L_ or lbl_
+            uint32_t addr = 0;
+            
+            // Check for L_ or lbl_ pattern labels
             if ((label[0] == 'L' && label[1] == '_') || 
                 (strncmp(label, "lbl_", 4) == 0)) {
-                uint32_t addr = 0;
                 // Try L_XXXXXXXX format
                 if (label[0] == 'L' && label[1] == '_') {
                     sscanf(label + 2, "%x", &addr);
@@ -401,9 +416,18 @@ static inline LabelMap* build_label_map(const char *filename) {
                 else if (strncmp(label, "lbl_", 4) == 0) {
                     sscanf(label + 4, "%x", &addr);
                 }
-                if (addr != 0) {
-                    labelmap_add(map, addr, current_function);
+            }
+            // Check for .sym named labels (e.g., GXPerf_80341E40)
+            else {
+                // Extract address from symbolic name (format: Name_HEXADDR)
+                const char *underscore = strrchr(label, '_');
+                if (underscore) {
+                    sscanf(underscore + 1, "%x", &addr);
                 }
+            }
+            
+            if (addr != 0) {
+                labelmap_add(map, addr, current_function);
             }
         }
     }
@@ -465,10 +489,35 @@ static inline bool parse_asm_line(const char *line, ASM_Line *parsed) {
     // Check for .fn (function start)
     if (strncmp(p, ".fn", 3) == 0) {
         parsed->is_function = true;
+        parsed->is_local_function = false;  // Default to global
+        
         // Extract function name
         p += 3;
         while (*p && isspace(*p)) p++;
         sscanf(p, "%127[^, \t\n]", parsed->function_name);
+        
+        // Check for ", local" or ", global" modifier
+        const char *comma = strchr(p, ',');
+        if (comma) {
+            comma++;
+            while (*comma && isspace(*comma)) comma++;
+            if (strncmp(comma, "local", 5) == 0) {
+                parsed->is_local_function = true;
+                // Debug: Uncomment to verify local function detection
+                fprintf(stderr, "[DEBUG] Detected local function: %s\n", parsed->function_name);
+            }
+        }
+        return true;
+    }
+    
+    // Check for .sym (symbol/label within a function - like .sym GXPerf_80341E40, global)
+    if (strncmp(p, ".sym", 4) == 0) {
+        parsed->is_label = true;
+        
+        // Extract label name
+        p += 4;
+        while (*p && isspace(*p)) p++;
+        sscanf(p, "%127[^, \t\n]", parsed->label_name);
         return true;
     }
     
@@ -645,12 +694,63 @@ static inline void write_header_end(FILE *h_file) {
  * @brief Write function declaration to header
  */
 static inline void write_function_declaration(FILE *h_file, const Function_Info *func) {
+    // Don't declare local/static functions in the header - they're file-private
+    if (func->is_local) {
+        return;
+    }
+    
+    // Skip standard library intrinsic functions - these are provided by the compiler
+    const char *intrinsics[] = {
+        "memset", "memcpy", "memmove", "memcmp",
+        "strcmp", "strcpy", "strncpy", "strlen", "strncmp",
+        "sprintf", "printf", "vprintf", "vsnprintf",
+        "fwrite", "fread", "fopen", "fclose", "ftell", "fseek",
+        "wcstombs", "mbstowcs",
+        "strtoul", "strtol", "atoi", "atof",
+        "sqrt", "round",
+        "malloc", "free", "calloc", "realloc",
+        "rand", "srand",
+        "main",  // Don't redeclare main - it's special
+        NULL
+    };
+    
+    for (int i = 0; intrinsics[i] != NULL; i++) {
+        if (strcmp(func->name, intrinsics[i]) == 0) {
+            return;  // Skip this function
+        }
+    }
+    
+    // Also skip functions ending with "_impl" - these are our wrapper implementations
+    size_t name_len = strlen(func->name);
+    if (name_len > 5 && strcmp(func->name + name_len - 5, "_impl") == 0) {
+        return;  // Skip implementation wrappers
+    }
+    
     if (func->skip) {
         fprintf(h_file, "// Skipped: ");
     }
     
-    fprintf(h_file, "void %s(void);  // 0x%08X (size: 0x%X)\n",
-            func->name, func->start_address, func->size);
+    const char *return_type = func->returns_value ? "uint32_t" : "void";
+    fprintf(h_file, "%s %s(", return_type, func->name);
+    
+    // Generate parameter list
+    if (!func->has_params) {
+        fprintf(h_file, "void");
+    } else {
+        int param_idx = 0;
+        for (int i = 0; i < func->num_int_params; i++) {
+            if (param_idx > 0) fprintf(h_file, ", ");
+            fprintf(h_file, "uint32_t param_r%d", 3 + i);
+            param_idx++;
+        }
+        for (int i = 0; i < func->num_float_params; i++) {
+            if (param_idx > 0) fprintf(h_file, ", ");
+            fprintf(h_file, "double param_f%d", 1 + i);
+            param_idx++;
+        }
+    }
+    
+    fprintf(h_file, ");  // 0x%08X (size: 0x%X)\n", func->start_address, func->size);
 }
 
 //==============================================================================
@@ -695,8 +795,53 @@ static inline void write_function_start(FILE *c_file, const Function_Info *func)
     fprintf(c_file, "\n");
     fprintf(c_file, " * Address: 0x%08X\n", func->start_address);
     fprintf(c_file, " * Size: 0x%X (%u bytes)\n", func->size, func->size);
+    if (func->is_local) {
+        fprintf(c_file, " * Scope: static (local to this file)\n");
+    }
+    if (func->has_params) {
+        fprintf(c_file, " * Parameters: %d int", func->num_int_params);
+        if (func->num_float_params > 0) {
+            fprintf(c_file, ", %d float", func->num_float_params);
+        }
+        fprintf(c_file, "\n");
+    }
     fprintf(c_file, " */\n");
-    fprintf(c_file, "void %s(void) {\n", func_name);
+    
+    // Add "static" keyword for local functions
+    const char *return_type = func->returns_value ? "uint32_t" : "void";
+    fprintf(c_file, "%s%s %s(", func->is_local ? "static " : "", return_type, func_name);
+    
+    // Generate parameter list
+    if (!func->has_params) {
+        fprintf(c_file, "void");
+    } else {
+        int param_idx = 0;
+        for (int i = 0; i < func->num_int_params; i++) {
+            if (param_idx > 0) fprintf(c_file, ", ");
+            fprintf(c_file, "uint32_t param_r%d", 3 + i);
+            param_idx++;
+        }
+        for (int i = 0; i < func->num_float_params; i++) {
+            if (param_idx > 0) fprintf(c_file, ", ");
+            fprintf(c_file, "double param_f%d", 1 + i);
+            param_idx++;
+        }
+    }
+    
+    fprintf(c_file, ") {\n");
+    
+    // Generate parameter marshaling code (move C params to register globals)
+    if (func->has_params) {
+        fprintf(c_file, "    // Parameter marshaling\n");
+        // Only marshal the consecutive parameters that were actually detected
+        for (int i = 0; i < func->num_int_params; i++) {
+            fprintf(c_file, "    r%d = param_r%d;\n", 3 + i, 3 + i);
+        }
+        for (int i = 0; i < func->num_float_params; i++) {
+            fprintf(c_file, "    f%d = param_f%d;\n", 1 + i, 1 + i);
+        }
+        fprintf(c_file, "\n");
+    }
 }
 
 /**
@@ -735,6 +880,192 @@ static inline void write_data_section(FILE *c_file, const char *name,
     }
     
     fprintf(c_file, "};\n\n");
+}
+
+//==============================================================================
+// FUNCTION ANALYSIS
+//==============================================================================
+
+/**
+ * @brief Analyze function to detect parameters by checking which registers are read before written
+ * @param input_file File handle positioned at function start
+ * @param func Function info to populate with parameter information
+ */
+static inline void analyze_function_params(FILE *input_file, Function_Info *func) {
+    long original_pos = ftell(input_file);
+    char line[MAX_LINE_LENGTH];
+    
+    // Track which registers have been written to
+    bool written_r3 = false, written_r4 = false, written_r5 = false, written_r6 = false;
+    bool written_r7 = false, written_r8 = false, written_r9 = false, written_r10 = false;
+    bool written_f1 = false, written_f2 = false;
+    
+    // Track which registers are read before written (those are parameters)
+    func->param_r3 = false; func->param_r4 = false; func->param_r5 = false; func->param_r6 = false;
+    func->param_r7 = false; func->param_r8 = false; func->param_r9 = false; func->param_r10 = false;
+    func->param_f1 = false; func->param_f2 = false;
+    
+    int lines_checked = 0;
+    const int MAX_LINES = 50; // Only check first 50 lines of function
+    
+    while (fgets(line, sizeof(line), input_file) && lines_checked++ < MAX_LINES) {
+        // Stop at end of function
+        if (strstr(line, ".endfn") || strstr(line, ".fn ")) break;
+        
+        // Check for reads of r3-r10 BEFORE they are written
+        // Patterns: "mr rX, r3", "addi rX, r3", "lwz rX, offset(r3)", etc.
+        if (!written_r3 && (strstr(line, ", r3") || strstr(line, "(r3)") || strstr(line, "r3,") || strstr(line, "r3;") || strstr(line, "r3 +"))) {
+            // Check it's not a write like "r3 = " or "mr r3,"
+            if (!strstr(line, "r3 = ") && !strstr(line, "mr r3,") && !strstr(line, "li r3,") && 
+                !strstr(line, "addi r3,") && !strstr(line, "lwz r3,") && !strstr(line, "lhz r3,")) {
+                func->param_r3 = true;
+            }
+        }
+        if (!written_r4 && (strstr(line, ", r4") || strstr(line, "(r4)") || strstr(line, "r4,") || strstr(line, "r4;") || strstr(line, "r4 +"))) {
+            if (!strstr(line, "r4 = ") && !strstr(line, "mr r4,") && !strstr(line, "li r4,") && 
+                !strstr(line, "addi r4,") && !strstr(line, "lwz r4,")) {
+                func->param_r4 = true;
+            }
+        }
+        if (!written_r5 && (strstr(line, ", r5") || strstr(line, "(r5)") || strstr(line, "r5,") || strstr(line, "r5;") || strstr(line, "r5 +"))) {
+            if (!strstr(line, "r5 = ") && !strstr(line, "mr r5,") && !strstr(line, "li r5,") && 
+                !strstr(line, "addi r5,") && !strstr(line, "lwz r5,")) {
+                func->param_r5 = true;
+            }
+        }
+        if (!written_r6 && (strstr(line, ", r6") || strstr(line, "(r6)") || strstr(line, "r6,") || strstr(line, "r6;") || strstr(line, "r6 +"))) {
+            if (!strstr(line, "r6 = ") && !strstr(line, "mr r6,") && !strstr(line, "li r6,") && 
+                !strstr(line, "addi r6,") && !strstr(line, "lwz r6,")) {
+                func->param_r6 = true;
+            }
+        }
+        if (!written_r7 && (strstr(line, ", r7") || strstr(line, "(r7)") || strstr(line, "r7,") || strstr(line, "r7;") || strstr(line, "r7 +"))) {
+            if (!strstr(line, "r7 = ") && !strstr(line, "mr r7,") && !strstr(line, "li r7,")) {
+                func->param_r7 = true;
+            }
+        }
+        if (!written_r8 && (strstr(line, ", r8") || strstr(line, "(r8)") || strstr(line, "r8,") || strstr(line, "r8;") || strstr(line, "r8 +"))) {
+            if (!strstr(line, "r8 = ") && !strstr(line, "mr r8,") && !strstr(line, "li r8,")) {
+                func->param_r8 = true;
+            }
+        }
+        if (!written_r9 && (strstr(line, ", r9") || strstr(line, "(r9)") || strstr(line, "r9,") || strstr(line, "r9;") || strstr(line, "r9 +"))) {
+            if (!strstr(line, "r9 = ") && !strstr(line, "mr r9,") && !strstr(line, "li r9,")) {
+                func->param_r9 = true;
+            }
+        }
+        if (!written_r10 && (strstr(line, ", r10") || strstr(line, "(r10)") || strstr(line, "r10,") || strstr(line, "r10;") || strstr(line, "r10 +"))) {
+            if (!strstr(line, "r10 = ") && !strstr(line, "mr r10,") && !strstr(line, "li r10,")) {
+                func->param_r10 = true;
+            }
+        }
+        
+        // Check for float parameter usage
+        if (!written_f1 && (strstr(line, ", f1") || strstr(line, "f1,") || strstr(line, "f1;") || strstr(line, "f1)"))) {
+            if (!strstr(line, "f1 = ") && !strstr(line, "lfs f1,") && !strstr(line, "lfd f1,")) {
+                func->param_f1 = true;
+            }
+        }
+        if (!written_f2 && (strstr(line, ", f2") || strstr(line, "f2,") || strstr(line, "f2;") || strstr(line, "f2)"))) {
+            if (!strstr(line, "f2 = ") && !strstr(line, "lfs f2,") && !strstr(line, "lfd f2,")) {
+                func->param_f2 = true;
+            }
+        }
+        
+        // Mark registers as written
+        if (strstr(line, "r3 = ") || strstr(line, "mr r3,") || strstr(line, "li r3,") || strstr(line, "addi r3,") || strstr(line, "lwz r3,")) written_r3 = true;
+        if (strstr(line, "r4 = ") || strstr(line, "mr r4,") || strstr(line, "li r4,") || strstr(line, "addi r4,") || strstr(line, "lwz r4,")) written_r4 = true;
+        if (strstr(line, "r5 = ") || strstr(line, "mr r5,") || strstr(line, "li r5,") || strstr(line, "addi r5,") || strstr(line, "lwz r5,")) written_r5 = true;
+        if (strstr(line, "r6 = ") || strstr(line, "mr r6,") || strstr(line, "li r6,") || strstr(line, "addi r6,") || strstr(line, "lwz r6,")) written_r6 = true;
+        if (strstr(line, "r7 = ") || strstr(line, "mr r7,") || strstr(line, "li r7,")) written_r7 = true;
+        if (strstr(line, "r8 = ") || strstr(line, "mr r8,") || strstr(line, "li r8,")) written_r8 = true;
+        if (strstr(line, "r9 = ") || strstr(line, "mr r9,") || strstr(line, "li r9,")) written_r9 = true;
+        if (strstr(line, "r10 = ") || strstr(line, "mr r10,") || strstr(line, "li r10,")) written_r10 = true;
+        if (strstr(line, "f1 = ") || strstr(line, "lfs f1,") || strstr(line, "lfd f1,")) written_f1 = true;
+        if (strstr(line, "f2 = ") || strstr(line, "lfs f2,") || strstr(line, "lfd f2,")) written_f2 = true;
+    }
+    
+    // Count parameters (must be consecutive from r3)
+    func->num_int_params = 0;
+    if (func->param_r3) func->num_int_params = 1;
+    if (func->param_r4 && func->num_int_params >= 1) func->num_int_params = 2;
+    if (func->param_r5 && func->num_int_params >= 2) func->num_int_params = 3;
+    if (func->param_r6 && func->num_int_params >= 3) func->num_int_params = 4;
+    if (func->param_r7 && func->num_int_params >= 4) func->num_int_params = 5;
+    if (func->param_r8 && func->num_int_params >= 5) func->num_int_params = 6;
+    if (func->param_r9 && func->num_int_params >= 6) func->num_int_params = 7;
+    if (func->param_r10 && func->num_int_params >= 7) func->num_int_params = 8;
+    
+    func->num_float_params = 0;
+    if (func->param_f1) func->num_float_params = 1;
+    if (func->param_f2 && func->num_float_params >= 1) func->num_float_params = 2;
+    
+    func->has_params = (func->num_int_params > 0 || func->num_float_params > 0);
+    
+    fseek(input_file, original_pos, SEEK_SET);
+}
+
+/**
+ * @brief Detect if a function returns a value by analyzing if r3 is set before blr
+ * @param input_file File handle positioned at function start
+ * @param func Function info
+ * @return true if function appears to return a value in r3
+ */
+static inline bool detect_function_returns_value(FILE *input_file, const Function_Info *func) {
+    long original_pos = ftell(input_file);
+    char line[MAX_LINE_LENGTH];
+    int lines_checked = 0;
+    const int MAX_LINES_TO_CHECK = 500; // Check up to 500 lines
+    
+    // Track all return points
+    int lines_since_r3_set = 999; // Distance from last r3 assignment
+    bool found_return_with_r3 = false;
+    
+    // Scan through the function looking for r3 assignments close to blr
+    while (fgets(line, sizeof(line), input_file) && lines_checked < MAX_LINES_TO_CHECK) {
+        lines_checked++;
+        
+        // Check if we've hit the end of the function
+        if (strstr(line, ".endfn") != NULL || strstr(line, ".fn ") != NULL) {
+            break;
+        }
+        
+        ASM_Line parsed;
+        if (!parse_asm_line(line, &parsed)) continue;
+        
+        // Check for r3 being set (destination register)
+        if (strstr(line, "r3 = ") != NULL || 
+            strstr(line, "mr r3,") != NULL ||
+            strstr(line, "li r3,") != NULL ||
+            strstr(line, "addi r3,") != NULL ||
+            strstr(line, "lwz r3,") != NULL ||
+            strstr(line, "lhz r3,") != NULL ||
+            strstr(line, "lbz r3,") != NULL ||
+            strstr(line, "rlwinm r3,") != NULL ||
+            strstr(line, "xori r3,") != NULL ||
+            strstr(line, "ori r3,") != NULL ||
+            strstr(line, "andi r3,") != NULL ||
+            strstr(line, "add r3,") != NULL ||
+            strstr(line, "sub r3,") != NULL ||
+            strstr(line, "mullw r3,") != NULL ||
+            strstr(line, "and r3,") != NULL ||
+            strstr(line, "or r3,") != NULL ||
+            strstr(line, "xor r3,") != NULL ||
+            strstr(line, "slwi r3,") != NULL ||
+            strstr(line, "srwi r3,") != NULL) {
+            lines_since_r3_set = 0;  // Reset counter
+        } else {
+            lines_since_r3_set++;
+        }
+        
+        // If we find blr/return within 3 lines of r3 being set, it's likely a return value
+        if ((strstr(line, "blr") != NULL || strstr(line, "return") != NULL) && lines_since_r3_set <= 3) {
+            found_return_with_r3 = true;
+        }
+    }
+    
+    fseek(input_file, original_pos, SEEK_SET);
+    return found_return_with_r3;
 }
 
 //==============================================================================

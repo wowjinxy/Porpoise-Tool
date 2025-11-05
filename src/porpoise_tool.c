@@ -20,17 +20,23 @@
 bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t address,
                         char *output, size_t output_size,
                         char *comment, size_t comment_size,
-                        const char **prev_lines, int num_prev_lines) {
+                        const char **prev_lines, int num_prev_lines,
+                        const Function_Info *func_context,
+                        const LabelMap *label_map) {
     // Handle blr (branch to link register = return)
     if (strcmp(mnemonic, "blr") == 0) {
-        snprintf(output, output_size, "return;");
+        if (func_context && func_context->returns_value) {
+            snprintf(output, output_size, "return r3;");
+        } else {
+            snprintf(output, output_size, "return;");
+        }
         snprintf(comment, comment_size, "blr");
         return true;
     }
     
     // Handle blrl (branch to link register and link) 
     if (strcmp(mnemonic, "blrl") == 0) {
-        snprintf(output, output_size, "((void (*)(void))lr)();");
+        snprintf(output, output_size, "((void (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double))lr)(r3, r4, r5, r6, r7, r8, r9, r10, f1, f2);");
         snprintf(comment, comment_size, "blrl - indirect call via lr");
         return true;
     }
@@ -76,7 +82,7 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
     
     // Handle bctrl (branch to count register and link)
     if (strcmp(mnemonic, "bctrl") == 0) {
-        snprintf(output, output_size, "lr = 0x%08X; ((void (*)(void))ctr)();", address + 4);
+        snprintf(output, output_size, "lr = 0x%08X; ((void (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double))ctr)(r3, r4, r5, r6, r7, r8, r9, r10, f1, f2);", address + 4);
         snprintf(comment, comment_size, "bctrl - indirect call via ctr");
         return true;
     }
@@ -93,7 +99,7 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
             uint32_t addr;
             sscanf(target, "%x", &addr);
             if (strcmp(mnemonic, "bla") == 0 || strcmp(mnemonic, "bl") == 0) {
-                snprintf(output, output_size, "lr = 0x%08X; ((void (*)(void))0x%08X)();  /* call absolute */", address + 4, addr);
+                snprintf(output, output_size, "lr = 0x%08X; ((void (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double))0x%08X)(r3, r4, r5, r6, r7, r8, r9, r10, f1, f2);  /* call absolute */", address + 4, addr);
             } else {
                 snprintf(output, output_size, "pc = 0x%08X;  /* branch absolute */", addr);
             }
@@ -122,18 +128,46 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
                 snprintf(output, output_size, "goto %s;  /* May be cross-function */", label_name);
             }
         } else {
-            // It's a function name (external or other file)
-            // Both b and bl should be function calls for external symbols
-            // Sanitize function name to avoid conflicts with compiler intrinsics
-            char sanitized_name[MAX_FUNCTION_NAME];
-            const char *func_name = sanitize_function_name(target, sanitized_name, sizeof(sanitized_name));
+            // Check if it's a label within the current function (from .sym directives)
+            // Extract address from symbolic name like "GXPerf_80341E40" -> 0x80341E40
+            bool is_local_label = false;
+            uint32_t target_addr = 0;
             
-            // Note: All functions use emulated registers (r3, r4, etc.) so no C parameters needed
-            if (strcmp(mnemonic, "bl") == 0 || strcmp(mnemonic, "bla") == 0) {
-                snprintf(output, output_size, "%s();", func_name);
+            // Try to extract address from name (format: Name_HEXADDR)
+            const char *underscore = strrchr(target, '_');
+            if (underscore) {
+                sscanf(underscore + 1, "%x", &target_addr);
+                
+                // Check if this address is in the current function's label map
+                if (label_map && func_context && target_addr != 0) {
+                    const char *mapped_func = labelmap_find_function(label_map, target_addr);
+                    if (mapped_func && strcmp(mapped_func, func_context->name) == 0) {
+                        is_local_label = true;
+                    }
+                }
+            }
+            
+            if (is_local_label) {
+                // It's a label within the current function - use goto
+                if (strcmp(mnemonic, "bl") == 0 || strcmp(mnemonic, "bla") == 0) {
+                    snprintf(output, output_size, "lr = 0x%08X; goto %s;", address + 4, target);
+                } else {
+                    snprintf(output, output_size, "goto %s;", target);
+                }
             } else {
-                // Tail call optimization (branch without link)
-                snprintf(output, output_size, "return %s();  /* Tail call */", func_name);
+                // It's a function name (external or other file)
+                // Both b and bl should be function calls for external symbols
+                // Sanitize function name to avoid conflicts with compiler intrinsics
+                char sanitized_name[MAX_FUNCTION_NAME];
+                const char *func_name = sanitize_function_name(target, sanitized_name, sizeof(sanitized_name));
+                
+                // Pass all potential parameter registers to match detected parameter signatures
+                if (strcmp(mnemonic, "bl") == 0 || strcmp(mnemonic, "bla") == 0) {
+                    snprintf(output, output_size, "%s(r3, r4, r5, r6, r7, r8, r9, r10, f1, f2);", func_name);
+                } else {
+                    // Tail call optimization (branch without link)
+                    snprintf(output, output_size, "return %s(r3, r4, r5, r6, r7, r8, r9, r10, f1, f2);  /* Tail call */", func_name);
+                }
             }
         }
         snprintf(comment, comment_size, "%s %s", mnemonic, target);
@@ -200,7 +234,52 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
                 snprintf(output, output_size, "if (1 /* unknown condition */) goto %s;", label_name);
             }
         } else {
-            snprintf(output, output_size, "%s();  /* conditional call */", target);
+            // Check if it's a label within the current function (from .sym directives)
+            // Extract address from symbolic name like "GXPerf_80341E40" -> 0x80341E40
+            bool is_local_label = false;
+            uint32_t target_addr = 0;
+            
+            // Try to extract address from name (format: Name_HEXADDR)
+            const char *underscore = strrchr(target, '_');
+            if (underscore) {
+                sscanf(underscore + 1, "%x", &target_addr);
+                
+                // Check if this address is in the current function's label map
+                if (label_map && func_context && target_addr != 0) {
+                    const char *mapped_func = labelmap_find_function(label_map, target_addr);
+                    if (mapped_func && strcmp(mapped_func, func_context->name) == 0) {
+                        is_local_label = true;
+                    }
+                }
+            }
+            
+            if (is_local_label) {
+                // It's a label within current function - use conditional goto
+                if (strcmp(clean_mnemonic, "bgt") == 0) {
+                    snprintf(output, output_size, "if (%s & 0x4) goto %s;", cr_field, target);
+                }
+                else if (strcmp(clean_mnemonic, "blt") == 0) {
+                    snprintf(output, output_size, "if (%s & 0x8) goto %s;", cr_field, target);
+                }
+                else if (strcmp(clean_mnemonic, "beq") == 0) {
+                    snprintf(output, output_size, "if (%s & 0x2) goto %s;", cr_field, target);
+                }
+                else if (strcmp(clean_mnemonic, "bne") == 0) {
+                    snprintf(output, output_size, "if (!(%s & 0x2)) goto %s;", cr_field, target);
+                }
+                else if (strcmp(clean_mnemonic, "ble") == 0) {
+                    snprintf(output, output_size, "if (%s & 0xA) goto %s;", cr_field, target);
+                }
+                else if (strcmp(clean_mnemonic, "bge") == 0) {
+                    snprintf(output, output_size, "if (!(%s & 0x8)) goto %s;", cr_field, target);
+                }
+                else {
+                    snprintf(output, output_size, "if (1 /* unknown condition: %s */) goto %s;", clean_mnemonic, target);
+                }
+            } else {
+                // It's a function name - conditional function call
+                snprintf(output, output_size, "%s(r3, r4, r5, r6, r7, r8, r9, r10, f1, f2);  /* conditional call */", target);
+            }
         }
         snprintf(comment, comment_size, "%s %s", mnemonic, operands);
         return true;
@@ -1679,9 +1758,13 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
     char *dot = strchr(guard_name, '.');
     if (dot) *dot = '\0';
     
-    // Convert to uppercase for guard
+    // Convert to uppercase for guard and replace special chars with underscore
     for (char *p = guard_name; *p; p++) {
-        *p = toupper(*p);
+        if (*p == '.' || *p == '-' || *p == ' ' || *p == '(' || *p == ')') {
+            *p = '_';
+        } else {
+            *p = toupper(*p);
+        }
     }
     
     // Write file headers
@@ -1769,6 +1852,7 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
             current_func.instruction_count = 0;
             current_func.is_trampoline = false;
             current_func.trampoline_target = 0;
+            current_func.is_local = parsed.is_local_function;  // Track if static
             
             // Auto-skip gap functions (usually data misidentified as code)
             if (strncmp(current_func.name, "gap_", 4) == 0) {
@@ -1777,15 +1861,22 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
                 current_func.skip = skiplist_should_skip(skip_list, current_func.name);
             }
             
-            // Write to header with sanitized name
+            // All functions accept all potential parameters (r3-r10, f1-f2) for simplicity
+            // This avoids the need to scan ahead in the file which can hang
             if (!current_func.skip) {
-                char sanitized_name[MAX_FUNCTION_NAME];
-                const char *func_name = sanitize_function_name(current_func.name, sanitized_name, sizeof(sanitized_name));
-                
-                // Use () instead of (void) to allow flexible parameter passing
-                // Functions communicate through emulated registers (r3, r4, etc.)
-                fprintf(h_file, "void %s();  // Uses emulated register state\n", func_name);
-                
+                current_func.has_params = true;
+                current_func.num_int_params = 8;  // r3-r10
+                current_func.num_float_params = 2; // f1-f2
+                current_func.returns_value = false; // Default to void, will be detected later
+            }
+            
+            // Write to header with sanitized name (skip local/static functions)
+            if (!current_func.skip && !current_func.is_local) {
+                // Write function declaration to header (with detected parameters)
+                write_function_declaration(h_file, &current_func);
+            }
+            
+            if (!current_func.skip) {
                 in_function = true;
             } else {
                 // For skipped functions, don't set in_function to prevent closing brace
@@ -1829,6 +1920,7 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
                         continue;
                     }
                     
+                    // Parameters already detected earlier, just write function start
                     write_function_start(c_file, &current_func);
                 }
                 
@@ -1840,7 +1932,8 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
                 bool success = transpile_from_asm(parsed.mnemonic, parsed.operands, parsed.address,
                                                   c_code, sizeof(c_code),
                                                   asm_comment, sizeof(asm_comment),
-                                                  prev_lines, lines_buffered);
+                                                  prev_lines, lines_buffered,
+                                                  &current_func, label_map);
                 
                 // Fall back to byte-based decoding
                 if (!success) {
@@ -1850,6 +1943,38 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
                 }
                 
                 if (success) {
+                    // Check for backward jumps to labels (potential loop or misidentified function boundary)
+                    if (strstr(c_code, "goto L_") != NULL || strstr(c_code, "goto lbl_") != NULL) {
+                        char *goto_pos = strstr(c_code, "goto ");
+                        if (goto_pos) {
+                            char *addr_start = goto_pos + 5; // Skip "goto "
+                            while (*addr_start == ' ') addr_start++;
+                            uint32_t target_addr = 0;
+                            if (strncmp(addr_start, "L_", 2) == 0) {
+                                sscanf(addr_start + 2, "%x", &target_addr);
+                            } else if (strncmp(addr_start, "lbl_", 4) == 0) {
+                                sscanf(addr_start + 4, "%x", &target_addr);
+                            }
+                            
+                            // Check if this is a backward jump (target address < current address)
+                            if (target_addr != 0 && target_addr < parsed.address) {
+                                // Check if target is before this function started (cross-function backward jump)
+                                if (target_addr < current_func.start_address) {
+                                    fprintf(stderr, "\n");
+                                    fprintf(stderr, "WARNING: Backward jump detected across function boundary!\n");
+                                    fprintf(stderr, "  Function: %s (starts at 0x%08X)\n", 
+                                           current_func.name, current_func.start_address);
+                                    fprintf(stderr, "  Jump from: 0x%08X\n", parsed.address);
+                                    fprintf(stderr, "  Jump to: L_%08X (before function start)\n", target_addr);
+                                    fprintf(stderr, "  This usually means the function boundaries are wrong.\n");
+                                    fprintf(stderr, "  The function at 0x%08X may need to be merged with the previous function.\n",
+                                           current_func.start_address);
+                                    fprintf(stderr, "\n");
+                                }
+                            }
+                        }
+                    }
+                    
                     // Detect trampoline: single branch instruction to a label
                     bool is_trampoline_branch = false;
                     uint32_t trampoline_target = 0;
@@ -1930,7 +2055,7 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
  * @brief Transpile a single .s file directly to project folders
  */
 int transpile_file_to_project(const char *input_filename, const char *src_dir, 
-                               const char *inc_dir, SkipList *skip_list) {
+                               const char *inc_dir, const char *rel_path, SkipList *skip_list) {
     // Build label-to-function map for trampoline resolution
     LabelMap *label_map = build_label_map(input_filename);
     
@@ -1973,8 +2098,11 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
     char guard_name[128];
     snprintf(guard_name, sizeof(guard_name), "%s_H", base_name);
     for (char *p = guard_name; *p; p++) {
-        if (*p == '-' || *p == ' ') *p = '_';
-        *p = (*p >= 'a' && *p <= 'z') ? (*p - 32) : *p;
+        if (*p == '-' || *p == ' ' || *p == '.' || *p == '(' || *p == ')') {
+            *p = '_';
+        } else if (*p >= 'a' && *p <= 'z') {
+            *p = *p - 32;  // Convert to uppercase
+        }
     }
     
     // Write header file boilerplate
@@ -1982,9 +2110,29 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
     fprintf(h_file, "#define %s\n\n", guard_name);
     
     // Write C file boilerplate
-    fprintf(c_file, "#include \"%s.h\"\n", base_name);
+    if (rel_path && rel_path[0]) {
+        fprintf(c_file, "#include \"%s/%s.h\"\n", rel_path, base_name);
+    } else {
+        fprintf(c_file, "#include \"%s.h\"\n", base_name);
+    }
     fprintf(c_file, "#include \"powerpc_state.h\"\n");
     fprintf(c_file, "#include \"all_functions.h\"  // For cross-file function calls\n\n");
+    
+    // First pass: collect all local (static) functions for forward declarations
+    fprintf(c_file, "// Forward declarations for local (static) functions\n");
+    FILE *scan_file = fopen(input_filename, "r");
+    if (scan_file) {
+        char scan_line[MAX_LINE_LENGTH];
+        while (fgets(scan_line, sizeof(scan_line), scan_file)) {
+            ASM_Line parsed;
+            if (parse_asm_line(scan_line, &parsed) && parsed.is_function && parsed.is_local_function) {
+                fprintf(c_file, "static void %s(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double);\n", 
+                       parsed.function_name);
+            }
+        }
+        fclose(scan_file);
+    }
+    fprintf(c_file, "\n");
     
     // Process file line by line
     char line[MAX_LINE_LENGTH];
@@ -2053,6 +2201,7 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
             current_func.instruction_count = 0;
             current_func.is_trampoline = false;
             current_func.trampoline_target = 0;
+            current_func.is_local = parsed.is_local_function;  // Track if static
             
             // Auto-skip gap functions (usually data misidentified as code)
             if (strncmp(current_func.name, "gap_", 4) == 0) {
@@ -2061,13 +2210,18 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
                 current_func.skip = skiplist_should_skip(skip_list, current_func.name);
             }
             
+            // All functions accept all potential parameters (r3-r10, f1-f2) for simplicity
+            // This avoids the need to scan ahead in the file which can hang
             if (!current_func.skip) {
-                char sanitized_name[MAX_FUNCTION_NAME];
-                const char *func_name = sanitize_function_name(current_func.name, sanitized_name, sizeof(sanitized_name));
-                
-                // Use () instead of (void) to allow flexible parameter passing
-                // Functions communicate through emulated registers (r3, r4, etc.)
-                fprintf(h_file, "void %s();  // Uses emulated register state\n", func_name);
+                current_func.has_params = true;
+                current_func.num_int_params = 8;  // r3-r10
+                current_func.num_float_params = 2; // f1-f2
+                current_func.returns_value = false; // Default to void, will be detected later
+            }
+            
+            if (!current_func.skip) {
+                // Write function declaration to header (with detected parameters)
+                write_function_declaration(h_file, &current_func);
                 
                 in_function = true;
             } else {
@@ -2081,11 +2235,14 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
         }
         
         if (parsed.is_label) {
-            if (in_function && !in_data_section) {
+            // Only output labels when inside a function AND after the function signature has been written
+            if (in_function && !in_data_section && current_func.start_address != 0) {
                 char c_label[MAX_LABEL_NAME + 2];
                 convert_label(parsed.label_name, c_label, sizeof(c_label));
                 fprintf(c_file, "\n%s\n", c_label);
             }
+            // If label appears before first instruction, it will be lost but that's okay
+            // because it would be at the function entry point anyway
             continue;
         }
         
@@ -2108,6 +2265,7 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
                         continue;
                     }
                     
+                    // Parameters already detected earlier, just write function start
                     write_function_start(c_file, &current_func);
                 }
                 
@@ -2117,7 +2275,8 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
                 bool success = transpile_from_asm(parsed.mnemonic, parsed.operands, parsed.address,
                                                   c_code, sizeof(c_code),
                                                   asm_comment, sizeof(asm_comment),
-                                                  prev_lines, lines_buffered);
+                                                  prev_lines, lines_buffered,
+                                                  &current_func, label_map);
                 
                 // Fall back to byte-based decoding if text-based failed
                 if (!success) {
@@ -2127,6 +2286,38 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
                 }
                 
                 if (success) {
+                    // Check for backward jumps to labels (potential loop or misidentified function boundary)
+                    if (strstr(c_code, "goto L_") != NULL || strstr(c_code, "goto lbl_") != NULL) {
+                        char *goto_pos = strstr(c_code, "goto ");
+                        if (goto_pos) {
+                            char *addr_start = goto_pos + 5; // Skip "goto "
+                            while (*addr_start == ' ') addr_start++;
+                            uint32_t target_addr = 0;
+                            if (strncmp(addr_start, "L_", 2) == 0) {
+                                sscanf(addr_start + 2, "%x", &target_addr);
+                            } else if (strncmp(addr_start, "lbl_", 4) == 0) {
+                                sscanf(addr_start + 4, "%x", &target_addr);
+                            }
+                            
+                            // Check if this is a backward jump (target address < current address)
+                            if (target_addr != 0 && target_addr < parsed.address) {
+                                // Check if target is before this function started (cross-function backward jump)
+                                if (target_addr < current_func.start_address) {
+                                    fprintf(stderr, "\n");
+                                    fprintf(stderr, "WARNING: Backward jump detected across function boundary!\n");
+                                    fprintf(stderr, "  Function: %s (starts at 0x%08X)\n", 
+                                           current_func.name, current_func.start_address);
+                                    fprintf(stderr, "  Jump from: 0x%08X\n", parsed.address);
+                                    fprintf(stderr, "  Jump to: L_%08X (before function start)\n", target_addr);
+                                    fprintf(stderr, "  This usually means the function boundaries are wrong.\n");
+                                    fprintf(stderr, "  The function at 0x%08X may need to be merged with the previous function.\n",
+                                           current_func.start_address);
+                                    fprintf(stderr, "\n");
+                                }
+                            }
+                        }
+                    }
+                    
                     // Detect trampoline: single branch instruction to a label
                     bool is_trampoline_branch = false;
                     uint32_t trampoline_target = 0;
@@ -2348,6 +2539,111 @@ int generate_project(const char *output_dir, const char *dir_path) {
 }
 
 /**
+ * @brief Recursively process .s files in directory and subdirectories
+ * @param input_dir Input directory path
+ * @param output_src Output src directory
+ * @param output_inc Output include directory
+ * @param rel_path Relative path from input root (for maintaining structure)
+ * @param skip_list Skip list
+ * @param files_processed Counter for files processed
+ * @param c_files Array to store .c filenames with paths
+ * @param h_files Array to store .h filenames with paths
+ * @param file_count Current file count
+ * @param max_files Maximum files
+ * @return 0 on success
+ */
+static int process_directory_recursive(const char *input_dir, const char *output_src, const char *output_inc,
+                                        const char *rel_path, SkipList *skip_list,
+                                        int *files_processed, char **c_files, char **h_files,
+                                        int *file_count, int max_files) {
+    DIR *dir = opendir(input_dir);
+    if (!dir) {
+        fprintf(stderr, "Warning: Cannot open directory %s\n", input_dir);
+        return -1;
+    }
+    
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        // Skip . and ..
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        
+        char full_path[512];
+        snprintf(full_path, sizeof(full_path), "%s/%s", input_dir, entry->d_name);
+        
+        // Check if it's a directory
+        struct stat path_stat;
+        if (stat(full_path, &path_stat) == 0 && S_ISDIR(path_stat.st_mode)) {
+            // Recursively process subdirectory
+            char new_rel_path[512];
+            if (rel_path[0] == '\0') {
+                snprintf(new_rel_path, sizeof(new_rel_path), "%s", entry->d_name);
+            } else {
+                snprintf(new_rel_path, sizeof(new_rel_path), "%s/%s", rel_path, entry->d_name);
+            }
+            
+            // Create matching subdirectories in output
+            char sub_src[512], sub_inc[512];
+            snprintf(sub_src, sizeof(sub_src), "%s/%s", output_src, entry->d_name);
+            snprintf(sub_inc, sizeof(sub_inc), "%s/%s", output_inc, entry->d_name);
+            create_directory(sub_src);
+            create_directory(sub_inc);
+            
+            // Recurse
+            process_directory_recursive(full_path, sub_src, sub_inc, new_rel_path,
+                                       skip_list, files_processed, c_files, h_files,
+                                       file_count, max_files);
+        }
+        // Check if it's a .s file
+        else {
+            size_t name_len = strlen(entry->d_name);
+            if (name_len >= 3 && strcmp(entry->d_name + name_len - 2, ".s") == 0) {
+                printf("Processing [%d]: %s%s\n", *files_processed + 1,
+                       rel_path[0] ? rel_path : "", rel_path[0] ? "/" : "");
+                printf("%s\n", entry->d_name);
+                fflush(stdout);
+                
+                if (*file_count >= max_files) {
+                    fprintf(stderr, "Warning: Too many files (max %d)\n", max_files);
+                    continue;
+                }
+                
+                // Transpile to project structure
+                int result = transpile_file_to_project(full_path, output_src, output_inc, rel_path, skip_list);
+                if (result == 0) {
+                    // Track filenames with relative paths
+                    char base_name[256];
+                    strncpy(base_name, entry->d_name, name_len - 2);
+                    base_name[name_len - 2] = '\0';
+                    
+                    char c_rel[512], h_rel[512];
+                    if (rel_path[0]) {
+                        snprintf(c_rel, sizeof(c_rel), "%s/%s.c", rel_path, base_name);
+                        snprintf(h_rel, sizeof(h_rel), "%s/%s.h", rel_path, base_name);
+                    } else {
+                        snprintf(c_rel, sizeof(c_rel), "%s.c", base_name);
+                        snprintf(h_rel, sizeof(h_rel), "%s.h", base_name);
+                    }
+                    
+                    c_files[*file_count] = strdup(c_rel);
+                    h_files[*file_count] = strdup(h_rel);
+                    (*file_count)++;
+                    (*files_processed)++;
+                    
+                    printf("  ✓ Success\n");
+                } else {
+                    fprintf(stderr, "  ✗ Failed\n");
+                }
+            }
+        }
+    }
+    
+    closedir(dir);
+    return 0;
+}
+
+/**
  * @brief Main entry point
  */
 int main(int argc, char *argv[]) {
@@ -2452,15 +2748,9 @@ int main(int argc, char *argv[]) {
     create_directory(src_dir);
     create_directory(inc_dir);
     
-    printf("Processing assembly files from: %s\n\n", input_dir);
+    printf("Processing assembly files from: %s (recursive)\n\n", input_dir);
     
-    // Process all .s files and output directly to project
-    DIR *dir = opendir(input_dir);
-    if (!dir) {
-        fprintf(stderr, "Error: Cannot open input directory %s\n", input_dir);
-        return 1;
-    }
-    
+    // Process all .s files recursively and output directly to project
     int files_processed = 0;
     int max_files = 5000;  // Support large games with thousands of files
     char **c_files = malloc(sizeof(char*) * max_files);
@@ -2469,52 +2759,13 @@ int main(int argc, char *argv[]) {
     
     if (!c_files || !h_files) {
         fprintf(stderr, "Error: Failed to allocate memory for file arrays\n");
-        closedir(dir);
         return 1;
     }
     
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        size_t name_len = strlen(entry->d_name);
-        if (name_len < 3) continue;
-        
-        if (strcmp(entry->d_name + name_len - 2, ".s") == 0) {
-            char input_path[512];
-            snprintf(input_path, sizeof(input_path), "%s/%s", input_dir, entry->d_name);
-            
-            printf("Processing [%d]: %s\n", files_processed + 1, entry->d_name);
-            fflush(stdout);  // Force output to show immediately
-            
-            // Check for buffer overflow
-            if (file_count >= max_files) {
-                fprintf(stderr, "Warning: Too many files (max %d), skipping %s\n", max_files, entry->d_name);
-                continue;
-            }
-            
-            // Transpile directly to project folders (with error handling)
-            int result = transpile_file_to_project(input_path, src_dir, inc_dir, &skip_list);
-            if (result == 0) {
-                // Track .c and .h filenames
-                char base_name[256];
-                strncpy(base_name, entry->d_name, name_len - 2);
-                base_name[name_len - 2] = '\0';
-                
-                char c_filename[300], h_filename[300];
-                snprintf(c_filename, sizeof(c_filename), "%s.c", base_name);
-                snprintf(h_filename, sizeof(h_filename), "%s.h", base_name);
-                c_files[file_count] = strdup(c_filename);
-                h_files[file_count] = strdup(h_filename);
-                file_count++;
-                
-                printf("  ✓ Success\n");
-                files_processed++;
-            } else {
-                fprintf(stderr, "  ✗ Failed to transpile %s (error code: %d)\n", entry->d_name, result);
-                // Continue processing other files instead of stopping
-            }
-        }
-    }
-    closedir(dir);
+    // Process recursively starting from root
+    process_directory_recursive(input_dir, src_dir, inc_dir, "",
+                               &skip_list, &files_processed,
+                               c_files, h_files, &file_count, max_files);
     
     printf("\n===========================================\n");
     printf("   Transpilation Complete!\n");
