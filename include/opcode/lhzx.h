@@ -25,7 +25,7 @@ static inline bool decode_lhzx(uint32_t inst, LHZX_Instruction *d) {
 
 static inline int transpile_lhzx(const LHZX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
-        return snprintf(o, s, "r%u = *(uint16_t*)(mem + r%u);", d->rD, d->rB);
+        return snprintf(o, s, "r%u = *(uint16_t*)translate_address(r%u);", d->rD, d->rB);
     }
     return snprintf(o, s, "r%u = *(uint16_t*)(mem + r%u + r%u);", d->rD, d->rA, d->rB);
 }

@@ -72,11 +72,11 @@ static inline int transpile_lmw(const LMW_Instruction *decoded,
     
     if (num_regs == 1) {
         written += snprintf(output + written, output_size - written,
-                           "r%u = *(uint32_t*)(mem + %s);",
+                           "r%u = *(uint32_t*)translate_address(%s);",
                            decoded->rD, base_expr);
     } else {
         written += snprintf(output + written, output_size - written,
-                           "{ uint32_t *p = (uint32_t*)(mem + %s); ",
+                           "{ uint32_t *p = (uint32_t*)translate_address(%s); ",
                            base_expr);
         
         for (int i = 0; i < num_regs; i++) {

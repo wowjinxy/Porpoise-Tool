@@ -38,7 +38,7 @@ static inline int transpile_stfiwx(const STFIWX_Instruction *d, char *o, size_t 
     if (d->rA == 0) {
         return snprintf(o, s,
                        "{ union { double d; uint64_t i; } u; u.d = f%u; "
-                       "*(uint32_t*)(mem + r%u) = (uint32_t)u.i; }",
+                       "*(uint32_t*)translate_address(r%u) = (uint32_t)u.i; }",
                        d->frS, d->rB);
     }
     return snprintf(o, s,

@@ -25,7 +25,7 @@ static inline bool decode_stbx(uint32_t inst, STBX_Instruction *d) {
 
 static inline int transpile_stbx(const STBX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
-        return snprintf(o, s, "*(uint8_t*)(mem + r%u) = (uint8_t)r%u;", d->rB, d->rS);
+        return snprintf(o, s, "*(uint8_t*)translate_address(r%u) = (uint8_t)r%u;", d->rB, d->rS);
     }
     return snprintf(o, s, "*(uint8_t*)(mem + r%u + r%u) = (uint8_t)r%u;", d->rA, d->rB, d->rS);
 }

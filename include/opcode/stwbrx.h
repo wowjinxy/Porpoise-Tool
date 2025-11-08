@@ -40,7 +40,7 @@ static inline int transpile_stwbrx(const STWBRX_Instruction *d, char *o, size_t 
     if (d->rA == 0) {
         return snprintf(o, s,
                        "{ uint32_t val = r%u; "
-                       "*(uint32_t*)(mem + r%u) = ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) | "
+                       "*(uint32_t*)translate_address(r%u) = ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) | "
                        "((val >> 8) & 0xFF00) | ((val >> 24) & 0xFF); }",
                        d->rS, d->rB);
     }

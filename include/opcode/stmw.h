@@ -95,12 +95,12 @@ static inline int transpile_stmw(const STMW_Instruction *decoded,
     if (num_regs == 1) {
         // Only one register
         written += snprintf(output + written, output_size - written,
-                           "*(uint32_t*)(mem + %s) = r%u;",
+                           "*(uint32_t*)translate_address(%s) = r%u;",
                            base_expr, decoded->rS);
     } else {
         // Multiple registers - use a loop or expand inline
         written += snprintf(output + written, output_size - written,
-                           "{ uint32_t *p = (uint32_t*)(mem + %s); ",
+                           "{ uint32_t *p = (uint32_t*)translate_address(%s); ",
                            base_expr);
         
         for (int i = 0; i < num_regs; i++) {

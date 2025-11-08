@@ -30,13 +30,13 @@ static inline bool decode_lfd(uint32_t inst, LFD_Instruction *d) {
 
 static inline int transpile_lfd(const LFD_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
-        return snprintf(o, s, "f%u = *(double*)(mem + 0x%x);", d->frD, (uint32_t)d->d);
+        return snprintf(o, s, "f%u = *(double*)translate_address(0x%x);", d->frD, (uint32_t)d->d);
     } else if (d->d == 0) {
-        return snprintf(o, s, "f%u = *(double*)(mem + r%u);", d->frD, d->rA);
+        return snprintf(o, s, "f%u = *(double*)translate_address(r%u);", d->frD, d->rA);
     } else if (d->d > 0) {
-        return snprintf(o, s, "f%u = *(double*)(mem + r%u + 0x%x);", d->frD, d->rA, (uint16_t)d->d);
+        return snprintf(o, s, "f%u = *(double*)translate_address(r%u + 0x%x);", d->frD, d->rA, (uint16_t)d->d);
     } else {
-        return snprintf(o, s, "f%u = *(double*)(mem + r%u - 0x%x);", d->frD, d->rA, (uint16_t)(-d->d));
+        return snprintf(o, s, "f%u = *(double*)translate_address(r%u - 0x%x);", d->frD, d->rA, (uint16_t)(-d->d));
     }
 }
 

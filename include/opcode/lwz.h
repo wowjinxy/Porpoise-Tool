@@ -69,20 +69,21 @@ static inline int transpile_lwz(const LWZ_Instruction *decoded,
                                 size_t output_size) {
     if (decoded->rA == 0) {
         return snprintf(output, output_size,
-                       "r%u = *(uint32_t*)(mem + 0x%x);",
-                       decoded->rD, (uint32_t)decoded->d);
+                       "r%u = *(uint32_t*)translate_address(%d);",
+                       decoded->rD, (int16_t)decoded->d);
     } else {
+        // Load from address (rA + displacement) - use safe address translation
         if (decoded->d == 0) {
             return snprintf(output, output_size,
-                           "r%u = *(uint32_t*)(mem + r%u);",
+                           "r%u = *(uint32_t*)translate_address(r%u);",
                            decoded->rD, decoded->rA);
         } else if (decoded->d > 0) {
             return snprintf(output, output_size,
-                           "r%u = *(uint32_t*)(mem + r%u + 0x%x);",
+                           "r%u = *(uint32_t*)translate_address(r%u + 0x%x);",
                            decoded->rD, decoded->rA, (uint16_t)decoded->d);
         } else {
             return snprintf(output, output_size,
-                           "r%u = *(uint32_t*)(mem + r%u - 0x%x);",
+                           "r%u = *(uint32_t*)translate_address(r%u - 0x%x);",
                            decoded->rD, decoded->rA, (uint16_t)(-decoded->d));
         }
     }

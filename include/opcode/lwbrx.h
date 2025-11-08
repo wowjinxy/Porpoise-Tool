@@ -39,7 +39,7 @@ static inline bool decode_lwbrx(uint32_t inst, LWBRX_Instruction *d) {
 static inline int transpile_lwbrx(const LWBRX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
         return snprintf(o, s,
-                       "{ uint32_t val = *(uint32_t*)(mem + r%u); "
+                       "{ uint32_t val = *(uint32_t*)translate_address(r%u); "
                        "r%u = ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) | "
                        "((val >> 8) & 0xFF00) | ((val >> 24) & 0xFF); }",
                        d->rB, d->rD);

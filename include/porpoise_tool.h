@@ -89,6 +89,10 @@ static inline bool is_reserved_name(const char *name) {
         "strtoul",       // stdlib.h
         "rand",          // stdlib.h - random number
         "srand",         // stdlib.h - seed random
+        "exit",          // stdlib.h - exit program
+        "abort",         // stdlib.h - abort program
+        "_Exit",         // stdlib.h - exit without cleanup
+        "atexit",        // stdlib.h - register exit handler
         "memcpy",        // string.h
         "memmove",       // string.h
         "memset",        // string.h
@@ -108,6 +112,62 @@ static inline bool is_reserved_name(const char *name) {
         "mbstowcs",      // stdlib.h - multibyte conversion
         "wctomb",        // stdlib.h
         "mbtowc",        // stdlib.h
+        // Math functions - single precision (float)
+        "sinf",          // math.h
+        "cosf",          // math.h
+        "tanf",          // math.h
+        "asinf",         // math.h
+        "acosf",         // math.h
+        "atanf",         // math.h
+        "atan2f",        // math.h
+        "sinhf",         // math.h
+        "coshf",         // math.h
+        "tanhf",         // math.h
+        "expf",          // math.h
+        "logf",          // math.h
+        "log10f",        // math.h
+        "sqrtf",         // math.h
+        "powf",          // math.h
+        "fabsf",         // math.h
+        "floorf",        // math.h
+        "ceilf",         // math.h
+        "roundf",        // math.h
+        "truncf",        // math.h
+        "fmodf",         // math.h
+        "hypotf",        // math.h
+        "copysignf",     // math.h
+        "fdimf",         // math.h
+        "fmaxf",         // math.h
+        "fminf",         // math.h
+        "fmaf",          // math.h
+        // Math functions - double precision
+        "sin",           // math.h
+        "cos",           // math.h
+        "tan",           // math.h
+        "asin",          // math.h
+        "acos",          // math.h
+        "atan",          // math.h
+        "atan2",         // math.h
+        "sinh",          // math.h
+        "cosh",          // math.h
+        "tanh",          // math.h
+        "exp",           // math.h
+        "log",           // math.h
+        "log10",         // math.h
+        "sqrt",          // math.h
+        "pow",           // math.h
+        "fabs",          // math.h
+        "floor",         // math.h
+        "ceil",          // math.h
+        "round",         // math.h
+        "trunc",         // math.h
+        "fmod",          // math.h
+        "hypot",         // math.h
+        "copysign",      // math.h
+        "fdim",          // math.h
+        "fmax",          // math.h
+        "fmin",          // math.h
+        "fma",           // math.h
         NULL
     };
     
@@ -148,6 +208,24 @@ static inline const char* sanitize_function_name(const char *name, char *output,
 //==============================================================================
 
 /**
+ * @brief String table entry for tracking .string/.asciz directives
+ */
+typedef struct {
+    uint32_t address;           // Address of the string in memory
+    char content[256];          // String content (escaped)
+    char label[64];             // Generated label name (e.g., str_80004000)
+} StringEntry;
+
+/**
+ * @brief String table for tracking all strings in the file
+ */
+typedef struct {
+    StringEntry *entries;
+    int count;
+    int capacity;
+} StringTable;
+
+/**
  * @brief Function skip list configuration
  */
 typedef struct {
@@ -168,6 +246,74 @@ typedef struct {
     int count;
     int capacity;
 } LabelMap;
+
+//==============================================================================
+// STRING TABLE FUNCTIONS
+//==============================================================================
+
+/**
+ * @brief Initialize string table
+ */
+static inline StringTable* string_table_init(void) {
+    StringTable *table = (StringTable*)malloc(sizeof(StringTable));
+    if (!table) return NULL;
+    table->capacity = 100;
+    table->count = 0;
+    table->entries = (StringEntry*)malloc(sizeof(StringEntry) * table->capacity);
+    if (!table->entries) {
+        free(table);
+        return NULL;
+    }
+    return table;
+}
+
+/**
+ * @brief Add a string to the table
+ */
+static inline void string_table_add(StringTable *table, uint32_t address, const char *content) {
+    if (!table || !content) return;
+    
+    // Grow if needed
+    if (table->count >= table->capacity) {
+        table->capacity *= 2;
+        table->entries = (StringEntry*)realloc(table->entries, sizeof(StringEntry) * table->capacity);
+        if (!table->entries) return;
+    }
+    
+    StringEntry *entry = &table->entries[table->count];
+    entry->address = address;
+    
+    // Copy and escape string content
+    strncpy(entry->content, content, sizeof(entry->content) - 1);
+    entry->content[sizeof(entry->content) - 1] = '\0';
+    
+    // Generate label name
+    snprintf(entry->label, sizeof(entry->label), "str_%08X", address);
+    
+    table->count++;
+}
+
+/**
+ * @brief Find string by address
+ */
+static inline const StringEntry* string_table_find(const StringTable *table, uint32_t address) {
+    if (!table) return NULL;
+    for (int i = 0; i < table->count; i++) {
+        if (table->entries[i].address == address) {
+            return &table->entries[i];
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief Free string table
+ */
+static inline void string_table_free(StringTable *table) {
+    if (!table) return;
+    if (table->entries) free(table->entries);
+    free(table);
+}
 
 /**
  * @brief Parsed assembly line
@@ -206,6 +352,7 @@ typedef struct {
     bool is_trampoline;         // Is this a trampoline (single branch)?
     uint32_t trampoline_target; // Target address for trampoline
     bool returns_value;         // Does this function return a value in r3?
+    bool is_data_only;          // Is this function actually just data (strings, tables, etc.)?
     
     // Parameter detection
     bool has_params;            // Does this function have parameters?
@@ -367,6 +514,84 @@ static inline void labelmap_free(LabelMap *map) {
 }
 
 /**
+ * @brief Parse .string or .asciz directive and extract address
+ * @param line Assembly line containing string directive
+ * @param address_out Output address where string is located
+ * @param content_out Output buffer for string content
+ * @param content_size Size of content buffer
+ * @return true if successfully parsed
+ */
+static inline bool parse_string_directive(const char *line, uint32_t *address_out, 
+                                          char *content_out, size_t content_size) {
+    // Look for address comment like: # .rodata:0x8 | 0x804D8C08 | size: 0x20
+    const char *comment = strchr(line, '#');
+    if (!comment) return false;
+    
+    // Try to extract address from comment
+    uint32_t addr = 0;
+    const char *addr_marker = strstr(comment, "0x");
+    if (addr_marker) {
+        // Skip the first occurrence (might be offset), look for the actual address
+        const char *next_addr = strstr(addr_marker + 2, "0x");
+        if (next_addr) {
+            sscanf(next_addr, "%x", &addr);
+        } else {
+            sscanf(addr_marker, "%x", &addr);
+        }
+    }
+    
+    if (addr == 0) return false;
+    
+    // Extract string content between quotes
+    const char *quote_start = strchr(line, '"');
+    if (!quote_start) return false;
+    
+    const char *quote_end = strchr(quote_start + 1, '"');
+    if (!quote_end) return false;
+    
+    size_t len = quote_end - quote_start - 1;
+    if (len >= content_size) len = content_size - 1;
+    
+    strncpy(content_out, quote_start + 1, len);
+    content_out[len] = '\0';
+    
+    *address_out = addr;
+    return true;
+}
+
+/**
+ * @brief Build string table by pre-scanning file for .string/.asciz directives
+ */
+static inline StringTable* build_string_table(const char *filename) {
+    FILE *f = fopen(filename, "r");
+    if (!f) return NULL;
+    
+    StringTable *table = string_table_init();
+    if (!table) {
+        fclose(f);
+        return NULL;
+    }
+    
+    char line[MAX_LINE_LENGTH];
+    while (fgets(line, sizeof(line), f)) {
+        // Look for .string or .asciz directives
+        if (strstr(line, ".string") != NULL || strstr(line, ".asciz") != NULL) {
+            uint32_t address;
+            char content[256];
+            
+            if (parse_string_directive(line, &address, content, sizeof(content))) {
+                string_table_add(table, address, content);
+            }
+        }
+    }
+    
+    fclose(f);
+    
+    fprintf(stderr, "  [Debug: Found %d string(s) in file]\n", table->count);
+    return table;
+}
+
+/**
  * @brief Build label-to-function map by pre-scanning file
  */
 static inline LabelMap* build_label_map(const char *filename) {
@@ -481,7 +706,11 @@ static inline bool parse_asm_line(const char *line, ASM_Line *parsed) {
     // Check for other common directives
     if (strncmp(p, ".align", 6) == 0 || strncmp(p, ".balign", 7) == 0 ||
         strncmp(p, ".section", 8) == 0 || strncmp(p, ".file", 5) == 0 ||
-        strncmp(p, ".global", 7) == 0 || strncmp(p, ".weak", 5) == 0) {
+        strncmp(p, ".global", 7) == 0 || strncmp(p, ".weak", 5) == 0 ||
+        strncmp(p, ".obj", 4) == 0 || strncmp(p, ".endobj", 7) == 0 ||
+        strncmp(p, ".float", 6) == 0 || strncmp(p, ".4byte", 6) == 0 ||
+        strncmp(p, ".byte", 5) == 0 || strncmp(p, ".2byte", 6) == 0 ||
+        strncmp(p, ".string", 7) == 0 || strncmp(p, ".asciz", 6) == 0) {
         parsed->is_directive = true;
         return true;
     }
@@ -699,6 +928,13 @@ static inline void write_function_declaration(FILE *h_file, const Function_Info 
         return;
     }
     
+    // Handle data-only functions as extern byte arrays
+    if (func->is_data_only) {
+        fprintf(h_file, "extern const uint8_t %s[];  // Data at 0x%08X\n", 
+               func->name, func->start_address);
+        return;
+    }
+    
     // Skip standard library intrinsic functions - these are provided by the compiler
     const char *intrinsics[] = {
         "memset", "memcpy", "memmove", "memcmp",
@@ -720,18 +956,16 @@ static inline void write_function_declaration(FILE *h_file, const Function_Info 
         }
     }
     
-    // Also skip functions ending with "_impl" - these are our wrapper implementations
-    size_t name_len = strlen(func->name);
-    if (name_len > 5 && strcmp(func->name + name_len - 5, "_impl") == 0) {
-        return;  // Skip implementation wrappers
-    }
+    // Get the actual function name (renamed if necessary to avoid conflicts)
+    char func_name_buffer[512];
+    const char *func_name = sanitize_function_name(func->name, func_name_buffer, sizeof(func_name_buffer));
     
     if (func->skip) {
         fprintf(h_file, "// Skipped: ");
     }
     
     const char *return_type = func->returns_value ? "uint32_t" : "void";
-    fprintf(h_file, "%s %s(", return_type, func->name);
+    fprintf(h_file, "%s %s(", return_type, func_name);
     
     // Generate parameter list
     if (!func->has_params) {
@@ -795,8 +1029,11 @@ static inline void write_function_start(FILE *c_file, const Function_Info *func)
     fprintf(c_file, "\n");
     fprintf(c_file, " * Address: 0x%08X\n", func->start_address);
     fprintf(c_file, " * Size: 0x%X (%u bytes)\n", func->size, func->size);
+    bool is_renamed = (strcmp(func->name, func_name) != 0);
     if (func->is_local) {
         fprintf(c_file, " * Scope: static (local to this file)\n");
+    } else if (is_renamed) {
+        fprintf(c_file, " * Scope: global (renamed from %s to avoid conflicts)\n", func->name);
     }
     if (func->has_params) {
         fprintf(c_file, " * Parameters: %d int", func->num_int_params);
@@ -807,7 +1044,7 @@ static inline void write_function_start(FILE *c_file, const Function_Info *func)
     }
     fprintf(c_file, " */\n");
     
-    // Add "static" keyword for local functions
+    // Add "static" keyword ONLY for truly local functions (not for renamed functions)
     const char *return_type = func->returns_value ? "uint32_t" : "void";
     fprintf(c_file, "%s%s %s(", func->is_local ? "static " : "", return_type, func_name);
     
@@ -1003,6 +1240,51 @@ static inline void analyze_function_params(FILE *input_file, Function_Info *func
     func->has_params = (func->num_int_params > 0 || func->num_float_params > 0);
     
     fseek(input_file, original_pos, SEEK_SET);
+}
+
+/**
+ * @brief Detect if a "function" is actually just data (strings, tables, etc.)
+ * by scanning for high percentage of .4byte directives or invalid instructions
+ */
+static inline bool detect_data_only_function(FILE *input_file) {
+    if (!input_file) return false;
+    
+    long original_pos = ftell(input_file);
+    rewind(input_file);
+    
+    char line[MAX_LINE_LENGTH];
+    int total_lines = 0;
+    int data_lines = 0;
+    bool in_function = false;
+    
+    while (fgets(line, sizeof(line), input_file)) {
+        // Look for function start
+        if (strstr(line, ".fn ") != NULL) {
+            in_function = true;
+            continue;
+        }
+        
+        // Stop at function end
+        if (strstr(line, ".endfn") != NULL) {
+            break;
+        }
+        
+        if (!in_function) continue;
+        
+        // Count lines that indicate data rather than code
+        if (strstr(line, ".4byte") != NULL ||
+            strstr(line, "/* invalid */") != NULL ||
+            strstr(line, "/* illegal:") != NULL) {
+            data_lines++;
+        }
+        
+        total_lines++;
+    }
+    
+    fseek(input_file, original_pos, SEEK_SET);
+    
+    // If more than 80% of lines are data directives/invalid, it's a data section
+    return (total_lines > 10 && data_lines > total_lines * 0.8);
 }
 
 /**

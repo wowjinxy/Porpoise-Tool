@@ -71,21 +71,21 @@ static inline int transpile_sth(const STH_Instruction *decoded,
     if (decoded->rA == 0) {
         // Store to absolute address
         return snprintf(output, output_size,
-                       "*(uint16_t*)(mem + 0x%x) = r%u;",
+                       "*(uint16_t*)translate_address(0x%x) = r%u;",
                        (uint32_t)decoded->d, decoded->rS);
     } else {
         // Store to address (rA + displacement)
         if (decoded->d == 0) {
             return snprintf(output, output_size,
-                           "*(uint16_t*)(mem + r%u) = r%u;",
+                           "*(uint16_t*)translate_address(r%u) = r%u;",
                            decoded->rA, decoded->rS);
         } else if (decoded->d > 0) {
             return snprintf(output, output_size,
-                           "*(uint16_t*)(mem + r%u + 0x%x) = r%u;",
+                           "*(uint16_t*)translate_address(r%u + 0x%x) = r%u;",
                            decoded->rA, (uint16_t)decoded->d, decoded->rS);
         } else {
             return snprintf(output, output_size,
-                           "*(uint16_t*)(mem + r%u - 0x%x) = r%u;",
+                           "*(uint16_t*)translate_address(r%u - 0x%x) = r%u;",
                            decoded->rA, (uint16_t)(-decoded->d), decoded->rS);
         }
     }

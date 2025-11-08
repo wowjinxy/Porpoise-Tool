@@ -30,7 +30,7 @@ static inline bool decode_stwcx(uint32_t inst, STWCX_Instruction *d) {
 static inline int transpile_stwcx(const STWCX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
         return snprintf(o, s,
-                       "{ *(uint32_t*)(mem + r%u) = r%u; "
+                       "{ *(uint32_t*)translate_address(r%u) = r%u; "
                        "cr0 = 0x2 | (xer >> 28 & 0x1); }  /* conditional store success */",
                        d->rB, d->rS);
     }

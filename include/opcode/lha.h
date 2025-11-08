@@ -28,13 +28,13 @@ static inline bool decode_lha(uint32_t inst, LHA_Instruction *d) {
 
 static inline int transpile_lha(const LHA_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
-        return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)(mem + 0x%x);", d->rD, (uint32_t)d->d);
+        return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)translate_address(0x%x);", d->rD, (uint32_t)d->d);
     } else if (d->d == 0) {
-        return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)(mem + r%u);", d->rD, d->rA);
+        return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)translate_address(r%u);", d->rD, d->rA);
     } else if (d->d > 0) {
-        return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)(mem + r%u + 0x%x);", d->rD, d->rA, (uint16_t)d->d);
+        return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)translate_address(r%u + 0x%x);", d->rD, d->rA, (uint16_t)d->d);
     } else {
-        return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)(mem + r%u - 0x%x);", d->rD, d->rA, (uint16_t)(-d->d));
+        return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)translate_address(r%u - 0x%x);", d->rD, d->rA, (uint16_t)(-d->d));
     }
 }
 

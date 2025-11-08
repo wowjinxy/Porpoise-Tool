@@ -34,15 +34,15 @@ static inline int transpile_psq_l(const PSQ_L_Instruction *d, char *o, size_t s)
     // Simplified: treat as loading float data (actual implementation needs GQR dequantization)
     if (d->rA == 0) {
         return snprintf(o, s, "/* psq_l f%u, 0x%x, %u, qr%u */ "
-                       "f%u = *(double*)(mem + 0x%x);", 
+                       "f%u = *(double*)translate_address(0x%x);", 
                        d->frD, (uint32_t)d->d, d->W, d->I, d->frD, (uint32_t)d->d);
     } else if (d->d >= 0) {
         return snprintf(o, s, "/* psq_l f%u, 0x%x(r%u), %u, qr%u */ "
-                       "f%u = *(double*)(mem + r%u + 0x%x);",
+                       "f%u = *(double*)translate_address(r%u + 0x%x);",
                        d->frD, (uint16_t)d->d, d->rA, d->W, d->I, d->frD, d->rA, (uint16_t)d->d);
     } else {
         return snprintf(o, s, "/* psq_l f%u, -0x%x(r%u), %u, qr%u */ "
-                       "f%u = *(double*)(mem + r%u - 0x%x);",
+                       "f%u = *(double*)translate_address(r%u - 0x%x);",
                        d->frD, (uint16_t)(-d->d), d->rA, d->W, d->I, d->frD, d->rA, (uint16_t)(-d->d));
     }
 }

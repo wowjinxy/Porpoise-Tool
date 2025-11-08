@@ -71,21 +71,21 @@ static inline int transpile_lhz(const LHZ_Instruction *decoded,
     if (decoded->rA == 0) {
         // Load from absolute address
         return snprintf(output, output_size,
-                       "r%u = *(uint16_t*)(mem + 0x%x);",
+                       "r%u = *(uint16_t*)translate_address(0x%x);",
                        decoded->rD, (uint32_t)decoded->d);
     } else {
         // Load from address (rA + displacement)
         if (decoded->d == 0) {
             return snprintf(output, output_size,
-                           "r%u = *(uint16_t*)(mem + r%u);",
+                           "r%u = *(uint16_t*)translate_address(r%u);",
                            decoded->rD, decoded->rA);
         } else if (decoded->d > 0) {
             return snprintf(output, output_size,
-                           "r%u = *(uint16_t*)(mem + r%u + 0x%x);",
+                           "r%u = *(uint16_t*)translate_address(r%u + 0x%x);",
                            decoded->rD, decoded->rA, (uint16_t)decoded->d);
         } else {
             return snprintf(output, output_size,
-                           "r%u = *(uint16_t*)(mem + r%u - 0x%x);",
+                           "r%u = *(uint16_t*)translate_address(r%u - 0x%x);",
                            decoded->rD, decoded->rA, (uint16_t)(-decoded->d));
         }
     }

@@ -51,20 +51,20 @@ static inline int transpile_lfs(const LFS_Instruction *decoded,
                                 size_t output_size) {
     if (decoded->rA == 0) {
         return snprintf(output, output_size,
-                       "f%u = (double)*(float*)(mem + 0x%x);",
+                       "f%u = (double)*(float*)translate_address(0x%x);",
                        decoded->frD, (uint32_t)decoded->d);
     } else {
         if (decoded->d == 0) {
             return snprintf(output, output_size,
-                           "f%u = (double)*(float*)(mem + r%u);",
+                           "f%u = (double)*(float*)translate_address(r%u);",
                            decoded->frD, decoded->rA);
         } else if (decoded->d > 0) {
             return snprintf(output, output_size,
-                           "f%u = (double)*(float*)(mem + r%u + 0x%x);",
+                           "f%u = (double)*(float*)translate_address(r%u + 0x%x);",
                            decoded->frD, decoded->rA, (uint16_t)decoded->d);
         } else {
             return snprintf(output, output_size,
-                           "f%u = (double)*(float*)(mem + r%u - 0x%x);",
+                           "f%u = (double)*(float*)translate_address(r%u - 0x%x);",
                            decoded->frD, decoded->rA, (uint16_t)(-decoded->d));
         }
     }

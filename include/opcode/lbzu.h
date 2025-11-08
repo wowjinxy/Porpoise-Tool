@@ -28,10 +28,10 @@ static inline bool decode_lbzu(uint32_t inst, LBZU_Instruction *d) {
 
 static inline int transpile_lbzu(const LBZU_Instruction *d, char *o, size_t s) {
     if (d->d >= 0) {
-        return snprintf(o, s, "r%u = r%u + 0x%x; r%u = *(uint8_t*)(mem + r%u);",
+        return snprintf(o, s, "r%u = r%u + 0x%x; r%u = *(uint8_t*)translate_address(r%u);",
                        d->rA, d->rA, (uint16_t)d->d, d->rD, d->rA);
     } else {
-        return snprintf(o, s, "r%u = r%u - 0x%x; r%u = *(uint8_t*)(mem + r%u);",
+        return snprintf(o, s, "r%u = r%u - 0x%x; r%u = *(uint8_t*)translate_address(r%u);",
                        d->rA, d->rA, (uint16_t)(-d->d), d->rD, d->rA);
     }
 }

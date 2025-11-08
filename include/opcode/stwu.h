@@ -53,12 +53,12 @@ static inline int transpile_stwu(const STWU_Instruction *decoded,
     // Store and update rA
     if (decoded->d >= 0) {
         return snprintf(output, output_size,
-                       "r%u = r%u + 0x%x; *(uint32_t*)(mem + r%u) = r%u;",
+                       "r%u = r%u + 0x%x; *(uint32_t*)translate_address(r%u) = r%u;",
                        decoded->rA, decoded->rA, (uint16_t)decoded->d,
                        decoded->rA, decoded->rS);
     } else {
         return snprintf(output, output_size,
-                       "r%u = r%u - 0x%x; *(uint32_t*)(mem + r%u) = r%u;",
+                       "r%u = r%u - 0x%x; *(uint32_t*)translate_address(r%u) = r%u;",
                        decoded->rA, decoded->rA, (uint16_t)(-decoded->d),
                        decoded->rA, decoded->rS);
     }

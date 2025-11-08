@@ -22,7 +22,48 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
                         char *comment, size_t comment_size,
                         const char **prev_lines, int num_prev_lines,
                         const Function_Info *func_context,
-                        const LabelMap *label_map) {
+                        const LabelMap *label_map,
+                        const StringTable *string_table) {
+    // Detect string address loading patterns (lis followed by addi/ori)
+    // Check if previous instruction was lis and current is addi
+    static uint32_t last_lis_value = 0;
+    static int last_lis_reg = -1;
+    
+    if (strcmp(mnemonic, "lis") == 0) {
+        // Parse: lis rD, value
+        int reg;
+        uint32_t value;
+        if (sscanf(operands, "r%d, %i", &reg, &value) == 2 ||
+            sscanf(operands, "r%d,%i", &reg, &value) == 2) {
+            last_lis_reg = reg;
+            last_lis_value = value << 16;  // lis shifts left by 16
+        }
+    }
+    
+    if ((strcmp(mnemonic, "addi") == 0 || strcmp(mnemonic, "ori") == 0) && string_table) {
+        // Parse: addi rD, rA, simm
+        int rD, rA;
+        int32_t simm;
+        if ((sscanf(operands, "r%d, r%d, %i", &rD, &rA, &simm) == 3 ||
+             sscanf(operands, "r%d,r%d,%i", &rD, &rA, &simm) == 3) &&
+            rA == last_lis_reg) {
+            // Combine lis + addi to form full address
+            uint32_t full_addr = last_lis_value + simm;
+            
+            // Check if this address matches a string
+            const StringEntry *str_entry = string_table_find(string_table, full_addr);
+            if (str_entry) {
+                // Generate string reference instead of raw address
+                snprintf(output, output_size, "r%d = (uint32_t)&%s;  /* \"%s\" */",
+                        rD, str_entry->label, str_entry->content);
+                snprintf(comment, comment_size, "%s r%d, r%d, %d (string ref)",
+                        mnemonic, rD, rA, simm);
+                last_lis_reg = -1;  // Reset
+                return true;
+            }
+        }
+    }
+    
     // Handle blr (branch to link register = return)
     if (strcmp(mnemonic, "blr") == 0) {
         if (func_context && func_context->returns_value) {
@@ -161,12 +202,14 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
                 char sanitized_name[MAX_FUNCTION_NAME];
                 const char *func_name = sanitize_function_name(target, sanitized_name, sizeof(sanitized_name));
                 
-                // Pass all potential parameter registers to match detected parameter signatures
+                // Always pass all potential parameter registers
+                const char *params = "r3, r4, r5, r6, r7, r8, r9, r10, f1, f2";
+                
                 if (strcmp(mnemonic, "bl") == 0 || strcmp(mnemonic, "bla") == 0) {
-                    snprintf(output, output_size, "%s(r3, r4, r5, r6, r7, r8, r9, r10, f1, f2);", func_name);
+                    snprintf(output, output_size, "%s(%s);", func_name, params);
                 } else {
                     // Tail call optimization (branch without link)
-                    snprintf(output, output_size, "return %s(r3, r4, r5, r6, r7, r8, r9, r10, f1, f2);  /* Tail call */", func_name);
+                    snprintf(output, output_size, "return %s(%s);  /* Tail call */", func_name, params);
                 }
             }
         }
@@ -278,7 +321,32 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
                 }
             } else {
                 // It's a function name - conditional function call
-                snprintf(output, output_size, "%s(r3, r4, r5, r6, r7, r8, r9, r10, f1, f2);  /* conditional call */", target);
+                // Generate proper conditional wrapper
+                int written = 0;
+                
+                if (strcmp(clean_mnemonic, "bgt") == 0) {
+                    written += snprintf(output + written, output_size - written, "if (%s & 0x4) {  // bgt: branch if greater than\n        ", cr_field);
+                }
+                else if (strcmp(clean_mnemonic, "blt") == 0) {
+                    written += snprintf(output + written, output_size - written, "if (%s & 0x8) {  // blt: branch if less than\n        ", cr_field);
+                }
+                else if (strcmp(clean_mnemonic, "beq") == 0) {
+                    written += snprintf(output + written, output_size - written, "if (%s & 0x2) {  // beq: branch if equal\n        ", cr_field);
+                }
+                else if (strcmp(clean_mnemonic, "bne") == 0) {
+                    written += snprintf(output + written, output_size - written, "if (!(%s & 0x2)) {  // bne: branch if not equal\n        ", cr_field);
+                }
+                else if (strcmp(clean_mnemonic, "ble") == 0) {
+                    written += snprintf(output + written, output_size - written, "if (%s & 0xA) {  // ble: branch if less than or equal\n        ", cr_field);
+                }
+                else if (strcmp(clean_mnemonic, "bge") == 0) {
+                    written += snprintf(output + written, output_size - written, "if (!(%s & 0x8)) {  // bge: branch if greater than or equal\n        ", cr_field);
+                }
+                else {
+                    written += snprintf(output + written, output_size - written, "if (1 /* unknown condition: %s */) {\n        ", clean_mnemonic);
+                }
+                
+                written += snprintf(output + written, output_size - written, "%s(r3, r4, r5, r6, r7, r8, r9, r10, f1, f2);\n    }", target);
             }
         }
         snprintf(comment, comment_size, "%s %s", mnemonic, operands);
@@ -1724,6 +1792,9 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
     // Build label-to-function map for trampoline resolution
     LabelMap *label_map = build_label_map(input_filename);
     
+    // Build string table for string literal tracking
+    StringTable *string_table = build_string_table(input_filename);
+    
     // Generate output filenames
     char output_c[256], output_h[256];
     generate_output_filenames(input_filename, output_c, output_h, sizeof(output_c));
@@ -1853,6 +1924,7 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
             current_func.is_trampoline = false;
             current_func.trampoline_target = 0;
             current_func.is_local = parsed.is_local_function;  // Track if static
+            current_func.is_data_only = false;  // Not used in this function but initialize anyway
             
             // Auto-skip gap functions (usually data misidentified as code)
             if (strncmp(current_func.name, "gap_", 4) == 0) {
@@ -1933,7 +2005,7 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
                                                   c_code, sizeof(c_code),
                                                   asm_comment, sizeof(asm_comment),
                                                   prev_lines, lines_buffered,
-                                                  &current_func, label_map);
+                                                  &current_func, label_map, string_table);
                 
                 // Fall back to byte-based decoding
                 if (!success) {
@@ -2042,8 +2114,9 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
     fclose(c_file);
     fclose(h_file);
     
-    // Cleanup label map
+    // Cleanup label map and string table
     if (label_map) labelmap_free(label_map);
+    if (string_table) string_table_free(string_table);
     
     printf("  Created: %s\n", output_c);
     printf("  Created: %s\n", output_h);
@@ -2058,6 +2131,9 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
                                const char *inc_dir, const char *rel_path, SkipList *skip_list) {
     // Build label-to-function map for trampoline resolution
     LabelMap *label_map = build_label_map(input_filename);
+    
+    // Build string table for string literal tracking
+    StringTable *string_table = build_string_table(input_filename);
     
     // Extract base name
     const char *base = strrchr(input_filename, '/');
@@ -2079,6 +2155,7 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
     if (!input) {
         fprintf(stderr, "  Error: Cannot open %s\n", input_filename);
         if (label_map) labelmap_free(label_map);
+        if (string_table) string_table_free(string_table);
         return -1;
     }
     
@@ -2118,12 +2195,34 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
     fprintf(c_file, "#include \"powerpc_state.h\"\n");
     fprintf(c_file, "#include \"all_functions.h\"  // For cross-file function calls\n\n");
     
+    // Generate string constants if any were found
+    if (string_table && string_table->count > 0) {
+        fprintf(c_file, "//==============================================================================\n");
+        fprintf(c_file, "// String Constants (from .rodata/.data sections)\n");
+        fprintf(c_file, "//==============================================================================\n\n");
+        
+        for (int i = 0; i < string_table->count; i++) {
+            const StringEntry *entry = &string_table->entries[i];
+            // Escape string content for C
+            fprintf(c_file, "const char %s[] = \"%s\";  // @ 0x%08X\n", 
+                   entry->label, entry->content, entry->address);
+        }
+        fprintf(c_file, "\n");
+    }
+    
     // First pass: collect all local (static) functions for forward declarations
     fprintf(c_file, "// Forward declarations for local (static) functions\n");
     FILE *scan_file = fopen(input_filename, "r");
     if (scan_file) {
         char scan_line[MAX_LINE_LENGTH];
         while (fgets(scan_line, sizeof(scan_line), scan_file)) {
+            // Stop scanning at non-code sections (data sections, etc.)
+            if (strstr(scan_line, ".section") != NULL && 
+                strstr(scan_line, ".text") == NULL &&
+                strstr(scan_line, ".init") == NULL) {
+                break;  // Stop at data sections
+            }
+            
             ASM_Line parsed;
             if (parse_asm_line(scan_line, &parsed) && parsed.is_function && parsed.is_local_function) {
                 fprintf(c_file, "static void %s(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double);\n", 
@@ -2138,6 +2237,7 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
     char line[MAX_LINE_LENGTH];
     bool in_function = false;
     bool in_data_section = false;
+    bool seen_text_section = false;  // Track if we've entered the code section
     Function_Info current_func = {0};
     
     // Buffer to track previous lines for parameter detection
@@ -2163,27 +2263,47 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
         if (parsed.is_comment) continue;
         
         if (parsed.is_directive) {
+            // Track when we enter the .text section
+            if (strstr(line, ".text") != NULL || strstr(line, ".init") != NULL) {
+                seen_text_section = true;
+            }
+            
+            // Only stop at data sections AFTER we've seen the code section
+            // This handles files where data sections appear before .text
+            if (seen_text_section && strstr(line, ".section") != NULL && 
+                strstr(line, ".text") == NULL && 
+                strstr(line, ".init") == NULL) {
+                fprintf(c_file, "\n// End of code section - data sections follow\n");
+                break;  // Stop processing this file
+            }
+            
             if (strstr(line, ".include") != NULL) {
                 char include_line[256];
                 convert_include(line, include_line, sizeof(include_line));
                 fprintf(h_file, "%s\n", include_line);
             }
-            if (strstr(line, ".endfn") != NULL && in_function) {
-                // Add trampoline fix instructions if detected
-                if (current_func.is_trampoline) {
-                    fprintf(c_file, "    /* TRAMPOLINE DETECTED - Cross-function jump to 0x%08X\n", 
-                           current_func.trampoline_target);
-                    fprintf(c_file, "     * Auto-fix: Replace the goto above with:\n");
-                    fprintf(c_file, "     *   pc = 0x%08X;\n", current_func.trampoline_target);
-                    fprintf(c_file, "     *   TARGET_FUNCTION();  // Function containing L_%08X\n", 
-                           current_func.trampoline_target);
-                    fprintf(c_file, "     * Then add to target function start:\n");
-                    fprintf(c_file, "     *   if (pc == 0x%08X) goto L_%08X;\n", 
-                           current_func.trampoline_target, current_func.trampoline_target);
-                    fprintf(c_file, "     */\n");
+            if (strstr(line, ".endfn") != NULL) {
+                if (in_data_section && current_func.is_data_only) {
+                    // Close data array
+                    fprintf(c_file, "};\n\n");
+                    in_data_section = false;
+                } else if (in_function) {
+                    // Add trampoline fix instructions if detected
+                    if (current_func.is_trampoline) {
+                        fprintf(c_file, "    /* TRAMPOLINE DETECTED - Cross-function jump to 0x%08X\n", 
+                               current_func.trampoline_target);
+                        fprintf(c_file, "     * Auto-fix: Replace the goto above with:\n");
+                        fprintf(c_file, "     *   pc = 0x%08X;\n", current_func.trampoline_target);
+                        fprintf(c_file, "     *   TARGET_FUNCTION();  // Function containing L_%08X\n", 
+                               current_func.trampoline_target);
+                        fprintf(c_file, "     * Then add to target function start:\n");
+                        fprintf(c_file, "     *   if (pc == 0x%08X) goto L_%08X;\n", 
+                               current_func.trampoline_target, current_func.trampoline_target);
+                        fprintf(c_file, "     */\n");
+                    }
+                    write_function_end(c_file);
+                    in_function = false;
                 }
-                write_function_end(c_file);
-                in_function = false;
             }
             continue;
         }
@@ -2202,6 +2322,7 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
             current_func.is_trampoline = false;
             current_func.trampoline_target = 0;
             current_func.is_local = parsed.is_local_function;  // Track if static
+            current_func.is_data_only = false;  // TODO: Implement efficient data detection
             
             // Auto-skip gap functions (usually data misidentified as code)
             if (strncmp(current_func.name, "gap_", 4) == 0) {
@@ -2217,6 +2338,17 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
                 current_func.num_int_params = 8;  // r3-r10
                 current_func.num_float_params = 2; // f1-f2
                 current_func.returns_value = false; // Default to void, will be detected later
+            }
+            
+            // For data-only functions, write as byte array instead of function
+            if (current_func.is_data_only) {
+                fprintf(c_file, "// Data section: %s (detected as %s)\n",
+                       current_func.name, current_func.is_local ? "static" : "global");
+                fprintf(c_file, "%sconst uint8_t %s[] __attribute__((aligned(4))) = {\n",
+                       current_func.is_local ? "static " : "", current_func.name);
+                in_function = false;  // Don't treat as function
+                in_data_section = true;  // Flag to output as data
+                continue;
             }
             
             if (!current_func.skip) {
@@ -2276,7 +2408,7 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
                                                   c_code, sizeof(c_code),
                                                   asm_comment, sizeof(asm_comment),
                                                   prev_lines, lines_buffered,
-                                                  &current_func, label_map);
+                                                  &current_func, label_map, string_table);
                 
                 // Fall back to byte-based decoding if text-based failed
                 if (!success) {
@@ -2379,6 +2511,7 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
     
     // Cleanup label map
     if (label_map) labelmap_free(label_map);
+    if (string_table) string_table_free(string_table);
     
     printf("  → %s/%s.c\n", src_dir, base_name);
     printf("  → %s/%s.h\n", inc_dir, base_name);

@@ -37,13 +37,13 @@ static inline int transpile_stfs(const STFS_Instruction *d, char *o, size_t s) {
         return snprintf(o, s, "*(float*)(mem + (int16_t)0x%x) = (float)f%u;",
                        (uint16_t)d->d, d->frS);
     } else if (d->d == 0) {
-        return snprintf(o, s, "*(float*)(mem + r%u) = (float)f%u;",
+        return snprintf(o, s, "*(float*)translate_address(r%u) = (float)f%u;",
                        d->rA, d->frS);
     } else if (d->d > 0) {
-        return snprintf(o, s, "*(float*)(mem + r%u + 0x%x) = (float)f%u;",
+        return snprintf(o, s, "*(float*)translate_address(r%u + 0x%x) = (float)f%u;",
                        d->rA, (uint16_t)d->d, d->frS);
     } else {
-        return snprintf(o, s, "*(float*)(mem + r%u - 0x%x) = (float)f%u;",
+        return snprintf(o, s, "*(float*)translate_address(r%u - 0x%x) = (float)f%u;",
                        d->rA, (uint16_t)(-d->d), d->frS);
     }
 }

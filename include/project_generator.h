@@ -53,24 +53,26 @@ static inline int generate_cmake(const char *project_dir, const char *project_na
     
     fprintf(f, "# Compiler flags\n");
     fprintf(f, "if(MSVC)\n");
-    fprintf(f, "    add_compile_options(/W4)\n");
+    fprintf(f, "    add_compile_options(/W4 /wd4996 /wd4244 /wd4267)\n");
+    fprintf(f, "    # Disable warnings for deprecated functions and type conversions\n");
     fprintf(f, "else()\n");
     fprintf(f, "    add_compile_options(-Wall -Wextra -Wpedantic)\n");
     fprintf(f, "endif()\n\n");
     
-    fprintf(f, "# Source files\n");
-    fprintf(f, "set(SOURCES\n");
-    for (int i = 0; i < c_file_count; i++) {
-        fprintf(f, "    src/%s\n", c_files[i]);
-    }
+    fprintf(f, "# Automatically find all source files recursively\n");
+    fprintf(f, "file(GLOB_RECURSE SOURCES \n");
+    fprintf(f, "    \"src/*.c\"\n");
     fprintf(f, ")\n\n");
     
-    fprintf(f, "# Header files (for IDE project view)\n");
-    fprintf(f, "set(HEADERS\n");
-    for (int i = 0; i < h_file_count; i++) {
-        fprintf(f, "    include/%s\n", h_files[i]);
-    }
+    fprintf(f, "# Automatically find all header files (for IDE project view)\n");
+    fprintf(f, "file(GLOB_RECURSE HEADERS \n");
+    fprintf(f, "    \"include/*.h\"\n");
     fprintf(f, ")\n\n");
+    
+    fprintf(f, "# Print number of files found (helpful for debugging)\n");
+    fprintf(f, "list(LENGTH SOURCES SOURCE_COUNT)\n");
+    fprintf(f, "list(LENGTH HEADERS HEADER_COUNT)\n");
+    fprintf(f, "message(STATUS \"Found ${SOURCE_COUNT} source files and ${HEADER_COUNT} header files\")\n\n");
     
     fprintf(f, "# Create executable\n");
     fprintf(f, "add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS})\n\n");
@@ -225,7 +227,15 @@ static inline int generate_runtime_h(const char *project_dir) {
     fprintf(f, "extern uint32_t *spr;  // Generic SPR array\n\n");
     
     fprintf(f, "extern uint8_t *mem;  // Emulated memory\n");
-    fprintf(f, "#define MEM_SIZE (64 * 1024 * 1024)  // 64MB\n\n");
+    fprintf(f, "#define MEM_SIZE (64 * 1024 * 1024)  // 64MB\n");
+    fprintf(f, "#define MEM_BASE 0x80000000  // GameCube RAM base address\n\n");
+    
+    fprintf(f, "// Safe address translation macro - translates GameCube addresses to mem buffer offsets\n");
+    fprintf(f, "// Must be a macro (not inline function) to avoid linker issues in C99 mode\n");
+    fprintf(f, "#define translate_address(addr) \\\n");
+    fprintf(f, "    (((addr) >= MEM_BASE && (addr) < (MEM_BASE + MEM_SIZE)) \\\n");
+    fprintf(f, "     ? (mem + ((addr) - MEM_BASE)) \\\n");
+    fprintf(f, "     : mem)  /* Return mem base for invalid addresses */\n\n");
     
     fprintf(f, "/**\n");
     fprintf(f, " * @brief Initialize the runtime environment\n");
@@ -302,9 +312,10 @@ static inline int generate_runtime_c(const char *project_dir) {
     
     fprintf(f, "    // Initialize registers\n");
     fprintf(f, "    memset(sr, 0, sizeof(sr));\n");
-    fprintf(f, "    r1 = 0x81700000;  // Default stack pointer\n");
-    fprintf(f, "    r2 = 0x80000000;  // Default r2 (RTOC)\n");
-    fprintf(f, "    r13 = 0x80000000; // Default r13 (SDA base)\n\n");
+    fprintf(f, "    r1 = 0x81700000;  // Stack pointer (stack grows downward)\n");
+    fprintf(f, "    // r2 and r13 are Small Data Area bases - from __start.s\n");
+    fprintf(f, "    r2 = 0x804DF9E0;  // SDA2 base (_SDA2_BASE_)\n");
+    fprintf(f, "    r13 = 0x804DB6A0; // SDA base (_SDA_BASE_)\n\n");
     
     fprintf(f, "    return 0;\n");
     fprintf(f, "}\n\n");

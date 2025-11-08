@@ -70,20 +70,20 @@ static inline int transpile_stb(const STB_Instruction *decoded,
                                 size_t output_size) {
     if (decoded->rA == 0) {
         return snprintf(output, output_size,
-                       "*(uint8_t*)(mem + 0x%x) = r%u;",
+                       "*(uint8_t*)translate_address(0x%x) = r%u;",
                        (uint32_t)decoded->d, decoded->rS);
     } else {
         if (decoded->d == 0) {
             return snprintf(output, output_size,
-                           "*(uint8_t*)(mem + r%u) = r%u;",
+                           "*(uint8_t*)translate_address(r%u) = r%u;",
                            decoded->rA, decoded->rS);
         } else if (decoded->d > 0) {
             return snprintf(output, output_size,
-                           "*(uint8_t*)(mem + r%u + 0x%x) = r%u;",
+                           "*(uint8_t*)translate_address(r%u + 0x%x) = r%u;",
                            decoded->rA, (uint16_t)decoded->d, decoded->rS);
         } else {
             return snprintf(output, output_size,
-                           "*(uint8_t*)(mem + r%u - 0x%x) = r%u;",
+                           "*(uint8_t*)translate_address(r%u - 0x%x) = r%u;",
                            decoded->rA, (uint16_t)(-decoded->d), decoded->rS);
         }
     }
