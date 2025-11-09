@@ -45,7 +45,7 @@ static inline int transpile_lwbrx(const LWBRX_Instruction *d, char *o, size_t s)
                        d->rB, d->rD);
     }
     return snprintf(o, s,
-                   "{ uint32_t val = *(uint32_t*)(mem + r%u + r%u); "
+                   "{ uint32_t val = *(uint32_t*)translate_address(r%u + r%u); "
                    "r%u = ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) | "
                    "((val >> 8) & 0xFF00) | ((val >> 24) & 0xFF); }",
                    d->rA, d->rB, d->rD);

@@ -45,7 +45,7 @@ static inline int transpile_sthbrx(const STHBRX_Instruction *d, char *o, size_t 
     }
     return snprintf(o, s,
                    "{ uint16_t val = (uint16_t)r%u; "
-                   "*(uint16_t*)(mem + r%u + r%u) = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF); }",
+                   "*(uint16_t*)translate_address(r%u + r%u) = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF); }",
                    d->rS, d->rA, d->rB);
 }
 

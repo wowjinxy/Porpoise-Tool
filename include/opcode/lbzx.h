@@ -27,7 +27,7 @@ static inline int transpile_lbzx(const LBZX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
         return snprintf(o, s, "r%u = *(uint8_t*)translate_address(r%u);", d->rD, d->rB);
     }
-    return snprintf(o, s, "r%u = *(uint8_t*)(mem + r%u + r%u);", d->rD, d->rA, d->rB);
+    return snprintf(o, s, "r%u = *(uint8_t*)translate_address(r%u + r%u);", d->rD, d->rA, d->rB);
 }
 
 static inline int comment_lbzx(const LBZX_Instruction *d, char *o, size_t s) {

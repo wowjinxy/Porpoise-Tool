@@ -27,7 +27,7 @@ static inline int transpile_sthx(const STHX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
         return snprintf(o, s, "*(uint16_t*)translate_address(r%u) = (uint16_t)r%u;", d->rB, d->rS);
     }
-    return snprintf(o, s, "*(uint16_t*)(mem + r%u + r%u) = (uint16_t)r%u;", d->rA, d->rB, d->rS);
+    return snprintf(o, s, "*(uint16_t*)translate_address(r%u + r%u) = (uint16_t)r%u;", d->rA, d->rB, d->rS);
 }
 
 static inline int comment_sthx(const STHX_Instruction *d, char *o, size_t s) {

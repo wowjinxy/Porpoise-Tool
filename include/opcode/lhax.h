@@ -39,7 +39,7 @@ static inline int transpile_lhax(const LHAX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
         return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)translate_address(r%u);", d->rD, d->rB);
     }
-    return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)(mem + r%u + r%u);", d->rD, d->rA, d->rB);
+    return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)translate_address(r%u + r%u);", d->rD, d->rA, d->rB);
 }
 
 static inline int comment_lhax(const LHAX_Instruction *d, char *o, size_t s) {

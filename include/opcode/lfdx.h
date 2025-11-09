@@ -38,7 +38,7 @@ static inline int transpile_lfdx(const LFDX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
         return snprintf(o, s, "f%u = *(double*)translate_address(r%u);", d->frD, d->rB);
     }
-    return snprintf(o, s, "f%u = *(double*)(mem + r%u + r%u);", d->frD, d->rA, d->rB);
+    return snprintf(o, s, "f%u = *(double*)translate_address(r%u + r%u);", d->frD, d->rA, d->rB);
 }
 
 static inline int comment_lfdx(const LFDX_Instruction *d, char *o, size_t s) {

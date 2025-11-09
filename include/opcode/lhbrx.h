@@ -44,7 +44,7 @@ static inline int transpile_lhbrx(const LHBRX_Instruction *d, char *o, size_t s)
                        d->rB, d->rD);
     }
     return snprintf(o, s,
-                   "{ uint16_t val = *(uint16_t*)(mem + r%u + r%u); "
+                   "{ uint16_t val = *(uint16_t*)translate_address(r%u + r%u); "
                    "r%u = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF); }",
                    d->rA, d->rB, d->rD);
 }

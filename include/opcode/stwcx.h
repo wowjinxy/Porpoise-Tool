@@ -35,7 +35,7 @@ static inline int transpile_stwcx(const STWCX_Instruction *d, char *o, size_t s)
                        d->rB, d->rS);
     }
     return snprintf(o, s,
-                   "{ *(uint32_t*)(mem + r%u + r%u) = r%u; "
+                   "{ *(uint32_t*)translate_address(r%u + r%u) = r%u; "
                    "cr0 = 0x2 | (xer >> 28 & 0x1); }  /* conditional store success */",
                    d->rA, d->rB, d->rS);
 }

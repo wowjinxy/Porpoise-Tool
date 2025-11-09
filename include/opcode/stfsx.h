@@ -38,7 +38,7 @@ static inline int transpile_stfsx(const STFSX_Instruction *d, char *o, size_t s)
     if (d->rA == 0) {
         return snprintf(o, s, "*(float*)translate_address(r%u) = (float)f%u;", d->rB, d->frS);
     }
-    return snprintf(o, s, "*(float*)(mem + r%u + r%u) = (float)f%u;", d->rA, d->rB, d->frS);
+    return snprintf(o, s, "*(float*)translate_address(r%u + r%u) = (float)f%u;", d->rA, d->rB, d->frS);
 }
 
 static inline int comment_stfsx(const STFSX_Instruction *d, char *o, size_t s) {
