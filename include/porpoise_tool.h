@@ -187,20 +187,78 @@ static inline bool is_reserved_name(const char *name) {
 }
 
 /**
- * @brief Sanitize a function name by adding suffix if it's reserved
+ * @brief Sanitize a function name by removing quotes and special characters
  * @param name Original function name
  * @param output Buffer to store sanitized name
  * @param output_size Size of output buffer
  * @return Pointer to output buffer
  */
 static inline const char* sanitize_function_name(const char *name, char *output, size_t output_size) {
-    if (is_reserved_name(name)) {
-        // Add _impl suffix to avoid conflicts
-        snprintf(output, output_size, "%s_impl", name);
-        return output;
+    static char stub_name[256];  // Static for stub names
+    
+    // Create a clean copy without quotes first
+    char clean_name[512];
+    strncpy(clean_name, name, sizeof(clean_name) - 1);
+    clean_name[sizeof(clean_name) - 1] = '\0';
+    
+    // Skip leading and trailing quotes
+    if (clean_name[0] == '"') {
+        size_t len = strlen(clean_name);
+        memmove(clean_name, clean_name + 1, len);
+        len = strlen(clean_name);
+        if (len > 0 && clean_name[len - 1] == '"') {
+            clean_name[len - 1] = '\0';
+        }
     }
-    // Name is fine as-is
-    return name;
+    
+    // Check if it needs to be stubbed (contains problematic chars or is too long)
+    if (strlen(clean_name) > 80 || strchr(clean_name, '<') != NULL || 
+        strchr(clean_name, '>') != NULL || strchr(clean_name, ',') != NULL ||
+        strchr(clean_name, '@') != NULL) {
+        // Create stub name based on hash
+        unsigned int hash = 0;
+        for (const char *p = clean_name; *p; p++) {
+            hash = hash * 31 + (unsigned char)*p;
+        }
+        snprintf(stub_name, sizeof(stub_name), "cpp_stub_func_%08x", hash);
+        return stub_name;
+    }
+    
+    // Otherwise, sanitize normally (replace invalid chars with underscores)
+    const char *src = clean_name;
+    char *dst = output;
+    size_t remaining = output_size - 1; // Leave room for null terminator
+    
+    // Copy and sanitize characters
+    while (*src && remaining > 0) {
+        // Replace invalid C identifier characters
+        if ((*src >= 'a' && *src <= 'z') ||
+            (*src >= 'A' && *src <= 'Z') ||
+            (*src >= '0' && *src <= '9') ||
+            *src == '_') {
+            // Valid identifier character
+            *dst++ = *src++;
+            remaining--;
+        } else {
+            // Invalid character - replace with underscore
+            *dst++ = '_';
+            src++;
+            remaining--;
+        }
+    }
+    
+    *dst = '\0';
+    
+    // Check if the sanitized name is a reserved word
+    if (is_reserved_name(output)) {
+        // Add _impl suffix
+        size_t len = strlen(output);
+        if (len + 5 < output_size) { // "_impl" is 5 chars
+            strcat(output, "_impl");
+        }
+    }
+    
+    return output;
 }
 
 //==============================================================================
@@ -999,6 +1057,7 @@ static inline void write_c_file_start(FILE *c_file, const char *header_filename)
     fprintf(c_file, " * Transpiled by Porpoise Tool\n");
     fprintf(c_file, " * PowerPC to C Transpiler for GameCube/Wii\n");
     fprintf(c_file, " */\n\n");
+    fprintf(c_file, "#include \"stdlib_headers.h\"  // Standard library headers\n");
     fprintf(c_file, "#include \"%s\"\n", header_filename);
     fprintf(c_file, "#include \"gecko_memory.h\"  // For memory access\n\n");
     fprintf(c_file, "// CPU Register declarations (global for simplicity)\n");

@@ -10,9 +10,75 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <ctype.h>
 #include "porpoise_tool.h"
 #include "opcode.h"
 #include "project_generator.h"
+
+// SDK function address translation configuration
+typedef struct {
+    char name[128];
+    int pointer_params[10];  // Indices of params that are pointers (0-based, -1 terminated)
+    int num_pointer_params;
+} SDK_Function_Info;
+
+static SDK_Function_Info *sdk_functions = NULL;
+static int sdk_functions_count = 0;
+
+// Load SDK functions list from file
+static void load_sdk_functions(const char *filepath) {
+    FILE *f = fopen(filepath, "r");
+    if (!f) return;
+    
+    char line[256];
+    int capacity = 100;
+    sdk_functions = (SDK_Function_Info*)malloc(capacity * sizeof(SDK_Function_Info));
+    sdk_functions_count = 0;
+    
+    while (fgets(line, sizeof(line), f)) {
+        // Skip comments and empty lines
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        
+        // Parse line: FunctionName:param1,param2,param3
+        char func_name[128];
+        char params_str[128] = "";
+        
+        if (sscanf(line, "%127[^:]:%127s", func_name, params_str) < 1) continue;
+        
+        // Expand capacity if needed
+        if (sdk_functions_count >= capacity) {
+            capacity *= 2;
+            sdk_functions = (SDK_Function_Info*)realloc(sdk_functions, capacity * sizeof(SDK_Function_Info));
+        }
+        
+        SDK_Function_Info *info = &sdk_functions[sdk_functions_count++];
+        strncpy(info->name, func_name, sizeof(info->name) - 1);
+        info->name[sizeof(info->name) - 1] = '\0';
+        info->num_pointer_params = 0;
+        
+        // Parse pointer parameter indices
+        if (params_str[0] != '\0' && params_str[0] != '\n' && params_str[0] != '\r') {
+            char *token = strtok(params_str, ",");
+            while (token && info->num_pointer_params < 10) {
+                info->pointer_params[info->num_pointer_params++] = atoi(token);
+                token = strtok(NULL, ",");
+            }
+        }
+        info->pointer_params[info->num_pointer_params] = -1;  // Terminate
+    }
+    
+    fclose(f);
+}
+
+// Check if a function is an SDK function and get its pointer params
+static const SDK_Function_Info* get_sdk_function_info(const char *func_name) {
+    for (int i = 0; i < sdk_functions_count; i++) {
+        if (strcmp(sdk_functions[i].name, func_name) == 0) {
+            return &sdk_functions[i];
+        }
+    }
+    return NULL;
+}
 
 /**
  * @brief Transpile from assembly text (mnemonic + operands)
@@ -131,8 +197,20 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
     // Handle branches by parsing operands directly
     if (strcmp(mnemonic, "b") == 0 || strcmp(mnemonic, "bl") == 0 || 
         strcmp(mnemonic, "ba") == 0 || strcmp(mnemonic, "bla") == 0) {
-        char target[128];
-        sscanf(operands, "%127s", target);
+        char target[512];  // Increased buffer for long C++ mangled names
+        sscanf(operands, "%511s", target);
+        
+        // Strip quotes from function names (C++ templates use quoted names in assembly)
+        if (target[0] == '"') {
+            size_t len = strlen(target);
+            // Move string left by 1 to remove leading quote
+            memmove(target, target + 1, len);
+            len = strlen(target);
+            // Remove trailing quote if present
+            if (len > 0 && target[len - 1] == '"') {
+                target[len - 1] = '\0';
+            }
+        }
         
         // Check if it's an absolute address (starts with 0x)
         if (target[0] == '0' && target[1] == 'x') {
@@ -198,18 +276,77 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
             } else {
                 // It's a function name (external or other file)
                 // Both b and bl should be function calls for external symbols
-                // Sanitize function name to avoid conflicts with compiler intrinsics
-                char sanitized_name[MAX_FUNCTION_NAME];
-                const char *func_name = sanitize_function_name(target, sanitized_name, sizeof(sanitized_name));
+                // NOTE: Don't sanitize function names when calling them
+                // Only sanitize when defining to avoid redefinition conflicts
+                // This allows calling standard library functions directly
                 
-                // Always pass all potential parameter registers
-                const char *params = "r3, r4, r5, r6, r7, r8, r9, r10, f1, f2";
+                // Rename __va_arg to ppc_va_arg to avoid MSVC intrinsic conflict
+                const char *actual_target = target;
+                static char stub_name[256];  // Static so it persists after function returns
+                
+                if (strcmp(target, "__va_arg") == 0) {
+                    actual_target = "ppc_va_arg";
+                }
+                // Handle C++ template names, @unnamed@ patterns, and extremely long mangled names
+                // These contain '<', '>', ',', '@' or are very long
+                else if (strlen(target) > 80 || strchr(target, '<') != NULL || 
+                         strchr(target, '>') != NULL || strchr(target, ',') != NULL ||
+                         strchr(target, '@') != NULL) {
+                    // Create a shorter stub name based on hash
+                    unsigned int hash = 0;
+                    for (const char *p = target; *p; p++) {
+                        hash = hash * 31 + (unsigned char)*p;
+                    }
+                    snprintf(stub_name, sizeof(stub_name), "cpp_stub_func_%08x", hash);
+                    actual_target = stub_name;
+                }
+                
+                // Check if this is an SDK function requiring address translation
+                const SDK_Function_Info *sdk_info = get_sdk_function_info(actual_target);
+                
+                char params[512];
+                if (sdk_info && sdk_info->num_pointer_params > 0) {
+                    // Build parameter list with translate_address() for pointer params
+                    const char *reg_names[] = {"r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "f1", "f2"};
+                    char *p = params;
+                    size_t remaining = sizeof(params);
+                    
+                    for (int i = 0; i < 10; i++) {
+                        if (i > 0) {
+                            int written = snprintf(p, remaining, ", ");
+                            p += written;
+                            remaining -= written;
+                        }
+                        
+                        // Check if this parameter index needs translation
+                        bool needs_translation = false;
+                        for (int j = 0; j < sdk_info->num_pointer_params; j++) {
+                            if (sdk_info->pointer_params[j] == i) {
+                                needs_translation = true;
+                                break;
+                            }
+                        }
+                        
+                        if (needs_translation) {
+                            int written = snprintf(p, remaining, "(void*)(uintptr_t)translate_address(%s)", reg_names[i]);
+                            p += written;
+                            remaining -= written;
+                        } else {
+                            int written = snprintf(p, remaining, "%s", reg_names[i]);
+                            p += written;
+                            remaining -= written;
+                        }
+                    }
+                } else {
+                    // No translation needed - pass registers as-is
+                    snprintf(params, sizeof(params), "r3, r4, r5, r6, r7, r8, r9, r10, f1, f2");
+                }
                 
                 if (strcmp(mnemonic, "bl") == 0 || strcmp(mnemonic, "bla") == 0) {
-                    snprintf(output, output_size, "%s(%s);", func_name, params);
+                    snprintf(output, output_size, "%s(%s);", actual_target, params);
                 } else {
                     // Tail call optimization (branch without link)
-                    snprintf(output, output_size, "return %s(%s);  /* Tail call */", func_name, params);
+                    snprintf(output, output_size, "return %s(%s);  /* Tail call */", actual_target, params);
                 }
             }
         }
@@ -2225,8 +2362,35 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
             
             ASM_Line parsed;
             if (parse_asm_line(scan_line, &parsed) && parsed.is_function && parsed.is_local_function) {
-                fprintf(c_file, "static void %s(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double);\n", 
-                       parsed.function_name);
+                // Strip quotes and handle special characters in function names
+                char clean_name[512];
+                strncpy(clean_name, parsed.function_name, sizeof(clean_name) - 1);
+                clean_name[sizeof(clean_name) - 1] = '\0';
+                
+                // Strip quotes
+                if (clean_name[0] == '"') {
+                    size_t len = strlen(clean_name);
+                    memmove(clean_name, clean_name + 1, len);
+                    len = strlen(clean_name);
+                    if (len > 0 && clean_name[len - 1] == '"') {
+                        clean_name[len - 1] = '\0';
+                    }
+                }
+                
+                // Check if it needs to be stubbed (contains invalid C identifier chars)
+                if (strlen(clean_name) > 80 || strchr(clean_name, '<') != NULL || 
+                    strchr(clean_name, '>') != NULL || strchr(clean_name, ',') != NULL ||
+                    strchr(clean_name, '@') != NULL) {
+                    // Create stub name based on hash
+                    unsigned int hash = 0;
+                    for (const char *p = clean_name; *p; p++) {
+                        hash = hash * 31 + (unsigned char)*p;
+                    }
+                    fprintf(c_file, "static void cpp_stub_func_%08x(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double);\n", hash);
+                } else {
+                    fprintf(c_file, "static void %s(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double);\n", 
+                           clean_name);
+                }
             }
         }
         fclose(scan_file);
@@ -2643,6 +2807,39 @@ int generate_project(const char *output_dir, const char *dir_path) {
     generate_runtime_c(output_dir);
     generate_main_c(output_dir);
     
+    printf("Copying core headers...\n");
+    // Copy stdlib_headers.h
+    char stdlib_src[512], stdlib_dst[512];
+    snprintf(stdlib_src, sizeof(stdlib_src), "include/stdlib_headers.h");
+    snprintf(stdlib_dst, sizeof(stdlib_dst), "%s/include/stdlib_headers.h", output_dir);
+    FILE *src_file = fopen(stdlib_src, "r");
+    FILE *dst_file = fopen(stdlib_dst, "w");
+    if (src_file && dst_file) {
+        char buffer[4096];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), src_file)) > 0) {
+            fwrite(buffer, 1, bytes, dst_file);
+        }
+        fclose(src_file);
+        fclose(dst_file);
+    }
+    
+    // Copy gecko_memory.h
+    char gecko_src[512], gecko_dst[512];
+    snprintf(gecko_src, sizeof(gecko_src), "include/gecko_memory.h");
+    snprintf(gecko_dst, sizeof(gecko_dst), "%s/include/gecko_memory.h", output_dir);
+    src_file = fopen(gecko_src, "r");
+    dst_file = fopen(gecko_dst, "w");
+    if (src_file && dst_file) {
+        char buffer[4096];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), src_file)) > 0) {
+            fwrite(buffer, 1, bytes, dst_file);
+        }
+        fclose(src_file);
+        fclose(dst_file);
+    }
+    
     printf("Generating documentation...\n");
     generate_readme(output_dir, proj_name);
     generate_gitignore(output_dir);
@@ -2789,6 +2986,9 @@ int main(int argc, char *argv[]) {
            get_implemented_opcode_count(),
            get_implementation_progress());
     printf("===========================================\n\n");
+    
+    // Load SDK functions configuration for address translation
+    load_sdk_functions("projects/sdk_functions_list.txt");
     
     // Check for help flag
     bool show_help = (argc < 2);
@@ -2941,6 +3141,38 @@ int main(int argc, char *argv[]) {
     generate_compiler_runtime_c(output_project);
     generate_main_c(output_project);
     generate_macros_h(output_project);
+    
+    // Copy core headers to project
+    printf("Copying core headers to project...\n");
+    
+    // List of headers to copy
+    const char *headers_to_copy[] = {
+        "stdlib_headers.h",
+        "stdlib_stubs.h",
+        "gecko_memory.h",
+        NULL
+    };
+    
+    for (int i = 0; headers_to_copy[i] != NULL; i++) {
+        char src_path[512], dst_path[512];
+        snprintf(src_path, sizeof(src_path), "include/%s", headers_to_copy[i]);
+        snprintf(dst_path, sizeof(dst_path), "%s/include/%s", output_project, headers_to_copy[i]);
+        
+        FILE *src_file = fopen(src_path, "r");
+        FILE *dst_file = fopen(dst_path, "w");
+        if (src_file && dst_file) {
+            char buffer[4096];
+            size_t bytes;
+            while ((bytes = fread(buffer, 1, sizeof(buffer), src_file)) > 0) {
+                fwrite(buffer, 1, bytes, dst_file);
+            }
+            fclose(src_file);
+            fclose(dst_file);
+        } else {
+            fprintf(stderr, "Warning: Could not copy %s\n", headers_to_copy[i]);
+        }
+    }
+    
     generate_readme(output_project, proj_name);
     generate_gitignore(output_project);
     

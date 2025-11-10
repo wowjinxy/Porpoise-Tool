@@ -10,6 +10,9 @@ build/
 *.dll
 *.dylib
 
+# Generated projects
+projects/
+
 # Generated transpiler output (optional - may want to commit these)
 # Uncomment if you don't want to track generated .c/.h files
 # Test Asm/*.c
@@ -39,3 +42,6 @@ desktop.ini
 *.tmp
 *.temp
 
+/GameCube_Project
+/PikminProject
+*.bat

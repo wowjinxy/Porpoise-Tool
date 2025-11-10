@@ -1,3 +1,16 @@
+# Porpoise Tool
+
+## 🎉 Runtime Issues Solved! (2025-01-10)
+
+All compiler intrinsics and CRT conflicts have been resolved! See:
+- **[QUICKSTART_RUNTIME.md](QUICKSTART_RUNTIME.md)** - Get started in 5 minutes
+- **[RUNTIME_ISSUES_SOLVED.md](RUNTIME_ISSUES_SOLVED.md)** - What was fixed
+- **[PIKMIN_INTEGRATION.md](PIKMIN_INTEGRATION.md)** - Integrate with your project
+
+To build: `build_all_runtime.bat`
+
+---
+
 # Porpoise Tool 🐬
 
 **PowerPC to C Transpiler for GameCube/Wii Decompilation Projects**
