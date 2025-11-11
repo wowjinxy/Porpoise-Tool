@@ -138,9 +138,14 @@ static inline int generate_main_c(const char *project_dir) {
     fprintf(f, "        return 1;\n");
     fprintf(f, "    }\n\n");
     
+    fprintf(f, "    // Initialize function registry for indirect calls\n");
+    fprintf(f, "    extern void init_function_registry(void);\n");
+    fprintf(f, "    init_function_registry();\n\n");
+    
     fprintf(f, "    printf(\"Runtime initialized successfully\\n\");\n");
     fprintf(f, "    printf(\"  - Emulated memory: %%d MB\\n\", MEM_SIZE / (1024 * 1024));\n");
-    fprintf(f, "    printf(\"  - PowerPC registers: Ready\\n\\n\");\n\n");
+    fprintf(f, "    printf(\"  - PowerPC registers: Ready\\n\");\n");
+    fprintf(f, "    printf(\"  - Function registry: Loaded\\n\\n\");\n\n");
     
     fprintf(f, "    // Call the game's main if it exists\n");
     fprintf(f, "    // Uncomment these lines if your game has a main() function:\n");
@@ -203,10 +208,11 @@ static inline int generate_runtime_h(const char *project_dir) {
     fprintf(f, "#endif\n\n");
     
     fprintf(f, "// PowerPC register state\n");
-    fprintf(f, "extern uint32_t r0, r1, r2, r3, r4, r5, r6, r7;\n");
-    fprintf(f, "extern uint32_t r8, r9, r10, r11, r12, r13, r14, r15;\n");
-    fprintf(f, "extern uint32_t r16, r17, r18, r19, r20, r21, r22, r23;\n");
-    fprintf(f, "extern uint32_t r24, r25, r26, r27, r28, r29, r30, r31;\n\n");
+    fprintf(f, "// Using uintptr_t to hold both GameCube 32-bit values and 64-bit host pointers\n");
+    fprintf(f, "extern uintptr_t r0, r1, r2, r3, r4, r5, r6, r7;\n");
+    fprintf(f, "extern uintptr_t r8, r9, r10, r11, r12, r13, r14, r15;\n");
+    fprintf(f, "extern uintptr_t r16, r17, r18, r19, r20, r21, r22, r23;\n");
+    fprintf(f, "extern uintptr_t r24, r25, r26, r27, r28, r29, r30, r31;\n\n");
     
     fprintf(f, "extern double f0, f1, f2, f3, f4, f5, f6, f7;\n");
     fprintf(f, "extern double f8, f9, f10, f11, f12, f13, f14, f15;\n");
@@ -277,10 +283,11 @@ static inline int generate_runtime_c(const char *project_dir) {
     fprintf(f, "#include <string.h>\n\n");
     
     fprintf(f, "// PowerPC register state\n");
-    fprintf(f, "uint32_t r0, r1, r2, r3, r4, r5, r6, r7;\n");
-    fprintf(f, "uint32_t r8, r9, r10, r11, r12, r13, r14, r15;\n");
-    fprintf(f, "uint32_t r16, r17, r18, r19, r20, r21, r22, r23;\n");
-    fprintf(f, "uint32_t r24, r25, r26, r27, r28, r29, r30, r31;\n\n");
+    fprintf(f, "// Using uintptr_t to hold both GameCube 32-bit values and 64-bit host pointers\n");
+    fprintf(f, "uintptr_t r0, r1, r2, r3, r4, r5, r6, r7;\n");
+    fprintf(f, "uintptr_t r8, r9, r10, r11, r12, r13, r14, r15;\n");
+    fprintf(f, "uintptr_t r16, r17, r18, r19, r20, r21, r22, r23;\n");
+    fprintf(f, "uintptr_t r24, r25, r26, r27, r28, r29, r30, r31;\n\n");
     
     fprintf(f, "double f0, f1, f2, f3, f4, f5, f6, f7;\n");
     fprintf(f, "double f8, f9, f10, f11, f12, f13, f14, f15;\n");
@@ -557,6 +564,20 @@ static inline int generate_gitignore(const char *project_dir) {
     fprintf(f, "*~\n");
     
     fclose(f);
+    return 0;
+}
+
+/**
+ * @brief Generate function_registry.c with all function mappings
+ * This function must be called from porpoise_tool.c where function_registry is accessible
+ */
+static inline int generate_function_registry_impl(const char *project_dir,
+                                                  void *registry, int count) {
+    // This is a placeholder - the actual implementation needs access to function_registry
+    // which is defined in porpoise_tool.c
+    (void)project_dir;
+    (void)registry;
+    (void)count;
     return 0;
 }
 

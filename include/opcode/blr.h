@@ -85,10 +85,12 @@ static inline int transpile_blr(const BLR_Instruction *decoded,
                                 size_t output_size) {
     if (is_unconditional_blr(decoded)) {
         if (decoded->LK) {
-            // blrl - branch and link to LR (unusual)
+            // blrl - indirect call via LR
+            // Use function resolver to handle GameCube function pointers
+            uint32_t return_addr = current_addr + 4;
             return snprintf(output, output_size,
-                           "{ uint32_t target = lr; lr = 0x%08X; goto *target; }",
-                           current_addr + 4);
+                           "{ uintptr_t saved_lr = lr; lr = 0x%08X; call_indirect((uint32_t)saved_lr, r3, r4, r5, r6, r7, r8, r9, r10, f1, f2); }",
+                           return_addr);
         } else {
             // blr - simple return
             return snprintf(output, output_size, "return;");

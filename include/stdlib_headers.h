@@ -20,7 +20,10 @@
 
 // Include stdlib stub declarations that match transpiler's 10-parameter signature
 // These override the standard library declarations
-#include "stdlib_stubs.h"
+// NOTE: If the project already has MSL_C headers (Metrowerks), they take precedence
+#ifndef SKIP_STDLIB_STUBS
+    #include "stdlib_stubs.h"
+#endif
 
 // Suppress warnings for unused parameters (common in transpiled code)
 #ifdef _MSC_VER

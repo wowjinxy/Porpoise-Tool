@@ -1,0 +1,88 @@
+# SDK Function Signatures
+# Format: FunctionName:param1_type,param2_type,param3_type
+# Types: ptr (pointer), int (integer), float, double
+# The transpiler will cast registers to these types for SDK calls
+
+# OS Thread Functions
+OSInitThreadQueue:ptr
+OSGetCurrentThread:
+OSIsThreadSuspended:ptr
+OSIsThreadTerminated:ptr
+OSDisableScheduler:
+OSEnableScheduler:
+OSYieldThread:
+OSCreateThread:ptr,ptr,ptr,ptr,int,int,int
+OSExitThread:ptr
+OSCancelThread:ptr
+OSJoinThread:ptr,ptr
+OSDetachThread:ptr
+OSResumeThread:ptr
+OSSuspendThread:ptr
+OSSetThreadPriority:ptr,int
+OSGetThreadPriority:ptr
+OSSleepThread:ptr
+OSWakeupThread:ptr
+OSGetThreadSpecific:int
+OSSetThreadSpecific:int,ptr
+OSClearStack:int
+OSCheckActiveThreads:
+OSSleepTicks:int,int
+
+# OS Message Functions
+OSInitMessageQueue:ptr,ptr,int
+OSSendMessage:ptr,ptr,int
+OSJamMessage:ptr,ptr,int
+OSReceiveMessage:ptr,ptr,int
+
+# OS Initialization
+OSInit:
+OSReport:ptr
+OSPanic:ptr,int,ptr
+
+# OS Memory/Arena
+OSGetArenaHi:
+OSGetArenaLo:
+OSSetArenaHi:ptr
+OSSetArenaLo:ptr
+OSGetMEM1ArenaHi:
+OSGetMEM1ArenaLo:
+OSSetMEM1ArenaHi:ptr
+OSSetMEM1ArenaLo:ptr
+OSGetMEM2ArenaHi:
+OSGetMEM2ArenaLo:
+OSSetMEM2ArenaHi:ptr
+OSSetMEM2ArenaLo:ptr
+
+# OS Allocation
+OSInitAlloc:ptr,ptr,int
+OSCreateHeap:ptr,ptr
+OSDestroyHeap:int
+OSSetCurrentHeap:int
+OSGetCurrentHeap:
+OSAllocFromHeap:int,int
+OSFreeToHeap:int,ptr
+
+# DVD Functions
+DVDInit:
+DVDOpen:ptr,ptr
+DVDClose:ptr
+DVDReadAsync:ptr,ptr,int,int,ptr
+
+# Card Functions
+CARDInit:
+
+# VI Functions
+VIInit:
+VISetPostRetraceCallback:ptr
+
+# PAD Functions
+PADInit:
+PADRead:ptr
+
+# AR/ARQ Functions
+ARInit:ptr,int
+ARQInit:
+
+# EXI Functions
+EXIInit:
+

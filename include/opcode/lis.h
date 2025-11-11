@@ -72,11 +72,23 @@ static inline int transpile_lis(const LIS_Instruction *decoded,
                                 size_t output_size) {
     if (decoded->rA == 0) {
         // lis rD, SIMM (load immediate shifted)
-        return snprintf(output, output_size,
-                       "r%u = 0x%x << 16;",
-                       decoded->rD, (uint16_t)decoded->SIMM);
+        uint32_t addr = (uint16_t)decoded->SIMM << 16;
+        
+        // Check if this is a GameCube address (0x80000000-0x84000000 range)
+        // If so, translate it to a host pointer immediately
+        if (addr >= 0x80000000 && addr < 0x84000000) {
+            return snprintf(output, output_size,
+                           "r%u = (uintptr_t)translate_address(0x%x << 16);",
+                           decoded->rD, (uint16_t)decoded->SIMM);
+        } else {
+            return snprintf(output, output_size,
+                           "r%u = 0x%x << 16;",
+                           decoded->rD, (uint16_t)decoded->SIMM);
+        }
     } else {
         // addis rD, rA, SIMM
+        // Note: We can't translate here because rA might already be a host pointer
+        // or might need offset added first. Leave as-is.
         return snprintf(output, output_size,
                        "r%u = r%u + (0x%x << 16);",
                        decoded->rD, decoded->rA, (uint16_t)decoded->SIMM);

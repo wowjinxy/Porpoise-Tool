@@ -93,6 +93,7 @@ static inline bool is_reserved_name(const char *name) {
         "abort",         // stdlib.h - abort program
         "_Exit",         // stdlib.h - exit without cleanup
         "atexit",        // stdlib.h - register exit handler
+        "abs",           // stdlib.h - absolute value (conflicts with transpiled version)
         "memcpy",        // string.h
         "memmove",       // string.h
         "memset",        // string.h
@@ -993,8 +994,9 @@ static inline void write_function_declaration(FILE *h_file, const Function_Info 
         return;
     }
     
-    // Skip standard library intrinsic functions - these are provided by the compiler
+    // Skip standard library and SDK functions - these have their own declarations
     const char *intrinsics[] = {
+        // Standard library
         "memset", "memcpy", "memmove", "memcmp",
         "strcmp", "strcpy", "strncpy", "strlen", "strncmp",
         "sprintf", "printf", "vprintf", "vsnprintf",
@@ -1004,7 +1006,33 @@ static inline void write_function_declaration(FILE *h_file, const Function_Info 
         "sqrt", "round",
         "malloc", "free", "calloc", "realloc",
         "rand", "srand",
-        "main",  // Don't redeclare main - it's special
+        "main",
+        // SDK OS functions
+        "OSInit", "OSReport", "OSPanic", "OSError",
+        "OSInitThreadQueue", "OSGetCurrentThread", "OSIsThreadSuspended", "OSIsThreadTerminated",
+        "OSDisableScheduler", "OSEnableScheduler", "OSYieldThread",
+        "OSCreateThread", "OSExitThread", "OSCancelThread", "OSJoinThread", "OSDetachThread",
+        "OSResumeThread", "OSSuspendThread", "OSSetThreadPriority", "OSGetThreadPriority",
+        "OSSleepThread", "OSWakeupThread", "OSGetThreadSpecific", "OSSetThreadSpecific",
+        "OSClearStack", "OSCheckActiveThreads", "OSSleepTicks",
+        "OSInitMessageQueue", "OSSendMessage", "OSJamMessage", "OSReceiveMessage",
+        "OSGetArenaHi", "OSGetArenaLo", "OSSetArenaHi", "OSSetArenaLo",
+        "OSGetMEM1ArenaHi", "OSGetMEM1ArenaLo", "OSSetMEM1ArenaHi", "OSSetMEM1ArenaLo",
+        "OSGetMEM2ArenaHi", "OSGetMEM2ArenaLo", "OSSetMEM2ArenaHi", "OSSetMEM2ArenaLo",
+        "OSInitAlloc", "OSCreateHeap", "OSDestroyHeap", "OSSetCurrentHeap", "OSGetCurrentHeap",
+        "OSAllocFromHeap", "OSFreeToHeap",
+        // SDK DVD functions
+        "DVDInit", "DVDOpen", "DVDClose", "DVDReadAsync",
+        // SDK Card functions
+        "CARDInit",
+        // SDK VI functions
+        "VIInit", "VISetPostRetraceCallback",
+        // SDK PAD functions
+        "PADInit", "PADRead",
+        // SDK AR/ARQ functions
+        "ARInit", "ARQInit",
+        // SDK EXI functions
+        "EXIInit",
         NULL
     };
     

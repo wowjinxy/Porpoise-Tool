@@ -6,12 +6,20 @@
  * These declarations match that signature so the compiler accepts the calls.
  * 
  * The actual implementations will ignore unused parameters.
+ * 
+ * NOTE: If MSL_C (Metrowerks Standard Library) is present, we skip declarations
+ *       to avoid conflicts with the actual library.
  */
 
 #ifndef STDLIB_STUBS_H
 #define STDLIB_STUBS_H
 
 #include <stdint.h>
+
+// Check if we're using Metrowerks Standard Library (MSL_C)
+// If so, don't redefine standard library functions
+#ifndef __MWERKS__
+#ifndef _MSL_C_H
 
 // Declare stdlib functions with the transpiler's 10-parameter signature
 // The implementations ignore extra parameters
@@ -38,13 +46,16 @@ extern void free(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7
 extern void calloc(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7, uint32_t r8, uint32_t r9, uint32_t r10, double f1, double f2);
 extern void realloc(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7, uint32_t r8, uint32_t r9, uint32_t r10, double f1, double f2);
 
-// Math functions
+// Math functions - SKIP if MSL_C is present (it has these)
 extern void abs(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7, uint32_t r8, uint32_t r9, uint32_t r10, double f1, double f2);
 extern void fabs(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7, uint32_t r8, uint32_t r9, uint32_t r10, double f1, double f2);
 extern void sqrt(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7, uint32_t r8, uint32_t r9, uint32_t r10, double f1, double f2);
 extern void pow(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7, uint32_t r8, uint32_t r9, uint32_t r10, double f1, double f2);
 extern void sin(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7, uint32_t r8, uint32_t r9, uint32_t r10, double f1, double f2);
 extern void cos(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t r7, uint32_t r8, uint32_t r9, uint32_t r10, double f1, double f2);
+
+#endif // _MSL_C_H
+#endif // __MWERKS__
 
 #endif // STDLIB_STUBS_H
 

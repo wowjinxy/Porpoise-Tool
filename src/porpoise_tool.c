@@ -15,20 +15,161 @@
 #include "opcode.h"
 #include "project_generator.h"
 
-// SDK function address translation configuration
+// SDK function configuration
+typedef enum {
+    SDK_PARAM_PTR,    // Pointer (cast from register)
+    SDK_PARAM_INT,    // Integer (cast from register)
+    SDK_PARAM_FLOAT,  // Float (cast from register)
+    SDK_PARAM_DOUBLE  // Double (cast from register)
+} SDK_ParamType;
+
 typedef struct {
     char name[128];
-    int pointer_params[10];  // Indices of params that are pointers (0-based, -1 terminated)
-    int num_pointer_params;
+    SDK_ParamType param_types[10];
+    int num_params;
 } SDK_Function_Info;
 
 static SDK_Function_Info *sdk_functions = NULL;
 static int sdk_functions_count = 0;
 
+// Function registry for indirect call resolution
+typedef struct {
+    char name[128];
+    uint32_t gc_address;
+    bool is_local;  // Skip local/static functions
+} FunctionRegistryEntry;
+
+static FunctionRegistryEntry *function_registry = NULL;
+static int function_registry_count = 0;
+static int function_registry_capacity = 0;
+
+// Check if a function is an SDK or standard library function
+static bool is_sdk_or_stdlib_function(const char *name) {
+    // Check SDK functions
+    for (int i = 0; i < sdk_functions_count; i++) {
+        if (strcmp(name, sdk_functions[i].name) == 0) {
+            return true;
+        }
+    }
+    
+    // Check reserved/stdlib functions
+    return is_reserved_name(name);
+}
+
+// Add function to registry for indirect call resolution
+static void register_transpiled_function(const char *name, uint32_t gc_address, bool is_local) {
+    // Initialize registry if needed
+    if (!function_registry) {
+        function_registry_capacity = 1000;
+        function_registry = (FunctionRegistryEntry*)malloc(function_registry_capacity * sizeof(FunctionRegistryEntry));
+        function_registry_count = 0;
+    }
+    
+    // Expand if needed
+    if (function_registry_count >= function_registry_capacity) {
+        function_registry_capacity *= 2;
+        function_registry = (FunctionRegistryEntry*)realloc(function_registry, 
+                                                             function_registry_capacity * sizeof(FunctionRegistryEntry));
+    }
+    
+    // Add entry (skip local/static, SDK, and stdlib functions)
+    if (!is_local && gc_address != 0 && !is_sdk_or_stdlib_function(name)) {
+        FunctionRegistryEntry *entry = &function_registry[function_registry_count++];
+        strncpy(entry->name, name, sizeof(entry->name) - 1);
+        entry->name[sizeof(entry->name) - 1] = '\0';
+        entry->gc_address = gc_address;
+        entry->is_local = is_local;
+    }
+}
+
+// Generate function_registry.c file
+static void generate_function_registry(const char *project_dir) {
+    char registry_path[512];
+    snprintf(registry_path, sizeof(registry_path), "%s/src/function_registry.c", project_dir);
+    
+    FILE *f = fopen(registry_path, "w");
+    if (!f) {
+        fprintf(stderr, "Error: Cannot create function_registry.c\n");
+        return;
+    }
+    
+    fprintf(f, "/**\n");
+    fprintf(f, " * @file function_registry.c\n");
+    fprintf(f, " * @brief Auto-generated function registry for indirect call resolution\n");
+    fprintf(f, " * \n");
+    fprintf(f, " * This file maps GameCube function addresses to transpiled C functions.\n");
+    fprintf(f, " * Used for vtables, callbacks, and other indirect calls.\n");
+    fprintf(f, " */\n\n");
+    fprintf(f, "#include \"function_resolver.h\"\n");
+    fprintf(f, "#include \"all_functions.h\"\n\n");
+    fprintf(f, "/**\n");
+    fprintf(f, " * @brief Initialize all function mappings\n");
+    fprintf(f, " * Must be called before any indirect calls are made\n");
+    fprintf(f, " */\n");
+    fprintf(f, "void init_function_registry(void) {\n");
+    fprintf(f, "    // Initialize the resolver\n");
+    fprintf(f, "    if (!function_resolver_init()) {\n");
+    fprintf(f, "        return;\n");
+    fprintf(f, "    }\n\n");
+    fprintf(f, "    // Register all %d transpiled functions\n", function_registry_count);
+    
+    // Generate all function registrations
+    for (int i = 0; i < function_registry_count; i++) {
+        const FunctionRegistryEntry *entry = &function_registry[i];
+        
+        // Check if function name is valid as a C identifier
+        // C++ mangled names can have @, <, >, numeric prefixes like __32ClassName, Q23zen18..., etc.
+        bool is_valid = true;
+        const char *p = entry->name;
+        
+        // Check for invalid characters
+        for (; *p; p++) {
+            if (*p == '@' || *p == '<' || *p == '>' || *p == '?' || *p == '`' || *p == ' ') {
+                is_valid = false;
+                break;
+            }
+        }
+        
+        // Check for C++ mangled names with numbers (Q219, Q23zen18, __32Class, etc.)
+        if (is_valid) {
+            // Patterns like __32ClassName or __Q219 or Q23zen
+            for (const char *scan = entry->name; scan && *scan; scan++) {
+                // Check for digit followed by uppercase (like 32Class, 19Navi, 18ogScr)
+                if (scan[0] >= '0' && scan[0] <= '9' && scan[1] >= 'A' && scan[1] <= 'Z') {
+                    is_valid = false;
+                    break;
+                }
+                // Check for consecutive uppercase then digit (like Q219, FP19)
+                if (scan[0] >= 'A' && scan[0] <= 'Z' && scan[1] >= '0' && scan[1] <= '9') {
+                    is_valid = false;
+                    break;
+                }
+            }
+        }
+        
+        // Skip internal functions (starting with __ are usually internal SDK/runtime)
+        if (is_valid && entry->name[0] == '_' && entry->name[1] == '_') {
+            is_valid = false;
+        }
+        
+        // Only register valid function names
+        if (is_valid) {
+            fprintf(f, "    register_function(0x%08X, (TranspiledFunction)%s, \"%s\");\n",
+                   entry->gc_address, entry->name, entry->name);
+        }
+    }
+    
+    fprintf(f, "}\n");
+    fclose(f);
+}
+
 // Load SDK functions list from file
 static void load_sdk_functions(const char *filepath) {
     FILE *f = fopen(filepath, "r");
-    if (!f) return;
+    if (!f) {
+        fprintf(stderr, "Warning: Could not open SDK functions file: %s\n", filepath);
+        return;
+    }
     
     char line[256];
     int capacity = 100;
@@ -39,11 +180,12 @@ static void load_sdk_functions(const char *filepath) {
         // Skip comments and empty lines
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
         
-        // Parse line: FunctionName:param1,param2,param3
+        // Parse line: FunctionName:param1_type,param2_type,param3_type
         char func_name[128];
         char params_str[128] = "";
         
-        if (sscanf(line, "%127[^:]:%127s", func_name, params_str) < 1) continue;
+        int items = sscanf(line, "%127[^:\n]:%127[^\n]", func_name, params_str);
+        if (items < 1) continue;
         
         // Expand capacity if needed
         if (sdk_functions_count >= capacity) {
@@ -54,23 +196,39 @@ static void load_sdk_functions(const char *filepath) {
         SDK_Function_Info *info = &sdk_functions[sdk_functions_count++];
         strncpy(info->name, func_name, sizeof(info->name) - 1);
         info->name[sizeof(info->name) - 1] = '\0';
-        info->num_pointer_params = 0;
+        info->num_params = 0;
         
-        // Parse pointer parameter indices
-        if (params_str[0] != '\0' && params_str[0] != '\n' && params_str[0] != '\r') {
+        // Parse parameter types
+        if (items == 2 && params_str[0] != '\0' && params_str[0] != '\n' && params_str[0] != '\r') {
             char *token = strtok(params_str, ",");
-            while (token && info->num_pointer_params < 10) {
-                info->pointer_params[info->num_pointer_params++] = atoi(token);
+            while (token && info->num_params < 10) {
+                // Trim whitespace
+                while (*token == ' ' || *token == '\t') token++;
+                char *end = token + strlen(token) - 1;
+                while (end > token && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) {
+                    *end = '\0';
+                    end--;
+                }
+                
+                if (strcmp(token, "ptr") == 0) {
+                    info->param_types[info->num_params++] = SDK_PARAM_PTR;
+                } else if (strcmp(token, "int") == 0) {
+                    info->param_types[info->num_params++] = SDK_PARAM_INT;
+                } else if (strcmp(token, "float") == 0) {
+                    info->param_types[info->num_params++] = SDK_PARAM_FLOAT;
+                } else if (strcmp(token, "double") == 0) {
+                    info->param_types[info->num_params++] = SDK_PARAM_DOUBLE;
+                }
                 token = strtok(NULL, ",");
             }
         }
-        info->pointer_params[info->num_pointer_params] = -1;  // Terminate
     }
     
     fclose(f);
+    printf("Loaded %d SDK function signatures\n", sdk_functions_count);
 }
 
-// Check if a function is an SDK function and get its pointer params
+// Check if a function is an SDK function
 static const SDK_Function_Info* get_sdk_function_info(const char *func_name) {
     for (int i = 0; i < sdk_functions_count; i++) {
         if (strcmp(sdk_functions[i].name, func_name) == 0) {
@@ -301,44 +459,60 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
                     actual_target = stub_name;
                 }
                 
-                // Check if this is an SDK function requiring address translation
+                // Check if this is an SDK function
                 const SDK_Function_Info *sdk_info = get_sdk_function_info(actual_target);
                 
                 char params[512];
-                if (sdk_info && sdk_info->num_pointer_params > 0) {
-                    // Build parameter list with translate_address() for pointer params
-                    const char *reg_names[] = {"r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "f1", "f2"};
+                if (sdk_info && sdk_info->num_params > 0) {
+                    // SDK function - generate typed parameters
+                    const char *int_regs[] = {"r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"};
+                    const char *float_regs[] = {"f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"};
+                    
                     char *p = params;
                     size_t remaining = sizeof(params);
+                    int int_reg_idx = 0;
+                    int float_reg_idx = 0;
                     
-                    for (int i = 0; i < 10; i++) {
+                    for (int i = 0; i < sdk_info->num_params && i < 10; i++) {
                         if (i > 0) {
                             int written = snprintf(p, remaining, ", ");
                             p += written;
                             remaining -= written;
                         }
                         
-                        // Check if this parameter index needs translation
-                        bool needs_translation = false;
-                        for (int j = 0; j < sdk_info->num_pointer_params; j++) {
-                            if (sdk_info->pointer_params[j] == i) {
-                                needs_translation = true;
+                        switch (sdk_info->param_types[i]) {
+                            case SDK_PARAM_PTR:
+                                if (int_reg_idx < 8) {
+                                    int written = snprintf(p, remaining, "(void*)%s", int_regs[int_reg_idx++]);
+                                    p += written;
+                                    remaining -= written;
+                                }
                                 break;
-                            }
-                        }
-                        
-                        if (needs_translation) {
-                            int written = snprintf(p, remaining, "(void*)(uintptr_t)translate_address(%s)", reg_names[i]);
-                            p += written;
-                            remaining -= written;
-                        } else {
-                            int written = snprintf(p, remaining, "%s", reg_names[i]);
-                            p += written;
-                            remaining -= written;
+                            case SDK_PARAM_INT:
+                                if (int_reg_idx < 8) {
+                                    int written = snprintf(p, remaining, "(int)%s", int_regs[int_reg_idx++]);
+                                    p += written;
+                                    remaining -= written;
+                                }
+                                break;
+                            case SDK_PARAM_FLOAT:
+                                if (float_reg_idx < 8) {
+                                    int written = snprintf(p, remaining, "(float)%s", float_regs[float_reg_idx++]);
+                                    p += written;
+                                    remaining -= written;
+                                }
+                                break;
+                            case SDK_PARAM_DOUBLE:
+                                if (float_reg_idx < 8) {
+                                    int written = snprintf(p, remaining, "%s", float_regs[float_reg_idx++]);
+                                    p += written;
+                                    remaining -= written;
+                                }
+                                break;
                         }
                     }
                 } else {
-                    // No translation needed - pass registers as-is
+                    // Game function - use standard 10-parameter convention
                     snprintf(params, sizeof(params), "r3, r4, r5, r6, r7, r8, r9, r10, f1, f2");
                 }
                 
@@ -1282,7 +1456,7 @@ bool transpile_instruction(uint32_t instruction, uint32_t address,
     // More branches
     BCTR_Instruction bctr;
     if (decode_bctr(instruction, &bctr)) {
-        transpile_bctr(&bctr, output, output_size);
+        transpile_bctr(&bctr, address, output, output_size);
         comment_bctr(&bctr, comment, comment_size);
         return true;
     }
@@ -2131,6 +2305,9 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
                     
                     // Parameters already detected earlier, just write function start
                     write_function_start(c_file, &current_func);
+                    
+                    // Register function for indirect call resolution
+                    register_transpiled_function(current_func.name, current_func.start_address, current_func.is_local);
                 }
                 
                 // Transpile instruction
@@ -2330,7 +2507,8 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
         fprintf(c_file, "#include \"%s.h\"\n", base_name);
     }
     fprintf(c_file, "#include \"powerpc_state.h\"\n");
-    fprintf(c_file, "#include \"all_functions.h\"  // For cross-file function calls\n\n");
+    fprintf(c_file, "#include \"all_functions.h\"  // For cross-file function calls\n");
+    fprintf(c_file, "#include \"function_resolver.h\"  // For indirect calls (vtables, callbacks)\n\n");
     
     // Generate string constants if any were found
     if (string_table && string_table->count > 0) {
@@ -2563,6 +2741,9 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
                     
                     // Parameters already detected earlier, just write function start
                     write_function_start(c_file, &current_func);
+                    
+                    // Register function for indirect call resolution
+                    register_transpiled_function(current_func.name, current_func.start_address, current_func.is_local);
                 }
                 
                 char c_code[512], asm_comment[128];
@@ -2987,8 +3168,8 @@ int main(int argc, char *argv[]) {
            get_implementation_progress());
     printf("===========================================\n\n");
     
-    // Load SDK functions configuration for address translation
-    load_sdk_functions("projects/sdk_functions_list.txt");
+    // Load SDK functions configuration
+    load_sdk_functions("sdk_functions.txt");
     
     // Check for help flag
     bool show_help = (argc < 2);
@@ -3175,6 +3356,10 @@ int main(int argc, char *argv[]) {
     
     generate_readme(output_project, proj_name);
     generate_gitignore(output_project);
+    
+    // Generate function registry for indirect call resolution
+    printf("Generating function registry (%d functions)...\n", function_registry_count);
+    generate_function_registry(output_project);
     
     // Cleanup
     for (int i = 0; i < file_count; i++) {

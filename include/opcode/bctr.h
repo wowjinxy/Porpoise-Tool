@@ -23,11 +23,18 @@ static inline bool decode_bctr(uint32_t inst, BCTR_Instruction *d) {
     return true;
 }
 
-static inline int transpile_bctr(const BCTR_Instruction *d, char *o, size_t s) {
+static inline int transpile_bctr(const BCTR_Instruction *d, uint32_t current_addr, char *o, size_t s) {
     if (d->LK) {
-        return snprintf(o, s, "lr = pc + 4; pc = ctr; goto *branch_table[ctr];");
+        // bctrl - indirect call via CTR
+        // Use function resolver to handle GameCube function pointers
+        uint32_t return_addr = current_addr + 4;
+        return snprintf(o, s,
+                       "{ uintptr_t saved_ctr = ctr; lr = 0x%08X; call_indirect((uint32_t)saved_ctr, r3, r4, r5, r6, r7, r8, r9, r10, f1, f2); }",
+                       return_addr);
     }
-    return snprintf(o, s, "pc = ctr; goto *branch_table[ctr];");
+    // bctr without link - typically used for computed jumps (switch statements)
+    // This is trickier as it's a jump, not a call
+    return snprintf(o, s, "/* bctr - computed jump not yet supported */");
 }
 
 static inline int comment_bctr(const BCTR_Instruction *d, char *o, size_t s) {
