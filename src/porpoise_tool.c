@@ -11,6 +11,11 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <ctype.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 #include "porpoise_tool.h"
 #include "opcode.h"
 #include "project_generator.h"
@@ -32,6 +37,23 @@ typedef struct {
 static SDK_Function_Info *sdk_functions = NULL;
 static int sdk_functions_count = 0;
 
+// Transpiler configuration
+typedef struct {
+    bool transpile_sdk_functions;      // Transpile SDK functions (true) or ignore them (false)
+    bool skip_stdlib_stubs;             // Skip stdlib_stubs.h inclusion (for MSL_C compatibility)
+    bool ignore_cstd_calls;             // Ignore C++ standard library calls (std:: namespace)
+    char sdk_functions_file[256];      // Path to SDK functions file
+    char skip_list_file[256];          // Path to skip list file
+} TranspilerConfig;
+
+static TranspilerConfig config = {
+    .transpile_sdk_functions = false,  // Default: ignore SDK functions
+    .skip_stdlib_stubs = false,         // Default: include stdlib stubs
+    .ignore_cstd_calls = true,          // Default: ignore C++ std calls
+    .sdk_functions_file = "sdk_functions.txt",
+    .skip_list_file = ""
+};
+
 // Function registry for indirect call resolution
 typedef struct {
     char name[128];
@@ -43,17 +65,100 @@ static FunctionRegistryEntry *function_registry = NULL;
 static int function_registry_count = 0;
 static int function_registry_capacity = 0;
 
+// Check if a function name is a C++ standard library call
+static bool is_cstd_call(const char *name) {
+    if (!name || name[0] == '\0') return false;
+    
+    // Check for std:: prefix (demangled names)
+    if (strncmp(name, "std::", 5) == 0) {
+        return true;
+    }
+    
+    // Check for C++ mangled names starting with _ZNS (std:: namespace)
+    // _ZNS = std:: namespace in Itanium ABI mangling
+    if (strncmp(name, "_ZNS", 4) == 0) {
+        return true;
+    }
+    
+    // Check for _ZNSt (std:: namespace with template)
+    if (strncmp(name, "_ZNSt", 5) == 0) {
+        return true;
+    }
+    
+    // Check for other common C++ std library patterns
+    // _ZNK = const member function
+    // _ZNSt = std:: namespace
+    if (strncmp(name, "_ZNSt", 5) == 0 || strncmp(name, "_ZNKSt", 6) == 0) {
+        return true;
+    }
+    
+    // Check for operator new, delete, etc. (common C++ std library functions)
+    if (strstr(name, "operator new") != NULL ||
+        strstr(name, "operator delete") != NULL ||
+        strstr(name, "operator new[]") != NULL ||
+        strstr(name, "operator delete[]") != NULL) {
+        return true;
+    }
+    
+    return false;
+}
+
 // Check if a function is an SDK or standard library function
 static bool is_sdk_or_stdlib_function(const char *name) {
-    // Check SDK functions
-    for (int i = 0; i < sdk_functions_count; i++) {
-        if (strcmp(name, sdk_functions[i].name) == 0) {
-            return true;
+    // Pattern-based detection: Skip functions with SDK prefixes
+    // This catches SDK functions even if they're not explicitly listed
+    // Always enabled (not controlled by config.transpile_sdk_functions)
+    if (strncmp(name, "OS", 2) == 0 ||          // OS functions (OSInit, OSReport, etc.)
+        strncmp(name, "__OS", 4) == 0 ||        // Internal OS functions (__OSPSInit, etc.)
+        strncmp(name, "EXI", 3) == 0 ||         // EXI functions (EXIInit, EXILock, etc.)
+        strncmp(name, "DC", 2) == 0 ||          // Data cache functions (DCInvalidateRange, etc.)
+        strncmp(name, "IC", 2) == 0 ||          // Instruction cache functions (ICInvalidateRange, etc.)
+        strncmp(name, "LC", 2) == 0 ||          // L2 cache functions (LCDisable, etc.)
+        strncmp(name, "L2", 2) == 0 ||          // L2 cache functions (L2GlobalInvalidate, etc.)
+        strncmp(name, "SI", 2) == 0 ||          // Serial Interface functions (SIInit, etc.)
+        strncmp(name, "VI", 2) == 0 ||          // Video Interface functions (VIInit, etc.)
+        strncmp(name, "CARD", 4) == 0 ||        // Memory card functions (CARDInit, etc.)
+        strncmp(name, "DVD", 3) == 0 ||         // DVD functions (DVDInit, etc.)
+        strncmp(name, "AR", 2) == 0 ||          // Audio functions (ARInit, etc.)
+        strncmp(name, "ARQ", 3) == 0 ||         // Audio Request Queue functions (ARQInit, etc.)
+        strncmp(name, "PAD", 3) == 0 ||         // Controller functions (PADInit, etc.)
+        strncmp(name, "GX", 2) == 0 ||          // Graphics functions (GXInit, etc.)
+        strncmp(name, "AX", 2) == 0) {          // Audio DSP functions (AXInit, etc.)
+        return true;
+    }
+    
+    // Check explicit SDK functions list (only if we're NOT transpiling them)
+    if (!config.transpile_sdk_functions) {
+        for (int i = 0; i < sdk_functions_count; i++) {
+            if (strcmp(name, sdk_functions[i].name) == 0) {
+                return true;
+            }
         }
     }
     
     // Check reserved/stdlib functions
     return is_reserved_name(name);
+}
+
+// Lookup function name by GameCube address (for compile-time function pointer resolution)
+static const char* lookup_function_by_address(uint32_t gc_address) {
+    if (!function_registry || gc_address == 0) {
+        return NULL;
+    }
+    
+    // Check if this is a GameCube address (0x80000000-0x84000000 range)
+    if (gc_address < 0x80000000 || gc_address >= 0x84000000) {
+        return NULL;
+    }
+    
+    // Linear search (could be optimized with hash map if needed)
+    for (int i = 0; i < function_registry_count; i++) {
+        if (function_registry[i].gc_address == gc_address) {
+            return function_registry[i].name;
+        }
+    }
+    
+    return NULL;
 }
 
 // Add function to registry for indirect call resolution
@@ -100,15 +205,15 @@ static void generate_function_registry(const char *project_dir) {
     fprintf(f, " * This file maps GameCube function addresses to transpiled C functions.\n");
     fprintf(f, " * Used for vtables, callbacks, and other indirect calls.\n");
     fprintf(f, " */\n\n");
-    fprintf(f, "#include \"function_resolver.h\"\n");
+    fprintf(f, "#include \"function_address_map.h\"\n");
     fprintf(f, "#include \"all_functions.h\"\n\n");
     fprintf(f, "/**\n");
     fprintf(f, " * @brief Initialize all function mappings\n");
     fprintf(f, " * Must be called before any indirect calls are made\n");
     fprintf(f, " */\n");
     fprintf(f, "void init_function_registry(void) {\n");
-    fprintf(f, "    // Initialize the resolver\n");
-    fprintf(f, "    if (!function_resolver_init()) {\n");
+    fprintf(f, "    // Initialize the address map\n");
+    fprintf(f, "    if (!function_address_map_init()) {\n");
     fprintf(f, "        return;\n");
     fprintf(f, "    }\n\n");
     fprintf(f, "    // Register all %d transpiled functions\n", function_registry_count);
@@ -154,7 +259,7 @@ static void generate_function_registry(const char *project_dir) {
         
         // Only register valid function names
         if (is_valid) {
-            fprintf(f, "    register_function(0x%08X, (TranspiledFunction)%s, \"%s\");\n",
+            fprintf(f, "    function_address_map_register(0x%08X, (TranspiledFunctionPtr)%s, \"%s\");\n",
                    entry->gc_address, entry->name, entry->name);
         }
     }
@@ -163,13 +268,44 @@ static void generate_function_registry(const char *project_dir) {
     fclose(f);
 }
 
+// Forward declarations
+static void get_executable_dir(char *buffer, size_t buffer_size);
+
 // Load SDK functions list from file
 static void load_sdk_functions(const char *filepath) {
-    FILE *f = fopen(filepath, "r");
-    if (!f) {
-        fprintf(stderr, "Warning: Could not open SDK functions file: %s\n", filepath);
-        return;
+    // Try to load from executable directory first (like config.json)
+    char exe_dir[512];
+    get_executable_dir(exe_dir, sizeof(exe_dir));
+    
+    char full_path[512];
+    // If filepath is relative, try next to executable first
+    if (filepath[0] != '/' && filepath[0] != '\\' && 
+        (strlen(filepath) < 2 || filepath[1] != ':')) {
+        // Relative path - try next to executable first
+        snprintf(full_path, sizeof(full_path), "%s%s", exe_dir, filepath);
+    } else {
+        // Absolute path
+        strncpy(full_path, filepath, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = '\0';
     }
+    
+    FILE *f = fopen(full_path, "r");
+    if (!f) {
+        // Try current directory as fallback
+        f = fopen(filepath, "r");
+        if (!f) {
+            fprintf(stderr, "Warning: Could not open SDK functions file: %s\n", filepath);
+            fprintf(stderr, "  Tried: %s (next to executable) and current directory\n", full_path);
+            fprintf(stderr, "  SDK functions will not be automatically skipped.\n");
+            fprintf(stderr, "  Make sure sdk_functions.txt is in the same directory as porpoise_tool.exe\n");
+            return;
+        }
+        // Use the current directory path
+        strncpy(full_path, filepath, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = '\0';
+    }
+    
+    printf("Loading SDK functions from: %s\n", full_path);
     
     char line[256];
     int capacity = 100;
@@ -228,6 +364,57 @@ static void load_sdk_functions(const char *filepath) {
     printf("Loaded %d SDK function signatures\n", sdk_functions_count);
 }
 
+// Initialize register tracker
+static void register_tracker_init(RegisterTracker *tracker) {
+    memset(tracker, 0, sizeof(RegisterTracker));
+}
+
+// Set a register to a known address
+static void register_tracker_set(RegisterTracker *tracker, int reg, uint32_t address) {
+    if (reg >= 0 && reg < 32) {
+        tracker->r[reg] = address;
+        tracker->r_known[reg] = (address >= 0x80000000 && address < 0x84000000);
+    }
+}
+
+// Get a register's known address (returns 0 if unknown)
+static uint32_t register_tracker_get(RegisterTracker *tracker, int reg) {
+    if (reg >= 0 && reg < 32 && tracker->r_known[reg]) {
+        return tracker->r[reg];
+    }
+    return 0;
+}
+
+// Set LR to a known address
+static void register_tracker_set_lr(RegisterTracker *tracker, uint32_t address) {
+    tracker->lr = address;
+    tracker->lr_known = (address >= 0x80000000 && address < 0x84000000);
+}
+
+// Get LR's known address (returns 0 if unknown)
+static uint32_t register_tracker_get_lr(RegisterTracker *tracker) {
+    return tracker->lr_known ? tracker->lr : 0;
+}
+
+// Set CTR to a known address
+static void register_tracker_set_ctr(RegisterTracker *tracker, uint32_t address) {
+    tracker->ctr = address;
+    tracker->ctr_known = (address >= 0x80000000 && address < 0x84000000);
+}
+
+// Get CTR's known address (returns 0 if unknown)
+static uint32_t register_tracker_get_ctr(RegisterTracker *tracker) {
+    return tracker->ctr_known ? tracker->ctr : 0;
+}
+
+// Mark register as unknown (e.g., after arithmetic operations)
+static void register_tracker_clear(RegisterTracker *tracker, int reg) {
+    if (reg >= 0 && reg < 32) {
+        tracker->r_known[reg] = false;
+        tracker->r[reg] = 0;
+    }
+}
+
 // Check if a function is an SDK function
 static const SDK_Function_Info* get_sdk_function_info(const char *func_name) {
     for (int i = 0; i < sdk_functions_count; i++) {
@@ -247,7 +434,8 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
                         const char **prev_lines, int num_prev_lines,
                         const Function_Info *func_context,
                         const LabelMap *label_map,
-                        const StringTable *string_table) {
+                        const StringTable *string_table,
+                        RegisterTracker *tracker) {
     // Detect string address loading patterns (lis followed by addi/ori)
     // Check if previous instruction was lis and current is addi
     static uint32_t last_lis_value = 0;
@@ -261,29 +449,131 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
             sscanf(operands, "r%d,%i", &reg, &value) == 2) {
             last_lis_reg = reg;
             last_lis_value = value << 16;  // lis shifts left by 16
+            // Track this partial address
+            if (tracker) {
+                register_tracker_set(tracker, reg, last_lis_value);
+            }
         }
     }
     
-    if ((strcmp(mnemonic, "addi") == 0 || strcmp(mnemonic, "ori") == 0) && string_table) {
+    if ((strcmp(mnemonic, "addi") == 0 || strcmp(mnemonic, "ori") == 0)) {
         // Parse: addi rD, rA, simm
         int rD, rA;
         int32_t simm;
-        if ((sscanf(operands, "r%d, r%d, %i", &rD, &rA, &simm) == 3 ||
-             sscanf(operands, "r%d,r%d,%i", &rD, &rA, &simm) == 3) &&
-            rA == last_lis_reg) {
-            // Combine lis + addi to form full address
-            uint32_t full_addr = last_lis_value + simm;
-            
-            // Check if this address matches a string
-            const StringEntry *str_entry = string_table_find(string_table, full_addr);
-            if (str_entry) {
-                // Generate string reference instead of raw address
-                snprintf(output, output_size, "r%d = (uint32_t)&%s;  /* \"%s\" */",
-                        rD, str_entry->label, str_entry->content);
-                snprintf(comment, comment_size, "%s r%d, r%d, %d (string ref)",
-                        mnemonic, rD, rA, simm);
-                last_lis_reg = -1;  // Reset
-                return true;
+        if (sscanf(operands, "r%d, r%d, %i", &rD, &rA, &simm) == 3 ||
+            sscanf(operands, "r%d,r%d,%i", &rD, &rA, &simm) == 3) {
+            if (rA == last_lis_reg) {
+                // Combine lis + addi to form full address
+                uint32_t full_addr = last_lis_value + simm;
+                
+                // Track the full address
+                if (tracker) {
+                    register_tracker_set(tracker, rD, full_addr);
+                }
+                
+                // Check if this address matches a string
+                if (string_table) {
+                    const StringEntry *str_entry = string_table_find(string_table, full_addr);
+                    if (str_entry) {
+                        // Generate string reference instead of raw address
+                        snprintf(output, output_size, "r%d = (uint32_t)&%s;  /* \"%s\" */",
+                                rD, str_entry->label, str_entry->content);
+                        snprintf(comment, comment_size, "%s r%d, r%d, %d (string ref)",
+                                mnemonic, rD, rA, simm);
+                        last_lis_reg = -1;  // Reset
+                        return true;
+                    }
+                }
+            } else if (tracker && tracker->r_known[rA]) {
+                // rA contains a known address, add offset to it
+                uint32_t base_addr = tracker->r[rA];
+                uint32_t new_addr = base_addr + simm;
+                register_tracker_set(tracker, rD, new_addr);
+            } else {
+                // Unknown value - clear tracking
+                if (tracker) register_tracker_clear(tracker, rD);
+            }
+        }
+    }
+    
+    // Track mtlr (move to link register)
+    if (strcmp(mnemonic, "mtlr") == 0) {
+        int reg;
+        if (sscanf(operands, "r%d", &reg) == 1) {
+            if (tracker) {
+                uint32_t addr = register_tracker_get(tracker, reg);
+                if (addr != 0) {
+                    register_tracker_set_lr(tracker, addr);
+                } else {
+                    tracker->lr_known = false;
+                }
+            }
+        }
+    }
+    
+    // Track mtctr (move to count register)
+    if (strcmp(mnemonic, "mtctr") == 0) {
+        int reg;
+        if (sscanf(operands, "r%d", &reg) == 1) {
+            if (tracker) {
+                uint32_t addr = register_tracker_get(tracker, reg);
+                if (addr != 0) {
+                    register_tracker_set_ctr(tracker, addr);
+                } else {
+                    tracker->ctr_known = false;
+                }
+            }
+        }
+    }
+    
+    // Track lwz (load word) - might load function pointers from vtables
+    if (strcmp(mnemonic, "lwz") == 0) {
+        int rD, rA;
+        int32_t offset;
+        if (sscanf(operands, "r%d, %i(r%d)", &rD, &offset, &rA) == 3 ||
+            sscanf(operands, "r%d,%i(r%d)", &rD, &offset, &rA) == 3) {
+            // Can't determine the address at compile time (depends on runtime value of rA)
+            // But we can track that this register now contains a value from memory
+            // For now, mark as unknown - could be enhanced to track vtable patterns
+            if (tracker) register_tracker_clear(tracker, rD);
+        }
+    }
+    
+    // Track operations that clear register values (arithmetic, etc.)
+    // These operations make register values unknown
+    if (tracker && (
+        strcmp(mnemonic, "add") == 0 || strcmp(mnemonic, "subf") == 0 ||
+        strcmp(mnemonic, "mul") == 0 || strcmp(mnemonic, "div") == 0 ||
+        strcmp(mnemonic, "and") == 0 || strcmp(mnemonic, "or") == 0 ||
+        strcmp(mnemonic, "xor") == 0 || strcmp(mnemonic, "slw") == 0 ||
+        strcmp(mnemonic, "srw") == 0 || strcmp(mnemonic, "sraw") == 0)) {
+        // Parse destination register and clear it
+        int rD;
+        if (sscanf(operands, "r%d", &rD) == 1) {
+            register_tracker_clear(tracker, rD);
+        }
+    }
+    
+    // Track mflr (move from link register) - copies LR to a register
+    if (strcmp(mnemonic, "mflr") == 0) {
+        int reg;
+        if (sscanf(operands, "r%d", &reg) == 1) {
+            if (tracker && tracker->lr_known) {
+                register_tracker_set(tracker, reg, tracker->lr);
+            } else if (tracker) {
+                register_tracker_clear(tracker, reg);
+            }
+        }
+    }
+    
+    // Track mfctr (move from count register) - copies CTR to a register
+    if (strcmp(mnemonic, "mfctr") == 0) {
+        int reg;
+        if (sscanf(operands, "r%d", &reg) == 1) {
+            if (tracker && tracker->ctr_known) {
+                register_tracker_set(tracker, reg, tracker->ctr);
+            } else if (tracker) {
+                register_tracker_clear(tracker, reg);
             }
         }
     }
@@ -299,10 +589,65 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
         return true;
     }
     
-    // Handle blrl (branch to link register and link) 
+    // Handle blrl (branch to link register and link)
     if (strcmp(mnemonic, "blrl") == 0) {
-        snprintf(output, output_size, "((void (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double))lr)(r3, r4, r5, r6, r7, r8, r9, r10, f1, f2);");
-        snprintf(comment, comment_size, "blrl - indirect call via lr");
+        uint32_t return_addr = address + 4;
+        uint32_t func_addr = 0;
+        const char *func_name = NULL;
+        
+        // Check if LR contains a known function address
+        if (tracker) {
+            func_addr = register_tracker_get_lr(tracker);
+            if (func_addr != 0) {
+                func_name = lookup_function_by_address(func_addr);
+            }
+        }
+        
+        if (func_name) {
+            // Replace with direct function call!
+            snprintf(output, output_size,
+                    "{ lr = 0x%08X; %s(r3, r4, r5, r6, r7, r8, r9, r10, f1, f2); }",
+                    return_addr, func_name);
+            snprintf(comment, comment_size, "blrl - replaced with direct call to %s (0x%08X)", func_name, func_addr);
+        } else {
+            // Fallback to runtime resolution
+            snprintf(output, output_size, 
+                    "{ uintptr_t saved_lr = lr; lr = 0x%08X; "
+                    "call_function_by_address((uint32_t)saved_lr, r3, r4, r5, r6, r7, r8, r9, r10, f1, f2); }",
+                    return_addr);
+            snprintf(comment, comment_size, "blrl - indirect call via lr (address unknown at compile time)");
+        }
+        return true;
+    }
+    
+    // Handle bctrl (branch to count register and link)
+    if (strcmp(mnemonic, "bctrl") == 0) {
+        uint32_t return_addr = address + 4;
+        uint32_t func_addr = 0;
+        const char *func_name = NULL;
+        
+        // Check if CTR contains a known function address
+        if (tracker) {
+            func_addr = register_tracker_get_ctr(tracker);
+            if (func_addr != 0) {
+                func_name = lookup_function_by_address(func_addr);
+            }
+        }
+        
+        if (func_name) {
+            // Replace with direct function call!
+            snprintf(output, output_size,
+                    "{ lr = 0x%08X; %s(r3, r4, r5, r6, r7, r8, r9, r10, f1, f2); }",
+                    return_addr, func_name);
+            snprintf(comment, comment_size, "bctrl - replaced with direct call to %s (0x%08X)", func_name, func_addr);
+        } else {
+            // Fallback to runtime resolution
+            snprintf(output, output_size,
+                    "{ uintptr_t saved_ctr = ctr; lr = 0x%08X; "
+                    "call_function_by_address((uint32_t)saved_ctr, r3, r4, r5, r6, r7, r8, r9, r10, f1, f2); }",
+                    return_addr);
+            snprintf(comment, comment_size, "bctrl - indirect call via ctr (address unknown at compile time)");
+        }
         return true;
     }
     
@@ -450,6 +795,18 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
                 else if (strlen(target) > 80 || strchr(target, '<') != NULL || 
                          strchr(target, '>') != NULL || strchr(target, ',') != NULL ||
                          strchr(target, '@') != NULL) {
+                    // Check if this is a C++ standard library call that should be ignored
+                    if (config.ignore_cstd_calls && is_cstd_call(target)) {
+                        // Generate a comment instead of a function call
+                        if (strcmp(mnemonic, "bl") == 0 || strcmp(mnemonic, "bla") == 0) {
+                            snprintf(output, output_size, "/* C++ std call ignored: %s */", target);
+                        } else {
+                            snprintf(output, output_size, "/* C++ std branch ignored: %s */", target);
+                        }
+                        snprintf(comment, comment_size, "%s %s (C++ std call - ignored)", mnemonic, target);
+                        return true;
+                    }
+                    
                     // Create a shorter stub name based on hash
                     unsigned int hash = 0;
                     for (const char *p = target; *p; p++) {
@@ -457,6 +814,17 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
                     }
                     snprintf(stub_name, sizeof(stub_name), "cpp_stub_func_%08x", hash);
                     actual_target = stub_name;
+                }
+                // Check if this is a C++ standard library call that should be ignored
+                else if (config.ignore_cstd_calls && is_cstd_call(target)) {
+                    // Generate a comment instead of a function call
+                    if (strcmp(mnemonic, "bl") == 0 || strcmp(mnemonic, "bla") == 0) {
+                        snprintf(output, output_size, "/* C++ std call ignored: %s */", target);
+                    } else {
+                        snprintf(output, output_size, "/* C++ std branch ignored: %s */", target);
+                    }
+                    snprintf(comment, comment_size, "%s %s (C++ std call - ignored)", mnemonic, target);
+                    return true;
                 }
                 
                 // Check if this is an SDK function
@@ -632,6 +1000,14 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
                 }
             } else {
                 // It's a function name - conditional function call
+                // Check if this is a C++ standard library call that should be ignored
+                if (config.ignore_cstd_calls && is_cstd_call(target)) {
+                    // Generate a comment instead of a function call
+                    snprintf(output, output_size, "/* C++ std call ignored: %s (conditional) */", target);
+                    snprintf(comment, comment_size, "%s %s (C++ std call - ignored)", mnemonic, target);
+                    return true;
+                }
+                
                 // Generate proper conditional wrapper
                 int written = 0;
                 
@@ -900,7 +1276,7 @@ bool transpile_instruction(uint32_t instruction, uint32_t address,
     
     BLR_Instruction blr;
     if (decode_blr(instruction, &blr)) {
-        transpile_blr(&blr, address, output, output_size);
+        transpile_blr(&blr, address, output, output_size, lookup_function_by_address);
         comment_blr(&blr, comment, comment_size);
         return true;
     }
@@ -1456,7 +1832,7 @@ bool transpile_instruction(uint32_t instruction, uint32_t address,
     // More branches
     BCTR_Instruction bctr;
     if (decode_bctr(instruction, &bctr)) {
-        transpile_bctr(&bctr, address, output, output_size);
+        transpile_bctr(&bctr, address, output, output_size, lookup_function_by_address);
         comment_bctr(&bctr, comment, comment_size);
         return true;
     }
@@ -2159,6 +2535,10 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
     bool in_data_section = false;
     Function_Info current_func = {0};
     
+    // Register tracker for compile-time function pointer resolution
+    RegisterTracker register_tracker;
+    register_tracker_init(&register_tracker);
+    
     // Buffer to track previous lines for parameter detection
     char line_buffer[MAX_LOOKBACK_LINES][MAX_LINE_LENGTH];
     const char *prev_lines[MAX_LOOKBACK_LINES];
@@ -2230,6 +2610,16 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
         // Handle function start
         if (parsed.is_function) {
             strcpy(current_func.name, parsed.function_name);
+            // Strip quotes from function name if present
+            if (current_func.name[0] == '"') {
+                size_t len = strlen(current_func.name);
+                memmove(current_func.name, current_func.name + 1, len);
+                len = strlen(current_func.name);
+                if (len > 0 && current_func.name[len - 1] == '"') {
+                    current_func.name[len - 1] = '\0';
+                }
+            }
+            
             current_func.start_address = 0;  // Will be set by first instruction
             current_func.instruction_count = 0;
             current_func.is_trampoline = false;
@@ -2241,7 +2631,12 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
             if (strncmp(current_func.name, "gap_", 4) == 0) {
                 current_func.skip = true;
             } else {
+                // Check skip list first
                 current_func.skip = skiplist_should_skip(skip_list, current_func.name);
+                // Also skip SDK functions (even if not in skip list)
+                if (!current_func.skip && is_sdk_or_stdlib_function(current_func.name)) {
+                    current_func.skip = true;
+                }
             }
             
             // All functions accept all potential parameters (r3-r10, f1-f2) for simplicity
@@ -2264,7 +2659,16 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
             } else {
                 // For skipped functions, don't set in_function to prevent closing brace
                 in_function = false;
-                fprintf(c_file, "// Function %s skipped (gap or in skip list)\n\n", current_func.name);
+                // Determine skip reason for better logging
+                const char *skip_reason = "gap or in skip list";
+                if (strncmp(current_func.name, "gap_", 4) == 0) {
+                    skip_reason = "gap function";
+                } else if (is_sdk_or_stdlib_function(current_func.name)) {
+                    skip_reason = "SDK or stdlib function";
+                } else if (skiplist_should_skip(skip_list, current_func.name)) {
+                    skip_reason = "in skip list";
+                }
+                fprintf(c_file, "// Function %s skipped (%s)\n\n", current_func.name, skip_reason);
             }
             
             in_data_section = false;
@@ -2308,6 +2712,9 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
                     
                     // Register function for indirect call resolution
                     register_transpiled_function(current_func.name, current_func.start_address, current_func.is_local);
+                    
+                    // Reset register tracker for new function
+                    register_tracker_init(&register_tracker);
                 }
                 
                 // Transpile instruction
@@ -2319,7 +2726,7 @@ int transpile_file(const char *input_filename, SkipList *skip_list) {
                                                   c_code, sizeof(c_code),
                                                   asm_comment, sizeof(asm_comment),
                                                   prev_lines, lines_buffered,
-                                                  &current_func, label_map, string_table);
+                                                  &current_func, label_map, string_table, &register_tracker);
                 
                 // Fall back to byte-based decoding
                 if (!success) {
@@ -2508,7 +2915,10 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
     }
     fprintf(c_file, "#include \"powerpc_state.h\"\n");
     fprintf(c_file, "#include \"all_functions.h\"  // For cross-file function calls\n");
-    fprintf(c_file, "#include \"function_resolver.h\"  // For indirect calls (vtables, callbacks)\n\n");
+    // PLACEHOLDER_FUNCTION_ADDRESS_MAP_INCLUDE - will be replaced if indirect calls are used
+    
+    // Track if this file uses indirect calls (will add function_address_map.h if needed)
+    bool needs_address_map_header = false;
     
     // Generate string constants if any were found
     if (string_table && string_table->count > 0) {
@@ -2581,6 +2991,10 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
     bool in_data_section = false;
     bool seen_text_section = false;  // Track if we've entered the code section
     Function_Info current_func = {0};
+    
+    // Register tracker for compile-time function pointer resolution
+    RegisterTracker register_tracker;
+    register_tracker_init(&register_tracker);
     
     // Buffer to track previous lines for parameter detection
     char line_buffer[MAX_LOOKBACK_LINES][MAX_LINE_LENGTH];
@@ -2670,7 +3084,12 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
             if (strncmp(current_func.name, "gap_", 4) == 0) {
                 current_func.skip = true;
             } else {
+                // Check skip list first
                 current_func.skip = skiplist_should_skip(skip_list, current_func.name);
+                // Also skip SDK functions (even if not in skip list)
+                if (!current_func.skip && is_sdk_or_stdlib_function(current_func.name)) {
+                    current_func.skip = true;
+                }
             }
             
             // All functions accept all potential parameters (r3-r10, f1-f2) for simplicity
@@ -2744,6 +3163,9 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
                     
                     // Register function for indirect call resolution
                     register_transpiled_function(current_func.name, current_func.start_address, current_func.is_local);
+                    
+                    // Reset register tracker for new function
+                    register_tracker_init(&register_tracker);
                 }
                 
                 char c_code[512], asm_comment[128];
@@ -2753,7 +3175,7 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
                                                   c_code, sizeof(c_code),
                                                   asm_comment, sizeof(asm_comment),
                                                   prev_lines, lines_buffered,
-                                                  &current_func, label_map, string_table);
+                                                  &current_func, label_map, string_table, &register_tracker);
                 
                 // Fall back to byte-based decoding if text-based failed
                 if (!success) {
@@ -2763,6 +3185,11 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
                 }
                 
                 if (success) {
+                    // Check if this instruction generates an indirect call that needs function_address_map.h
+                    if (strstr(c_code, "call_function_by_address") != NULL) {
+                        needs_address_map_header = true;
+                    }
+                    
                     // Check for backward jumps to labels (potential loop or misidentified function boundary)
                     if (strstr(c_code, "goto L_") != NULL || strstr(c_code, "goto lbl_") != NULL) {
                         char *goto_pos = strstr(c_code, "goto ");
@@ -2850,8 +3277,35 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
     
     fprintf(h_file, "\n#endif // %s\n", guard_name);
     
-    fclose(input);
-    fclose(c_file);
+    // If indirect calls were used, add the include header
+    if (needs_address_map_header) {
+        // Read the C file, replace placeholder with include
+        fclose(c_file);
+        FILE *temp_file = fopen(output_c, "r");
+        if (temp_file) {
+            char temp_path[512];
+            snprintf(temp_path, sizeof(temp_path), "%s.tmp", output_c);
+            FILE *new_file = fopen(temp_path, "w");
+            if (new_file) {
+                char line[1024];
+                while (fgets(line, sizeof(line), temp_file)) {
+                    if (strstr(line, "PLACEHOLDER_FUNCTION_ADDRESS_MAP_INCLUDE") != NULL) {
+                        fprintf(new_file, "#include \"function_address_map.h\"  // For indirect calls (vtables, callbacks)\n");
+                    } else {
+                        fputs(line, new_file);
+                    }
+                }
+                fclose(new_file);
+                fclose(temp_file);
+                remove(output_c);
+                rename(temp_path, output_c);
+            } else {
+                fclose(temp_file);
+            }
+        }
+    } else {
+        fclose(c_file);
+    }
     fclose(h_file);
     
     // Cleanup label map
@@ -2989,19 +3443,45 @@ int generate_project(const char *output_dir, const char *dir_path) {
     generate_main_c(output_dir);
     
     printf("Copying core headers...\n");
-    // Copy stdlib_headers.h
-    char stdlib_src[512], stdlib_dst[512];
-    snprintf(stdlib_src, sizeof(stdlib_src), "include/stdlib_headers.h");
+    // Generate stdlib_headers.h with config settings
+    char stdlib_dst[512];
     snprintf(stdlib_dst, sizeof(stdlib_dst), "%s/include/stdlib_headers.h", output_dir);
-    FILE *src_file = fopen(stdlib_src, "r");
     FILE *dst_file = fopen(stdlib_dst, "w");
-    if (src_file && dst_file) {
-        char buffer[4096];
-        size_t bytes;
-        while ((bytes = fread(buffer, 1, sizeof(buffer), src_file)) > 0) {
-            fwrite(buffer, 1, bytes, dst_file);
+    if (dst_file) {
+        fprintf(dst_file, "/**\n");
+        fprintf(dst_file, " * @file stdlib_headers.h\n");
+        fprintf(dst_file, " * @brief Standard library headers for transpiled code\n");
+        fprintf(dst_file, " * \n");
+        fprintf(dst_file, " * This header includes all standard C library headers needed for\n");
+        fprintf(dst_file, " * transpiled GameCube/Wii PowerPC assembly code.\n");
+        fprintf(dst_file, " * Include this in all generated .c files.\n");
+        fprintf(dst_file, " */\n\n");
+        fprintf(dst_file, "#ifndef STDLIB_HEADERS_H\n");
+        fprintf(dst_file, "#define STDLIB_HEADERS_H\n\n");
+        fprintf(dst_file, "// Standard library includes (BEFORE redeclarations)\n");
+        fprintf(dst_file, "#include <stdint.h>\n");
+        fprintf(dst_file, "#include <stdbool.h>\n");
+        fprintf(dst_file, "#include <stddef.h>\n\n");
+        fprintf(dst_file, "// PowerPC runtime library (64-bit intrinsics)\n");
+        fprintf(dst_file, "#include \"ppc_runtime.h\"\n\n");
+        fprintf(dst_file, "// Include stdlib stub declarations that match transpiler's 10-parameter signature\n");
+        fprintf(dst_file, "// These override the standard library declarations\n");
+        fprintf(dst_file, "// NOTE: If the project already has MSL_C headers (Metrowerks), they take precedence\n");
+        if (config.skip_stdlib_stubs) {
+            fprintf(dst_file, "#define SKIP_STDLIB_STUBS 1\n");
         }
-        fclose(src_file);
+        fprintf(dst_file, "#ifndef SKIP_STDLIB_STUBS\n");
+        fprintf(dst_file, "    #include \"stdlib_stubs.h\"\n");
+        fprintf(dst_file, "#endif\n\n");
+        fprintf(dst_file, "// Suppress warnings for unused parameters (common in transpiled code)\n");
+        fprintf(dst_file, "#ifdef _MSC_VER\n");
+        fprintf(dst_file, "    #pragma warning(disable: 4100)  // unreferenced formal parameter\n");
+        fprintf(dst_file, "    #pragma warning(disable: 4189)  // local variable initialized but not used\n");
+        fprintf(dst_file, "    #pragma warning(disable: 4702)  // unreachable code\n");
+        fprintf(dst_file, "    #pragma warning(disable: 4310)  // cast truncates constant value\n");
+        fprintf(dst_file, "    #pragma warning(disable: 4146)  // unary minus on unsigned type\n");
+        fprintf(dst_file, "#endif\n\n");
+        fprintf(dst_file, "#endif // STDLIB_HEADERS_H\n");
         fclose(dst_file);
     }
     
@@ -3009,16 +3489,105 @@ int generate_project(const char *output_dir, const char *dir_path) {
     char gecko_src[512], gecko_dst[512];
     snprintf(gecko_src, sizeof(gecko_src), "include/gecko_memory.h");
     snprintf(gecko_dst, sizeof(gecko_dst), "%s/include/gecko_memory.h", output_dir);
-    src_file = fopen(gecko_src, "r");
-    dst_file = fopen(gecko_dst, "w");
-    if (src_file && dst_file) {
+    FILE *gecko_src_file = fopen(gecko_src, "r");
+    FILE *gecko_dst_file = fopen(gecko_dst, "w");
+    if (gecko_src_file && gecko_dst_file) {
         char buffer[4096];
         size_t bytes;
-        while ((bytes = fread(buffer, 1, sizeof(buffer), src_file)) > 0) {
-            fwrite(buffer, 1, bytes, dst_file);
+        while ((bytes = fread(buffer, 1, sizeof(buffer), gecko_src_file)) > 0) {
+            fwrite(buffer, 1, bytes, gecko_dst_file);
         }
-        fclose(src_file);
-        fclose(dst_file);
+        fclose(gecko_src_file);
+        fclose(gecko_dst_file);
+    }
+    
+    // Copy function_address_map.h and function_address_map.c
+    char fam_src[512], fam_dst[512];
+    
+    // Copy header
+    snprintf(fam_src, sizeof(fam_src), "include/function_address_map.h");
+    snprintf(fam_dst, sizeof(fam_dst), "%s/include/function_address_map.h", output_dir);
+    FILE *fam_src_file = fopen(fam_src, "r");
+    FILE *fam_dst_file = fopen(fam_dst, "w");
+    if (fam_src_file && fam_dst_file) {
+        char buffer[4096];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), fam_src_file)) > 0) {
+            fwrite(buffer, 1, bytes, fam_dst_file);
+        }
+        fclose(fam_src_file);
+        fclose(fam_dst_file);
+        printf("Copied function_address_map.h\n");
+    } else {
+        fprintf(stderr, "Warning: Could not copy function_address_map.h\n");
+    }
+    
+    // Copy source file
+    snprintf(fam_src, sizeof(fam_src), "src/function_address_map.c");
+    snprintf(fam_dst, sizeof(fam_dst), "%s/src/function_address_map.c", output_dir);
+    fam_src_file = fopen(fam_src, "r");
+    fam_dst_file = fopen(fam_dst, "w");
+    if (fam_src_file && fam_dst_file) {
+        char buffer[4096];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), fam_src_file)) > 0) {
+            fwrite(buffer, 1, bytes, fam_dst_file);
+        }
+        fclose(fam_src_file);
+        fclose(fam_dst_file);
+        printf("Copied function_address_map.c\n");
+    } else {
+        fprintf(stderr, "Warning: Could not copy function_address_map.c\n");
+    }
+    
+    // Copy sdk_functions.txt to project (needed for SDK function signatures)
+    char sdk_funcs_src[512], sdk_funcs_dst[512];
+    snprintf(sdk_funcs_src, sizeof(sdk_funcs_src), "sdk_functions.txt");
+    snprintf(sdk_funcs_dst, sizeof(sdk_funcs_dst), "%s/sdk_functions.txt", output_dir);
+    FILE *sdk_funcs_src_file = fopen(sdk_funcs_src, "r");
+    FILE *sdk_funcs_dst_file = fopen(sdk_funcs_dst, "w");
+    if (sdk_funcs_src_file && sdk_funcs_dst_file) {
+        char buffer[4096];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), sdk_funcs_src_file)) > 0) {
+            fwrite(buffer, 1, bytes, sdk_funcs_dst_file);
+        }
+        fclose(sdk_funcs_src_file);
+        fclose(sdk_funcs_dst_file);
+        printf("Copied sdk_functions.txt\n");
+    } else {
+        fprintf(stderr, "Warning: Could not copy sdk_functions.txt\n");
+    }
+    
+    // Generate skip_sdk_functions.txt next to the tool executable (not in project)
+    // This file is used by the transpiler tool, not the project
+    char skip_sdk_tool[512];
+    snprintf(skip_sdk_tool, sizeof(skip_sdk_tool), "skip_sdk_functions.txt");
+    FILE *skip_sdk_file = fopen(skip_sdk_tool, "w");
+    if (skip_sdk_file) {
+        fprintf(skip_sdk_file, "# Skip list for SDK functions\n");
+        fprintf(skip_sdk_file, "# Generated automatically from sdk_functions.txt\n");
+        fprintf(skip_sdk_file, "# These functions should not be transpiled as they are provided by the SDK\n");
+        fprintf(skip_sdk_file, "# This file should be used with the transpiler tool: porpoise_tool.exe \"Project\" \"Input\" \"Output\" skip_sdk_functions.txt\n\n");
+        
+        // Read sdk_functions.txt to extract function names
+        sdk_funcs_src_file = fopen(sdk_funcs_src, "r");
+        if (sdk_funcs_src_file) {
+            char line[256];
+            while (fgets(line, sizeof(line), sdk_funcs_src_file)) {
+                // Skip comments and empty lines
+                if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+                
+                // Extract function name (before the colon)
+                char func_name[128];
+                if (sscanf(line, "%127[^:\n]", func_name) == 1) {
+                    fprintf(skip_sdk_file, "%s\n", func_name);
+                }
+            }
+            fclose(sdk_funcs_src_file);
+        }
+        fclose(skip_sdk_file);
+        printf("Generated skip_sdk_functions.txt (next to tool executable)\n");
     }
     
     printf("Generating documentation...\n");
@@ -3155,6 +3724,178 @@ static int process_directory_recursive(const char *input_dir, const char *output
 }
 
 /**
+ * @brief Simple JSON value extractor (handles basic key:value pairs)
+ * Returns pointer to value string, or NULL if not found
+ * Note: Returns pointer to static buffer - copy result if needed
+ */
+static const char* json_get_value(const char *json, const char *key) {
+    char search_key[256];
+    snprintf(search_key, sizeof(search_key), "\"%s\"", key);
+    
+    const char *key_pos = strstr(json, search_key);
+    if (!key_pos) return NULL;
+    
+    // Find colon after key
+    const char *colon = strchr(key_pos, ':');
+    if (!colon) return NULL;
+    
+    // Skip whitespace after colon
+    const char *value_start = colon + 1;
+    while (*value_start == ' ' || *value_start == '\t') value_start++;
+    
+    // Handle string values (quoted)
+    if (*value_start == '"') {
+        value_start++;  // Skip opening quote
+        static char string_buffer[256];
+        int i = 0;
+        while (*value_start != '"' && *value_start != '\0' && *value_start != '\n' && i < sizeof(string_buffer) - 1) {
+            string_buffer[i++] = *value_start++;
+        }
+        string_buffer[i] = '\0';
+        return string_buffer;
+    }
+    
+    // Handle boolean/number values (unquoted)
+    static char value_buffer[256];
+    int i = 0;
+    const char *value_end = value_start;
+    while (*value_end != ',' && *value_end != '}' && *value_end != '\0' && *value_end != '\n' && *value_end != ' ' && *value_end != '\t' && i < sizeof(value_buffer) - 1) {
+        value_buffer[i++] = *value_end++;
+    }
+    value_buffer[i] = '\0';
+    return value_buffer;
+}
+
+/**
+ * @brief Get executable directory path
+ */
+static void get_executable_dir(char *buffer, size_t buffer_size) {
+#ifdef _WIN32
+    // Windows: GetModuleFileName
+    HMODULE hModule = GetModuleHandle(NULL);
+    if (hModule) {
+        DWORD size = GetModuleFileNameA(hModule, buffer, (DWORD)buffer_size);
+        if (size > 0 && size < buffer_size) {
+            // Find last backslash and null-terminate there
+            char *last_slash = strrchr(buffer, '\\');
+            if (last_slash) {
+                *(last_slash + 1) = '\0';
+            } else {
+                buffer[0] = '\0';  // No directory found
+            }
+        }
+    }
+#else
+    // Linux/Unix: readlink /proc/self/exe or use argv[0]
+    char link_path[512];
+    snprintf(link_path, sizeof(link_path), "/proc/self/exe");
+    ssize_t len = readlink(link_path, buffer, buffer_size - 1);
+    if (len > 0) {
+        buffer[len] = '\0';
+        // Find last slash and null-terminate there
+        char *last_slash = strrchr(buffer, '/');
+        if (last_slash) {
+            *(last_slash + 1) = '\0';
+        } else {
+            buffer[0] = '\0';
+        }
+    } else {
+        // Fallback: use current directory
+        buffer[0] = '.';
+        buffer[1] = '/';
+        buffer[2] = '\0';
+    }
+#endif
+}
+
+/**
+ * @brief Load configuration from config.json file beside executable
+ */
+static void load_config(void) {
+    char exe_dir[512];
+    get_executable_dir(exe_dir, sizeof(exe_dir));
+    
+    char config_path[512];
+    snprintf(config_path, sizeof(config_path), "%sconfig.json", exe_dir);
+    
+    FILE *f = fopen(config_path, "r");
+    if (!f) {
+        // Config file not found - use defaults
+        return;
+    }
+    
+    // Read entire file
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    
+    if (file_size <= 0 || file_size > 8192) {
+        fclose(f);
+        return;
+    }
+    
+    char *json_content = (char*)malloc(file_size + 1);
+    if (!json_content) {
+        fclose(f);
+        return;
+    }
+    
+    size_t read_size = fread(json_content, 1, file_size, f);
+    json_content[read_size] = '\0';
+    fclose(f);
+    
+    // Parse JSON values
+    const char *value;
+    
+    // transpile_sdk_functions
+    value = json_get_value(json_content, "transpile_sdk_functions");
+    if (value) {
+        if (strcmp(value, "true") == 0 || strcmp(value, "1") == 0) {
+            config.transpile_sdk_functions = true;
+        } else {
+            config.transpile_sdk_functions = false;
+        }
+    }
+    
+    // skip_stdlib_stubs
+    value = json_get_value(json_content, "skip_stdlib_stubs");
+    if (value) {
+        if (strcmp(value, "true") == 0 || strcmp(value, "1") == 0) {
+            config.skip_stdlib_stubs = true;
+        } else {
+            config.skip_stdlib_stubs = false;
+        }
+    }
+    
+    // ignore_cstd_calls
+    value = json_get_value(json_content, "ignore_cstd_calls");
+    if (value) {
+        if (strcmp(value, "true") == 0 || strcmp(value, "1") == 0) {
+            config.ignore_cstd_calls = true;
+        } else {
+            config.ignore_cstd_calls = false;
+        }
+    }
+    
+    // sdk_functions_file
+    value = json_get_value(json_content, "sdk_functions_file");
+    if (value && strlen(value) > 0) {
+        strncpy(config.sdk_functions_file, value, sizeof(config.sdk_functions_file) - 1);
+        config.sdk_functions_file[sizeof(config.sdk_functions_file) - 1] = '\0';
+    }
+    
+    // skip_list_file
+    value = json_get_value(json_content, "skip_list_file");
+    if (value && strlen(value) > 0) {
+        strncpy(config.skip_list_file, value, sizeof(config.skip_list_file) - 1);
+        config.skip_list_file[sizeof(config.skip_list_file) - 1] = '\0';
+    }
+    
+    free(json_content);
+    printf("Loaded configuration from: %s\n", config_path);
+}
+
+/**
  * @brief Main entry point
  */
 int main(int argc, char *argv[]) {
@@ -3168,8 +3909,11 @@ int main(int argc, char *argv[]) {
            get_implementation_progress());
     printf("===========================================\n\n");
     
-    // Load SDK functions configuration
-    load_sdk_functions("sdk_functions.txt");
+    // Load configuration from config.json (beside executable)
+    load_config();
+    
+    // Load SDK functions configuration (use path from config if specified)
+    load_sdk_functions(config.sdk_functions_file);
     
     // Check for help flag
     bool show_help = (argc < 2);
@@ -3234,6 +3978,11 @@ int main(int argc, char *argv[]) {
     const char *input_dir = argv[1];
     const char *output_project = (argc >= 3) ? argv[2] : "GameCube_Project";
     const char *skip_file = (argc >= 4) ? argv[3] : NULL;
+    
+    // Use skip_list_file from config if not provided via command line
+    if (!skip_file && config.skip_list_file[0] != '\0') {
+        skip_file = config.skip_list_file;
+    }
     
     // Initialize skip list
     SkipList skip_list;
@@ -3326,11 +4075,53 @@ int main(int argc, char *argv[]) {
     // Copy core headers to project
     printf("Copying core headers to project...\n");
     
-    // List of headers to copy
+    // Generate stdlib_headers.h with config settings
+    char stdlib_dst[512];
+    snprintf(stdlib_dst, sizeof(stdlib_dst), "%s/include/stdlib_headers.h", output_project);
+    FILE *dst_file = fopen(stdlib_dst, "w");
+    if (dst_file) {
+        fprintf(dst_file, "/**\n");
+        fprintf(dst_file, " * @file stdlib_headers.h\n");
+        fprintf(dst_file, " * @brief Standard library headers for transpiled code\n");
+        fprintf(dst_file, " * \n");
+        fprintf(dst_file, " * This header includes all standard C library headers needed for\n");
+        fprintf(dst_file, " * transpiled GameCube/Wii PowerPC assembly code.\n");
+        fprintf(dst_file, " * Include this in all generated .c files.\n");
+        fprintf(dst_file, " */\n\n");
+        fprintf(dst_file, "#ifndef STDLIB_HEADERS_H\n");
+        fprintf(dst_file, "#define STDLIB_HEADERS_H\n\n");
+        fprintf(dst_file, "// Standard library includes (BEFORE redeclarations)\n");
+        fprintf(dst_file, "#include <stdint.h>\n");
+        fprintf(dst_file, "#include <stdbool.h>\n");
+        fprintf(dst_file, "#include <stddef.h>\n\n");
+        fprintf(dst_file, "// PowerPC runtime library (64-bit intrinsics)\n");
+        fprintf(dst_file, "#include \"ppc_runtime.h\"\n\n");
+        fprintf(dst_file, "// Include stdlib stub declarations that match transpiler's 10-parameter signature\n");
+        fprintf(dst_file, "// These override the standard library declarations\n");
+        fprintf(dst_file, "// NOTE: If the project already has MSL_C headers (Metrowerks), they take precedence\n");
+        if (config.skip_stdlib_stubs) {
+            fprintf(dst_file, "#define SKIP_STDLIB_STUBS 1\n");
+        }
+        fprintf(dst_file, "#ifndef SKIP_STDLIB_STUBS\n");
+        fprintf(dst_file, "    #include \"stdlib_stubs.h\"\n");
+        fprintf(dst_file, "#endif\n\n");
+        fprintf(dst_file, "// Suppress warnings for unused parameters (common in transpiled code)\n");
+        fprintf(dst_file, "#ifdef _MSC_VER\n");
+        fprintf(dst_file, "    #pragma warning(disable: 4100)  // unreferenced formal parameter\n");
+        fprintf(dst_file, "    #pragma warning(disable: 4189)  // local variable initialized but not used\n");
+        fprintf(dst_file, "    #pragma warning(disable: 4702)  // unreachable code\n");
+        fprintf(dst_file, "    #pragma warning(disable: 4310)  // cast truncates constant value\n");
+        fprintf(dst_file, "    #pragma warning(disable: 4146)  // unary minus on unsigned type\n");
+        fprintf(dst_file, "#endif\n\n");
+        fprintf(dst_file, "#endif // STDLIB_HEADERS_H\n");
+        fclose(dst_file);
+    }
+    
+    // List of other headers to copy
     const char *headers_to_copy[] = {
-        "stdlib_headers.h",
         "stdlib_stubs.h",
         "gecko_memory.h",
+        "function_address_map.h",
         NULL
     };
     
@@ -3352,6 +4143,112 @@ int main(int argc, char *argv[]) {
         } else {
             fprintf(stderr, "Warning: Could not copy %s\n", headers_to_copy[i]);
         }
+    }
+    
+    // Copy function_address_map.c source file
+    char src_c_path[512], dst_c_path[512];
+    snprintf(src_c_path, sizeof(src_c_path), "src/function_address_map.c");
+    snprintf(dst_c_path, sizeof(dst_c_path), "%s/src/function_address_map.c", output_project);
+    FILE *src_c = fopen(src_c_path, "r");
+    FILE *dst_c = fopen(dst_c_path, "w");
+    if (src_c && dst_c) {
+        char buffer[4096];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), src_c)) > 0) {
+            fwrite(buffer, 1, bytes, dst_c);
+        }
+        fclose(src_c);
+        fclose(dst_c);
+        printf("  Copied function_address_map.c\n");
+    } else {
+        fprintf(stderr, "Warning: Could not copy function_address_map.c\n");
+    }
+    
+    // Copy ppc_runtime.c source file
+    snprintf(src_c_path, sizeof(src_c_path), "src/ppc_runtime.c");
+    snprintf(dst_c_path, sizeof(dst_c_path), "%s/src/ppc_runtime.c", output_project);
+    src_c = fopen(src_c_path, "r");
+    dst_c = fopen(dst_c_path, "w");
+    if (src_c && dst_c) {
+        char buffer[4096];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), src_c)) > 0) {
+            fwrite(buffer, 1, bytes, dst_c);
+        }
+        fclose(src_c);
+        fclose(dst_c);
+        printf("  Copied ppc_runtime.c\n");
+    } else {
+        fprintf(stderr, "Warning: Could not copy ppc_runtime.c (tried: %s)\n", src_c_path);
+    }
+    
+    // Copy ppc_runtime.h header file (if not already in headers_to_copy list)
+    char ppc_runtime_h_src[512], ppc_runtime_h_dst[512];
+    snprintf(ppc_runtime_h_src, sizeof(ppc_runtime_h_src), "include/ppc_runtime.h");
+    snprintf(ppc_runtime_h_dst, sizeof(ppc_runtime_h_dst), "%s/include/ppc_runtime.h", output_project);
+    FILE *ppc_runtime_h_src_file = fopen(ppc_runtime_h_src, "r");
+    FILE *ppc_runtime_h_dst_file = fopen(ppc_runtime_h_dst, "w");
+    if (ppc_runtime_h_src_file && ppc_runtime_h_dst_file) {
+        char buffer[4096];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), ppc_runtime_h_src_file)) > 0) {
+            fwrite(buffer, 1, bytes, ppc_runtime_h_dst_file);
+        }
+        fclose(ppc_runtime_h_src_file);
+        fclose(ppc_runtime_h_dst_file);
+        printf("  Copied ppc_runtime.h\n");
+    } else {
+        fprintf(stderr, "Warning: Could not copy ppc_runtime.h (tried: %s)\n", ppc_runtime_h_src);
+    }
+    
+    // Copy sdk_functions.txt to project (needed for SDK function signatures)
+    char sdk_funcs_src[512], sdk_funcs_dst[512];
+    snprintf(sdk_funcs_src, sizeof(sdk_funcs_src), "sdk_functions.txt");
+    snprintf(sdk_funcs_dst, sizeof(sdk_funcs_dst), "%s/sdk_functions.txt", output_project);
+    FILE *sdk_funcs_src_file = fopen(sdk_funcs_src, "r");
+    FILE *sdk_funcs_dst_file = fopen(sdk_funcs_dst, "w");
+    if (sdk_funcs_src_file && sdk_funcs_dst_file) {
+        char buffer[4096];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), sdk_funcs_src_file)) > 0) {
+            fwrite(buffer, 1, bytes, sdk_funcs_dst_file);
+        }
+        fclose(sdk_funcs_src_file);
+        fclose(sdk_funcs_dst_file);
+        printf("  Copied sdk_functions.txt\n");
+    } else {
+        fprintf(stderr, "Warning: Could not copy sdk_functions.txt\n");
+    }
+    
+    // Generate skip_sdk_functions.txt next to the tool executable (not in project)
+    // This file is used by the transpiler tool, not the project
+    char skip_sdk_tool[512];
+    snprintf(skip_sdk_tool, sizeof(skip_sdk_tool), "skip_sdk_functions.txt");
+    FILE *skip_sdk_file = fopen(skip_sdk_tool, "w");
+    if (skip_sdk_file) {
+        fprintf(skip_sdk_file, "# Skip list for SDK functions\n");
+        fprintf(skip_sdk_file, "# Generated automatically from sdk_functions.txt\n");
+        fprintf(skip_sdk_file, "# These functions should not be transpiled as they are provided by the SDK\n");
+        fprintf(skip_sdk_file, "# This file should be used with the transpiler tool: porpoise_tool.exe \"Project\" \"Input\" \"Output\" skip_sdk_functions.txt\n\n");
+        
+        // Read sdk_functions.txt to extract function names
+        sdk_funcs_src_file = fopen(sdk_funcs_src, "r");
+        if (sdk_funcs_src_file) {
+            char line[256];
+            while (fgets(line, sizeof(line), sdk_funcs_src_file)) {
+                // Skip comments and empty lines
+                if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+                
+                // Extract function name (before the colon)
+                char func_name[128];
+                if (sscanf(line, "%127[^:\n]", func_name) == 1) {
+                    fprintf(skip_sdk_file, "%s\n", func_name);
+                }
+            }
+            fclose(sdk_funcs_src_file);
+        }
+        fclose(skip_sdk_file);
+        printf("  Generated skip_sdk_functions.txt (next to tool executable)\n");
     }
     
     generate_readme(output_project, proj_name);

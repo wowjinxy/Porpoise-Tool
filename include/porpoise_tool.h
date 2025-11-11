@@ -92,6 +92,7 @@ static inline bool is_reserved_name(const char *name) {
         "exit",          // stdlib.h - exit program
         "abort",         // stdlib.h - abort program
         "_Exit",         // stdlib.h - exit without cleanup
+        "_ExitProcess",  // ppc_runtime.h - GameCube exit function (provided by runtime)
         "atexit",        // stdlib.h - register exit handler
         "abs",           // stdlib.h - absolute value (conflicts with transpiled version)
         "memcpy",        // string.h
@@ -421,6 +422,22 @@ typedef struct {
     int num_int_params;         // Number of integer parameters
     int num_float_params;       // Number of float parameters
 } Function_Info;
+
+/**
+ * @brief Register value tracking for compile-time function pointer resolution
+ */
+typedef struct {
+    // Track known addresses in registers
+    // 0 = unknown, non-zero = known GameCube address
+    uint32_t r[32];      // General purpose registers
+    uint32_t lr;         // Link register
+    uint32_t ctr;        // Count register
+    
+    // Track if register values are known
+    bool r_known[32];
+    bool lr_known;
+    bool ctr_known;
+} RegisterTracker;
 
 /**
  * @brief File context for transpilation
@@ -987,6 +1004,11 @@ static inline void write_function_declaration(FILE *h_file, const Function_Info 
         return;
     }
     
+    // Don't write declarations for skipped functions (SDK, stdlib, etc.)
+    if (func->skip) {
+        return;
+    }
+    
     // Handle data-only functions as extern byte arrays
     if (func->is_data_only) {
         fprintf(h_file, "extern const uint8_t %s[];  // Data at 0x%08X\n", 
@@ -995,6 +1017,28 @@ static inline void write_function_declaration(FILE *h_file, const Function_Info 
     }
     
     // Skip standard library and SDK functions - these have their own declarations
+    // Use pattern matching to catch all SDK functions (OS*, EXI*, DC*, IC*, etc.)
+    const char *name = func->name;
+    if (strncmp(name, "OS", 2) == 0 ||          // OS functions
+        strncmp(name, "__OS", 4) == 0 ||        // Internal OS functions
+        strncmp(name, "EXI", 3) == 0 ||         // EXI functions
+        strncmp(name, "DC", 2) == 0 ||          // Data cache functions
+        strncmp(name, "IC", 2) == 0 ||          // Instruction cache functions
+        strncmp(name, "LC", 2) == 0 ||          // L2 cache functions
+        strncmp(name, "L2", 2) == 0 ||          // L2 cache functions
+        strncmp(name, "SI", 2) == 0 ||          // Serial Interface functions
+        strncmp(name, "VI", 2) == 0 ||          // Video Interface functions
+        strncmp(name, "CARD", 4) == 0 ||        // Memory card functions
+        strncmp(name, "DVD", 3) == 0 ||         // DVD functions
+        strncmp(name, "AR", 2) == 0 ||          // Audio functions
+        strncmp(name, "ARQ", 3) == 0 ||         // Audio Request Queue functions
+        strncmp(name, "PAD", 3) == 0 ||         // Controller functions
+        strncmp(name, "GX", 2) == 0 ||          // Graphics functions
+        strncmp(name, "AX", 2) == 0) {          // Audio DSP functions
+        return;  // Skip SDK function declarations
+    }
+    
+    // Also check explicit list for standard library functions
     const char *intrinsics[] = {
         // Standard library
         "memset", "memcpy", "memmove", "memcmp",
@@ -1007,32 +1051,6 @@ static inline void write_function_declaration(FILE *h_file, const Function_Info 
         "malloc", "free", "calloc", "realloc",
         "rand", "srand",
         "main",
-        // SDK OS functions
-        "OSInit", "OSReport", "OSPanic", "OSError",
-        "OSInitThreadQueue", "OSGetCurrentThread", "OSIsThreadSuspended", "OSIsThreadTerminated",
-        "OSDisableScheduler", "OSEnableScheduler", "OSYieldThread",
-        "OSCreateThread", "OSExitThread", "OSCancelThread", "OSJoinThread", "OSDetachThread",
-        "OSResumeThread", "OSSuspendThread", "OSSetThreadPriority", "OSGetThreadPriority",
-        "OSSleepThread", "OSWakeupThread", "OSGetThreadSpecific", "OSSetThreadSpecific",
-        "OSClearStack", "OSCheckActiveThreads", "OSSleepTicks",
-        "OSInitMessageQueue", "OSSendMessage", "OSJamMessage", "OSReceiveMessage",
-        "OSGetArenaHi", "OSGetArenaLo", "OSSetArenaHi", "OSSetArenaLo",
-        "OSGetMEM1ArenaHi", "OSGetMEM1ArenaLo", "OSSetMEM1ArenaHi", "OSSetMEM1ArenaLo",
-        "OSGetMEM2ArenaHi", "OSGetMEM2ArenaLo", "OSSetMEM2ArenaHi", "OSSetMEM2ArenaLo",
-        "OSInitAlloc", "OSCreateHeap", "OSDestroyHeap", "OSSetCurrentHeap", "OSGetCurrentHeap",
-        "OSAllocFromHeap", "OSFreeToHeap",
-        // SDK DVD functions
-        "DVDInit", "DVDOpen", "DVDClose", "DVDReadAsync",
-        // SDK Card functions
-        "CARDInit",
-        // SDK VI functions
-        "VIInit", "VISetPostRetraceCallback",
-        // SDK PAD functions
-        "PADInit", "PADRead",
-        // SDK AR/ARQ functions
-        "ARInit", "ARQInit",
-        // SDK EXI functions
-        "EXIInit",
         NULL
     };
     
@@ -1045,10 +1063,6 @@ static inline void write_function_declaration(FILE *h_file, const Function_Info 
     // Get the actual function name (renamed if necessary to avoid conflicts)
     char func_name_buffer[512];
     const char *func_name = sanitize_function_name(func->name, func_name_buffer, sizeof(func_name_buffer));
-    
-    if (func->skip) {
-        fprintf(h_file, "// Skipped: ");
-    }
     
     const char *return_type = func->returns_value ? "uint32_t" : "void";
     fprintf(h_file, "%s %s(", return_type, func_name);

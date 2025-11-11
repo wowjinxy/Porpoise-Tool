@@ -1,0 +1,7 @@
+{
+  "transpile_sdk_functions": false,
+  "skip_stdlib_stubs": false,
+  "ignore_cstd_calls": true,
+  "sdk_functions_file": "sdk_functions.txt",
+  "skip_list_file": ""
+}

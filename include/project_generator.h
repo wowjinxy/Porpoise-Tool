@@ -49,7 +49,14 @@ static inline int generate_cmake(const char *project_dir, const char *project_na
     fprintf(f, "set(CMAKE_C_STANDARD_REQUIRED ON)\n\n");
     
     fprintf(f, "# Include directories\n");
-    fprintf(f, "include_directories(${CMAKE_SOURCE_DIR}/include)\n\n");
+    fprintf(f, "include_directories(${CMAKE_SOURCE_DIR}/include)\n");
+    fprintf(f, "# Add SDK include directory if it exists\n");
+    fprintf(f, "if(EXISTS ${CMAKE_SOURCE_DIR}/sdk/include)\n");
+    fprintf(f, "    include_directories(${CMAKE_SOURCE_DIR}/sdk/include)\n");
+    fprintf(f, "endif()\n");
+    fprintf(f, "if(EXISTS ${CMAKE_SOURCE_DIR}/src/sdk/include)\n");
+    fprintf(f, "    include_directories(${CMAKE_SOURCE_DIR}/src/sdk/include)\n");
+    fprintf(f, "endif()\n\n");
     
     fprintf(f, "# Compiler flags\n");
     fprintf(f, "if(MSVC)\n");
@@ -60,14 +67,28 @@ static inline int generate_cmake(const char *project_dir, const char *project_na
     fprintf(f, "endif()\n\n");
     
     fprintf(f, "# Automatically find all source files recursively\n");
+    fprintf(f, "# This includes transpiled files and SDK files if they're in src/\n");
     fprintf(f, "file(GLOB_RECURSE SOURCES \n");
     fprintf(f, "    \"src/*.c\"\n");
     fprintf(f, ")\n\n");
     
+    fprintf(f, "# Also find SDK files if they're in a separate sdk/ directory\n");
+    fprintf(f, "if(EXISTS ${CMAKE_SOURCE_DIR}/sdk)\n");
+    fprintf(f, "    file(GLOB_RECURSE SDK_SOURCES \"sdk/src/*.c\")\n");
+    fprintf(f, "    list(APPEND SOURCES ${SDK_SOURCES})\n");
+    fprintf(f, "endif()\n\n");
+    
     fprintf(f, "# Automatically find all header files (for IDE project view)\n");
+    fprintf(f, "# This includes transpiled headers and SDK headers if they're in include/\n");
     fprintf(f, "file(GLOB_RECURSE HEADERS \n");
     fprintf(f, "    \"include/*.h\"\n");
     fprintf(f, ")\n\n");
+    
+    fprintf(f, "# Also find SDK headers if they're in a separate sdk/ directory\n");
+    fprintf(f, "if(EXISTS ${CMAKE_SOURCE_DIR}/sdk)\n");
+    fprintf(f, "    file(GLOB_RECURSE SDK_HEADERS \"sdk/include/*.h\")\n");
+    fprintf(f, "    list(APPEND HEADERS ${SDK_HEADERS})\n");
+    fprintf(f, "endif()\n\n");
     
     fprintf(f, "# Print number of files found (helpful for debugging)\n");
     fprintf(f, "list(LENGTH SOURCES SOURCE_COUNT)\n");
@@ -112,7 +133,8 @@ static inline int generate_main_c(const char *project_dir) {
     fprintf(f, "#include <stdint.h>\n");
     fprintf(f, "#include <stdlib.h>\n");
     fprintf(f, "#include \"powerpc_state.h\"\n");
-    fprintf(f, "#include \"all_functions.h\"\n\n");
+    fprintf(f, "#include \"all_functions.h\"\n");
+    fprintf(f, "#include \"function_address_map.h\"\n\n");
     
     fprintf(f, "// Forward declare game's main if it exists\n");
     fprintf(f, "// The transpiler renames 'main' to 'main_impl' to avoid conflicts\n");

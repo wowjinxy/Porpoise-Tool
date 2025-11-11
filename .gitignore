@@ -46,3 +46,5 @@ desktop.ini
 /PikminProject
 *.bat
 /build_runtime
+/COLORASM_Project
+/include/opcode
