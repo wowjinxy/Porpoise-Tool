@@ -136,10 +136,9 @@ static inline int generate_main_c(const char *project_dir) {
     fprintf(f, "#include \"all_functions.h\"\n");
     fprintf(f, "#include \"function_address_map.h\"\n\n");
     
-    fprintf(f, "// Forward declare game's main if it exists\n");
-    fprintf(f, "// The transpiler renames 'main' to 'main_impl' to avoid conflicts\n");
-    fprintf(f, "// Uncomment this line if your game has a main() function:\n");
-    fprintf(f, "// extern void main_impl(void);  // Game's main (renamed from 'main')\n\n");
+    fprintf(f, "// Forward declare GameCube startup function\n");
+    fprintf(f, "// __start() performs OS initialization and then calls the game's main() function\n");
+    fprintf(f, "extern void __start(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, double, double);\n\n");
     
     fprintf(f, "/**\n");
     fprintf(f, " * @brief Program entry point\n");
@@ -169,13 +168,14 @@ static inline int generate_main_c(const char *project_dir) {
     fprintf(f, "    printf(\"  - PowerPC registers: Ready\\n\");\n");
     fprintf(f, "    printf(\"  - Function registry: Loaded\\n\\n\");\n\n");
     
-    fprintf(f, "    // Call the game's main if it exists\n");
-    fprintf(f, "    // Uncomment these lines if your game has a main() function:\n");
-    fprintf(f, "    // printf(\"Calling game's main_impl()...\\n\\n\");\n");
-    fprintf(f, "    // main_impl();  // Call the transpiled game main\n\n");
+    fprintf(f, "    // Call the GameCube startup function\n");
+    fprintf(f, "    // __start() performs OS initialization (OSInit, hardware setup, etc.)\n");
+    fprintf(f, "    // and then calls the game's main() function (renamed to main_impl)\n");
+    fprintf(f, "    printf(\"Calling game's __start()...\\n\\n\");\n");
+    fprintf(f, "    __start(0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0);  // Call GameCube startup\n\n");
     
-    fprintf(f, "    // Otherwise, add your test code here:\n");
-    fprintf(f, "    printf(\"Add function calls here for testing.\\n\");\n");
+    fprintf(f, "    // If you want to call individual functions instead of __start(), add test code here:\n");
+    fprintf(f, "    // printf(\"Add function calls here for testing.\\n\");\n");
     fprintf(f, "    // r3 = 0x12345678;  // Set up parameter\n");
     fprintf(f, "    // fn_80010BBC();    // Call transpiled function\n");
     fprintf(f, "    // printf(\"Result in r3: 0x%%08X\\n\", r3);\n\n");

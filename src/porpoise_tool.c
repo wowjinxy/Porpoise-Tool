@@ -136,8 +136,11 @@ static bool is_sdk_or_stdlib_function(const char *name) {
         }
     }
     
-    // Check reserved/stdlib functions
-    return is_reserved_name(name);
+    // NOTE: Reserved names (like "main") should NOT be skipped - they should be renamed
+    // to avoid conflicts (e.g., "main" -> "main_impl"). This is handled by sanitize_function_name.
+    // Only SDK functions and standard library functions that are provided externally should be skipped.
+    
+    return false;
 }
 
 // Lookup function name by GameCube address (for compile-time function pointer resolution)
@@ -180,7 +183,11 @@ static void register_transpiled_function(const char *name, uint32_t gc_address, 
     // Add entry (skip local/static, SDK, and stdlib functions)
     if (!is_local && gc_address != 0 && !is_sdk_or_stdlib_function(name)) {
         FunctionRegistryEntry *entry = &function_registry[function_registry_count++];
-        strncpy(entry->name, name, sizeof(entry->name) - 1);
+        
+        // Store the SANITIZED name (e.g., "main" -> "main_impl") to avoid conflicts
+        char sanitized_name[MAX_FUNCTION_NAME];
+        sanitize_function_name(name, sanitized_name, sizeof(sanitized_name));
+        strncpy(entry->name, sanitized_name, sizeof(entry->name) - 1);
         entry->name[sizeof(entry->name) - 1] = '\0';
         entry->gc_address = gc_address;
         entry->is_local = is_local;
@@ -779,14 +786,16 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
             } else {
                 // It's a function name (external or other file)
                 // Both b and bl should be function calls for external symbols
-                // NOTE: Don't sanitize function names when calling them
-                // Only sanitize when defining to avoid redefinition conflicts
-                // This allows calling standard library functions directly
+                // IMPORTANT: We MUST sanitize reserved names when calling them too,
+                // because the function was defined with a sanitized name (e.g., main -> main_impl)
+                // This ensures calls to reserved names match the renamed definitions.
                 
-                // Rename __va_arg to ppc_va_arg to avoid MSVC intrinsic conflict
-                const char *actual_target = target;
+                // Sanitize the function name to get the actual C function name
+                char sanitized_target[MAX_FUNCTION_NAME];
                 static char stub_name[256];  // Static so it persists after function returns
+                const char *actual_target;
                 
+                // Special case: __va_arg -> ppc_va_arg (to avoid MSVC intrinsic conflict)
                 if (strcmp(target, "__va_arg") == 0) {
                     actual_target = "ppc_va_arg";
                 }
@@ -814,17 +823,21 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
                     }
                     snprintf(stub_name, sizeof(stub_name), "cpp_stub_func_%08x", hash);
                     actual_target = stub_name;
-                }
-                // Check if this is a C++ standard library call that should be ignored
-                else if (config.ignore_cstd_calls && is_cstd_call(target)) {
-                    // Generate a comment instead of a function call
-                    if (strcmp(mnemonic, "bl") == 0 || strcmp(mnemonic, "bla") == 0) {
-                        snprintf(output, output_size, "/* C++ std call ignored: %s */", target);
-                    } else {
-                        snprintf(output, output_size, "/* C++ std branch ignored: %s */", target);
+                } else {
+                    // Normal function name - check if it should be ignored first
+                    if (config.ignore_cstd_calls && is_cstd_call(target)) {
+                        // Generate a comment instead of a function call
+                        if (strcmp(mnemonic, "bl") == 0 || strcmp(mnemonic, "bla") == 0) {
+                            snprintf(output, output_size, "/* C++ std call ignored: %s */", target);
+                        } else {
+                            snprintf(output, output_size, "/* C++ std branch ignored: %s */", target);
+                        }
+                        snprintf(comment, comment_size, "%s %s (C++ std call - ignored)", mnemonic, target);
+                        return true;
                     }
-                    snprintf(comment, comment_size, "%s %s (C++ std call - ignored)", mnemonic, target);
-                    return true;
+                    // Sanitize it (handles reserved names like main -> main_impl)
+                    sanitize_function_name(target, sanitized_target, sizeof(sanitized_target));
+                    actual_target = sanitized_target;
                 }
                 
                 // Check if this is an SDK function

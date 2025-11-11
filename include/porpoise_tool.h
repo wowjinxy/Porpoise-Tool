@@ -1038,31 +1038,17 @@ static inline void write_function_declaration(FILE *h_file, const Function_Info 
         return;  // Skip SDK function declarations
     }
     
-    // Also check explicit list for standard library functions
-    const char *intrinsics[] = {
-        // Standard library
-        "memset", "memcpy", "memmove", "memcmp",
-        "strcmp", "strcpy", "strncpy", "strlen", "strncmp",
-        "sprintf", "printf", "vprintf", "vsnprintf",
-        "fwrite", "fread", "fopen", "fclose", "ftell", "fseek",
-        "wcstombs", "mbstowcs",
-        "strtoul", "strtol", "atoi", "atof",
-        "sqrt", "round",
-        "malloc", "free", "calloc", "realloc",
-        "rand", "srand",
-        "main",
-        NULL
-    };
-    
-    for (int i = 0; intrinsics[i] != NULL; i++) {
-        if (strcmp(func->name, intrinsics[i]) == 0) {
-            return;  // Skip this function
-        }
-    }
-    
     // Get the actual function name (renamed if necessary to avoid conflicts)
+    // This MUST be done before checking intrinsics, because reserved names like "main"
+    // are renamed to "main_impl" and should be declared with the sanitized name
     char func_name_buffer[512];
     const char *func_name = sanitize_function_name(func->name, func_name_buffer, sizeof(func_name_buffer));
+    
+    // Check if the ORIGINAL (unsanitized) name is a standard library function
+    // If it is, we still declare it (with the sanitized name) because it's transpiled
+    // Standard library functions that are provided externally (not transpiled) are skipped
+    // by is_sdk_or_stdlib_function, so they won't reach here.
+    // Reserved names like "main" are transpiled and renamed, so they need declarations.
     
     const char *return_type = func->returns_value ? "uint32_t" : "void";
     fprintf(h_file, "%s %s(", return_type, func_name);
