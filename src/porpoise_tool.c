@@ -844,64 +844,101 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
                 const SDK_Function_Info *sdk_info = get_sdk_function_info(actual_target);
                 
                 char params[512];
-                if (sdk_info && sdk_info->num_params > 0) {
-                    // SDK function - generate typed parameters
-                    const char *int_regs[] = {"r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"};
-                    const char *float_regs[] = {"f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"};
-                    
-                    char *p = params;
-                    size_t remaining = sizeof(params);
-                    int int_reg_idx = 0;
-                    int float_reg_idx = 0;
-                    
-                    for (int i = 0; i < sdk_info->num_params && i < 10; i++) {
-                        if (i > 0) {
-                            int written = snprintf(p, remaining, ", ");
-                            p += written;
-                            remaining -= written;
-                        }
+                bool is_sdk_func = (sdk_info != NULL);
+                
+                if (is_sdk_func) {
+                    // SDK function - generate typed parameters (or empty if no params)
+                    if (sdk_info->num_params > 0) {
+                        const char *int_regs[] = {"r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"};
+                        const char *float_regs[] = {"f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"};
                         
-                        switch (sdk_info->param_types[i]) {
-                            case SDK_PARAM_PTR:
-                                if (int_reg_idx < 8) {
-                                    int written = snprintf(p, remaining, "(void*)%s", int_regs[int_reg_idx++]);
-                                    p += written;
-                                    remaining -= written;
-                                }
-                                break;
-                            case SDK_PARAM_INT:
-                                if (int_reg_idx < 8) {
-                                    int written = snprintf(p, remaining, "(int)%s", int_regs[int_reg_idx++]);
-                                    p += written;
-                                    remaining -= written;
-                                }
-                                break;
-                            case SDK_PARAM_FLOAT:
-                                if (float_reg_idx < 8) {
-                                    int written = snprintf(p, remaining, "(float)%s", float_regs[float_reg_idx++]);
-                                    p += written;
-                                    remaining -= written;
-                                }
-                                break;
-                            case SDK_PARAM_DOUBLE:
-                                if (float_reg_idx < 8) {
-                                    int written = snprintf(p, remaining, "%s", float_regs[float_reg_idx++]);
-                                    p += written;
-                                    remaining -= written;
-                                }
-                                break;
+                        char *p = params;
+                        size_t remaining = sizeof(params);
+                        int int_reg_idx = 0;
+                        int float_reg_idx = 0;
+                        
+                        for (int i = 0; i < sdk_info->num_params && i < 10; i++) {
+                            if (i > 0) {
+                                int written = snprintf(p, remaining, ", ");
+                                p += written;
+                                remaining -= written;
+                            }
+                            
+                            switch (sdk_info->param_types[i]) {
+                                case SDK_PARAM_PTR:
+                                    if (int_reg_idx < 8) {
+                                        int written = snprintf(p, remaining, "(void*)%s", int_regs[int_reg_idx++]);
+                                        p += written;
+                                        remaining -= written;
+                                    }
+                                    break;
+                                case SDK_PARAM_INT:
+                                    if (int_reg_idx < 8) {
+                                        int written = snprintf(p, remaining, "(int)%s", int_regs[int_reg_idx++]);
+                                        p += written;
+                                        remaining -= written;
+                                    }
+                                    break;
+                                case SDK_PARAM_FLOAT:
+                                    if (float_reg_idx < 8) {
+                                        int written = snprintf(p, remaining, "(float)%s", float_regs[float_reg_idx++]);
+                                        p += written;
+                                        remaining -= written;
+                                    }
+                                    break;
+                                case SDK_PARAM_DOUBLE:
+                                    if (float_reg_idx < 8) {
+                                        int written = snprintf(p, remaining, "%s", float_regs[float_reg_idx++]);
+                                        p += written;
+                                        remaining -= written;
+                                    }
+                                    break;
+                            }
                         }
+                    } else {
+                        // SDK function with no parameters - empty parameter list
+                        params[0] = '\0';
                     }
                 } else {
                     // Game function - use standard 10-parameter convention
                     snprintf(params, sizeof(params), "r3, r4, r5, r6, r7, r8, r9, r10, f1, f2");
                 }
                 
+                // Check if this SDK function returns a value (functions that return pointers or ints)
+                // For now, we'll assume SDK functions with names starting with "OSGet" return values
+                bool returns_value = false;
+                if (is_sdk_func && (strncmp(actual_target, "OSGet", 5) == 0 || 
+                                    strncmp(actual_target, "OSIs", 4) == 0 ||
+                                    strncmp(actual_target, "OSCreate", 8) == 0 ||
+                                    strncmp(actual_target, "OSAlloc", 7) == 0 ||
+                                    strncmp(actual_target, "OSGetCurrent", 12) == 0 ||
+                                    strncmp(actual_target, "OSGetThread", 11) == 0)) {
+                    returns_value = true;
+                }
+                
                 if (strcmp(mnemonic, "bl") == 0 || strcmp(mnemonic, "bla") == 0) {
-                    snprintf(output, output_size, "%s(%s);", actual_target, params);
+                    if (is_sdk_func && returns_value) {
+                        // SDK function that returns a value - capture return in r3
+                        if (sdk_info->num_params > 0) {
+                            snprintf(output, output_size, "r3 = (uintptr_t)%s(%s);", actual_target, params);
+                        } else {
+                            snprintf(output, output_size, "r3 = (uintptr_t)%s();", actual_target);
+                        }
+                    } else {
+                        // SDK function with no return, or game function
+                        if (is_sdk_func && sdk_info->num_params == 0) {
+                            snprintf(output, output_size, "%s();", actual_target);
+                        } else {
+                            snprintf(output, output_size, "%s(%s);", actual_target, params);
+                        }
+                    }
                 } else {
                     // Tail call optimization (branch without link)
-                    snprintf(output, output_size, "return %s(%s);  /* Tail call */", actual_target, params);
+                    if (is_sdk_func && sdk_info->num_params == 0) {
+                        snprintf(output, output_size, "return %s();  /* Tail call */", actual_target);
+                    } else {
+                        snprintf(output, output_size, "return %s(%s);  /* Tail call */", actual_target, params);
+                    }
                 }
             }
         }
