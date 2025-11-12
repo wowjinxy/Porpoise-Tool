@@ -69,23 +69,25 @@ static inline int transpile_stw(const STW_Instruction *decoded,
                                 char *output,
                                 size_t output_size) {
     if (decoded->rA == 0) {
-        // Store to absolute address (displacement only)
+        // Absolute address - should be resolved by transpiler to actual symbol/location
+        // For now, generate direct address (transpiler will resolve this)
+        uint32_t abs_addr = (uint32_t)(int16_t)decoded->d;
         return snprintf(output, output_size,
-                       "*(uint32_t*)translate_address(0x%x) = r%u;",
-                       (uint32_t)decoded->d, decoded->rS);
+                       "*(uint32_t*)(uintptr_t)0x%08X = r%u;",
+                       abs_addr, decoded->rS);
     } else {
-        // Store to address (rA + displacement) - subtract GameCube base 0x80000000
+        // Register-based address - registers contain host pointers, use direct cast
         if (decoded->d == 0) {
             return snprintf(output, output_size,
-                           "*(uint32_t*)translate_address(r%u) = r%u;",
+                           "*(uint32_t*)(r%u) = r%u;",
                            decoded->rA, decoded->rS);
         } else if (decoded->d > 0) {
             return snprintf(output, output_size,
-                           "*(uint32_t*)translate_address(r%u + 0x%x) = r%u;",
+                           "*(uint32_t*)(r%u + 0x%x) = r%u;",
                            decoded->rA, (uint16_t)decoded->d, decoded->rS);
         } else {
             return snprintf(output, output_size,
-                           "*(uint32_t*)translate_address(r%u - 0x%x) = r%u;",
+                           "*(uint32_t*)(r%u - 0x%x) = r%u;",
                            decoded->rA, (uint16_t)(-decoded->d), decoded->rS);
         }
     }

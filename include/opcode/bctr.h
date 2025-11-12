@@ -23,13 +23,15 @@ static inline bool decode_bctr(uint32_t inst, BCTR_Instruction *d) {
     return true;
 }
 
-static inline int transpile_bctr(const BCTR_Instruction *d, uint32_t current_addr, char *o, size_t s) {
+static inline int transpile_bctr(const BCTR_Instruction *d, uint32_t current_addr, char *o, size_t s, const char* (*lookup_func)(uint32_t)) {
     if (d->LK) {
         // bctrl - indirect call via CTR
-        // Use function resolver to handle GameCube function pointers
+        // Generate code that uses function address map to resolve indirect calls
+        (void)lookup_func; // May be used for compile-time optimization in future
         uint32_t return_addr = current_addr + 4;
         return snprintf(o, s,
-                       "{ uintptr_t saved_ctr = ctr; lr = 0x%08X; call_indirect((uint32_t)saved_ctr, r3, r4, r5, r6, r7, r8, r9, r10, f1, f2); }",
+                       "{ uintptr_t saved_ctr = ctr; lr = 0x%08X; "
+                       "call_function_by_address((uint32_t)saved_ctr, r3, r4, r5, r6, r7, r8, r9, r10, f1, f2); }",
                        return_addr);
     }
     // bctr without link - typically used for computed jumps (switch statements)

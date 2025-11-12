@@ -4,6 +4,7 @@
  */
 
 #include "ppc_runtime.h"
+#include "powerpc_state.h"  // For translate_address and mem
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -136,3 +137,43 @@ int strcasecmp(const char *s1, const char *s2) {
 }
 #endif
 #endif
+
+/**
+ * @brief Initialize PowerPC registers to host pointers
+ * This replaces the game's __init_registers() function to ensure registers
+ * contain host pointers instead of GameCube addresses.
+ * 
+ * The game's __init_registers() sets:
+ * - r1 = 0x8002F0D8 (stack pointer)
+ * - r2 = 0x800270A0 (small data area pointer)
+ * - r13 = 0x80026E00 (small data area pointer)
+ * 
+ * This function converts these GameCube addresses to host pointers.
+ */
+void __init_registers(uint32_t param_r3, uint32_t param_r4, uint32_t param_r5, uint32_t param_r6,
+                      uint32_t param_r7, uint32_t param_r8, uint32_t param_r9, uint32_t param_r10,
+                      double param_f1, double param_f2) {
+    // Parameter marshaling
+    r3 = param_r3;
+    r4 = param_r4;
+    r5 = param_r5;
+    r6 = param_r6;
+    r7 = param_r7;
+    r8 = param_r8;
+    r9 = param_r9;
+    r10 = param_r10;
+    f1 = param_f1;
+    f2 = param_f2;
+    
+    // Initialize r1 (stack pointer) to host pointer
+    // GameCube address: 0x8002F0D8 -> mem + 0x2F0D8
+    r1 = (uintptr_t)(mem + 0x2F0D8);
+    
+    // Initialize r2 (small data area pointer) to host pointer
+    // GameCube address: 0x800270A0 -> mem + 0x270A0
+    r2 = (uintptr_t)(mem + 0x270A0);
+    
+    // Initialize r13 (small data area pointer) to host pointer
+    // GameCube address: 0x80026E00 -> mem + 0x26E00
+    r13 = (uintptr_t)(mem + 0x26E00);
+}

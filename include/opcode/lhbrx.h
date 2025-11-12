@@ -38,13 +38,14 @@ static inline bool decode_lhbrx(uint32_t inst, LHBRX_Instruction *d) {
 
 static inline int transpile_lhbrx(const LHBRX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
+        // Absolute address (rB contains absolute address) - should be resolved by transpiler
         return snprintf(o, s,
-                       "{ uint16_t val = *(uint16_t*)translate_address(r%u); "
+                       "{ uint16_t val = *(uint16_t*)(uintptr_t)r%u; "
                        "r%u = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF); }",
                        d->rB, d->rD);
     }
     return snprintf(o, s,
-                   "{ uint16_t val = *(uint16_t*)translate_address(r%u + r%u); "
+                   "{ uint16_t val = *(uint16_t*)(r%u + r%u); "
                    "r%u = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF); }",
                    d->rA, d->rB, d->rD);
 }

@@ -36,9 +36,10 @@ static inline bool decode_stfsx(uint32_t inst, STFSX_Instruction *d) {
 
 static inline int transpile_stfsx(const STFSX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
-        return snprintf(o, s, "*(float*)translate_address(r%u) = (float)f%u;", d->rB, d->frS);
+        // Absolute address (rB contains absolute address) - should be resolved by transpiler
+        return snprintf(o, s, "*(float*)(uintptr_t)r%u = (float)f%u;", d->rB, d->frS);
     }
-    return snprintf(o, s, "*(float*)translate_address(r%u + r%u) = (float)f%u;", d->rA, d->rB, d->frS);
+    return snprintf(o, s, "*(float*)(r%u + r%u) = (float)f%u;", d->rA, d->rB, d->frS);
 }
 
 static inline int comment_stfsx(const STFSX_Instruction *d, char *o, size_t s) {

@@ -1009,6 +1009,11 @@ static inline void write_function_declaration(FILE *h_file, const Function_Info 
         return;
     }
     
+    // Skip __init_registers - we provide our own custom implementation
+    if (strcmp(func->name, "__init_registers") == 0) {
+        return;
+    }
+    
     // Handle data-only functions as extern byte arrays
     if (func->is_data_only) {
         fprintf(h_file, "extern const uint8_t %s[];  // Data at 0x%08X\n", 
@@ -1155,12 +1160,24 @@ static inline void write_function_start(FILE *c_file, const Function_Info *func)
     fprintf(c_file, ") {\n");
     
     // Generate parameter marshaling code (move C params to register globals)
+    // Convert GameCube addresses to host pointers immediately to ensure registers never contain GC addresses
     if (func->has_params) {
-        fprintf(c_file, "    // Parameter marshaling\n");
+        fprintf(c_file, "    // Parameter marshaling (convert GC addresses to host pointers)\n");
+        fprintf(c_file, "    // Helper to convert GameCube addresses to host pointers\n");
+        fprintf(c_file, "    #define PARAM_TO_HOST_PTR(addr) (\\\n");
+        fprintf(c_file, "        ((addr) >= 0x80000000 && (addr) < 0x84000000) ? (uintptr_t)(mem + ((addr) - 0x80000000)) : \\\n");
+        fprintf(c_file, "        ((addr) >= 0xC0000000 && (addr) < 0xC2000000) ? (uintptr_t)(mem + ((addr) - 0xC0000000)) : \\\n");
+        fprintf(c_file, "        ((addr) >= 0xCC000000 && (addr) < 0xCC010000) ? (uintptr_t)(mem + ((addr) - 0xCC000000) + 0x4000000) : \\\n");
+        fprintf(c_file, "        ((addr) >= 0x90000000 && (addr) < 0x94000000) ? (uintptr_t)(mem + ((addr) - 0x90000000) + 0x1800000) : \\\n");
+        fprintf(c_file, "        ((addr) >= 0xD0000000 && (addr) < 0xD4000000) ? (uintptr_t)(mem + ((addr) - 0xD0000000) + 0x1800000) : \\\n");
+        fprintf(c_file, "        ((addr) >= 0xE0000000 && (addr) < 0xE0010000) ? (uintptr_t)(mem + ((addr) - 0xE0000000) + 0x5800000) : \\\n");
+        fprintf(c_file, "        (uintptr_t)(addr))\n");
         // Only marshal the consecutive parameters that were actually detected
         for (int i = 0; i < func->num_int_params; i++) {
-            fprintf(c_file, "    r%d = param_r%d;\n", 3 + i, 3 + i);
+            // Convert GameCube addresses to host pointers immediately
+            fprintf(c_file, "    r%d = PARAM_TO_HOST_PTR(param_r%d);\n", 3 + i, 3 + i);
         }
+        fprintf(c_file, "    #undef PARAM_TO_HOST_PTR\n");
         for (int i = 0; i < func->num_float_params; i++) {
             fprintf(c_file, "    f%d = param_f%d;\n", 1 + i, 1 + i);
         }

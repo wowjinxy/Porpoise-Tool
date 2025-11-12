@@ -68,23 +68,26 @@ static inline int transpile_lwz(const LWZ_Instruction *decoded,
                                 char *output,
                                 size_t output_size) {
     if (decoded->rA == 0) {
+        // Absolute address - should be resolved by transpiler to actual symbol/location
+        uint32_t abs_addr = (uint32_t)(int16_t)decoded->d;
         return snprintf(output, output_size,
-                       "r%u = *(uint32_t*)translate_address(%d);",
-                       decoded->rD, (int16_t)decoded->d);
+                       "r%u = *(uint32_t*)(uintptr_t)0x%08X; r%u = convert_gc_address((uint32_t)r%u);",
+                       decoded->rD, abs_addr, decoded->rD, decoded->rD);
     } else {
-        // Load from address (rA + displacement) - use safe address translation
+        // Register-based address - registers contain host pointers, use direct cast
+        // Add conversion to handle GameCube addresses loaded from memory
         if (decoded->d == 0) {
             return snprintf(output, output_size,
-                           "r%u = *(uint32_t*)translate_address(r%u);",
-                           decoded->rD, decoded->rA);
+                           "r%u = *(uint32_t*)(r%u); r%u = convert_gc_address((uint32_t)r%u);",
+                           decoded->rD, decoded->rA, decoded->rD, decoded->rD);
         } else if (decoded->d > 0) {
             return snprintf(output, output_size,
-                           "r%u = *(uint32_t*)translate_address(r%u + 0x%x);",
-                           decoded->rD, decoded->rA, (uint16_t)decoded->d);
+                           "r%u = *(uint32_t*)(r%u + 0x%x); r%u = convert_gc_address((uint32_t)r%u);",
+                           decoded->rD, decoded->rA, (uint16_t)decoded->d, decoded->rD, decoded->rD);
         } else {
             return snprintf(output, output_size,
-                           "r%u = *(uint32_t*)translate_address(r%u - 0x%x);",
-                           decoded->rD, decoded->rA, (uint16_t)(-decoded->d));
+                           "r%u = *(uint32_t*)(r%u - 0x%x); r%u = convert_gc_address((uint32_t)r%u);",
+                           decoded->rD, decoded->rA, (uint16_t)(-decoded->d), decoded->rD, decoded->rD);
         }
     }
 }

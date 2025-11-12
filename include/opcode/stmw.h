@@ -73,12 +73,10 @@ static inline int transpile_stmw(const STMW_Instruction *decoded,
     
     // Calculate base address expression
     char base_expr[64];
-    if (decoded->rA == 0) {
-        if (decoded->d >= 0) {
-            snprintf(base_expr, sizeof(base_expr), "0x%x", (uint32_t)decoded->d);
-        } else {
-            snprintf(base_expr, sizeof(base_expr), "-0x%x", (uint32_t)(-decoded->d));
-        }
+    bool is_absolute = (decoded->rA == 0);
+    if (is_absolute) {
+        uint32_t abs_addr = (uint32_t)(int16_t)decoded->d;
+        snprintf(base_expr, sizeof(base_expr), "(uintptr_t)0x%08X", abs_addr);
     } else {
         if (decoded->d == 0) {
             snprintf(base_expr, sizeof(base_expr), "r%u", decoded->rA);
@@ -95,12 +93,12 @@ static inline int transpile_stmw(const STMW_Instruction *decoded,
     if (num_regs == 1) {
         // Only one register
         written += snprintf(output + written, output_size - written,
-                           "*(uint32_t*)translate_address(%s) = r%u;",
+                           "*(uint32_t*)%s = r%u;",
                            base_expr, decoded->rS);
     } else {
         // Multiple registers - use a loop or expand inline
         written += snprintf(output + written, output_size - written,
-                           "{ uint32_t *p = (uint32_t*)translate_address(%s); ",
+                           "{ uint32_t *p = (uint32_t*)%s; ",
                            base_expr);
         
         for (int i = 0; i < num_regs; i++) {

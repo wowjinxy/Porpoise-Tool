@@ -36,6 +36,18 @@ void* ppc_va_arg(uint32_t r3, uint32_t r4, uint32_t r5, uint32_t r6,
  */
 int strcasecmp(const char *s1, const char *s2);
 
+/**
+ * @brief Initialize PowerPC registers to host pointers
+ * This replaces the game's __init_registers() function to ensure registers
+ * contain host pointers instead of GameCube addresses.
+ * 
+ * @param param_r3-r10 Parameters passed in registers r3-r10
+ * @param param_f1-f2 Parameters passed in floating-point registers f1-f2
+ */
+void __init_registers(uint32_t param_r3, uint32_t param_r4, uint32_t param_r5, uint32_t param_r6,
+                      uint32_t param_r7, uint32_t param_r8, uint32_t param_r9, uint32_t param_r10,
+                      double param_f1, double param_f2);
+
 #ifdef __cplusplus
 }
 #endif

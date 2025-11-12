@@ -72,17 +72,39 @@ static inline int transpile_lis(const LIS_Instruction *decoded,
                                 size_t output_size) {
     if (decoded->rA == 0) {
         // lis rD, SIMM (load immediate shifted)
-        uint32_t addr = (uint16_t)decoded->SIMM << 16;
+        uint32_t shifted_value = (uint16_t)decoded->SIMM << 16;
         
-        // Check if this is a GameCube address (0x80000000-0x84000000 range)
-        // If so, translate it to a host pointer immediately
-        if (addr >= 0x80000000 && addr < 0x84000000) {
+        // Check if this is a GameCube address that should be converted
+        // MEM1 cached: 0x80000000-0x84000000
+        // MEM1 uncached: 0xC0000000-0xC2000000
+        // Hardware I/O: 0xCC000000-0xCC010000
+        // MEM2 cached: 0x90000000-0x94000000
+        // MEM2 uncached: 0xD0000000-0xD4000000
+        // Locked cache: 0xE0000000-0xE0010000
+        uint32_t offset = 0xFFFFFFFF;
+        if (shifted_value >= 0x80000000 && shifted_value < 0x84000000) {
+            offset = shifted_value - 0x80000000;
+        } else if (shifted_value >= 0xC0000000 && shifted_value < 0xC2000000) {
+            offset = shifted_value - 0xC0000000;
+        } else if (shifted_value >= 0xCC000000 && shifted_value < 0xCC010000) {
+            offset = shifted_value - 0xCC000000 + 0x1800000;  // After MEM1 (24MB), within 256MB buffer
+        } else if (shifted_value >= 0x90000000 && shifted_value < 0x94000000) {
+            offset = shifted_value - 0x90000000 + 0x1800000;  // After MEM1
+        } else if (shifted_value >= 0xD0000000 && shifted_value < 0xD4000000) {
+            offset = shifted_value - 0xD0000000 + 0x1800000;  // After MEM1
+        } else if (shifted_value >= 0xE0000000 && shifted_value < 0xE0010000) {
+            offset = shifted_value - 0xE0000000 + 0x5800000;  // After MEM2
+        }
+        
+        if (offset != 0xFFFFFFFF) {
+            // Generate code that directly creates host pointer: mem + offset
             return snprintf(output, output_size,
-                           "r%u = (uintptr_t)translate_address(0x%x << 16);",
-                           decoded->rD, (uint16_t)decoded->SIMM);
+                           "r%u = (uintptr_t)(mem + 0x%08X);",
+                           decoded->rD, offset);
         } else {
+            // Not a GameCube address - generate the address literal (transpiler will resolve this)
             return snprintf(output, output_size,
-                           "r%u = 0x%x << 16;",
+                           "r%u = (uintptr_t)(0x%x << 16);",
                            decoded->rD, (uint16_t)decoded->SIMM);
         }
     } else {

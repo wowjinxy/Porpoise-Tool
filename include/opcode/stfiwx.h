@@ -36,14 +36,15 @@ static inline bool decode_stfiwx(uint32_t inst, STFIWX_Instruction *d) {
 
 static inline int transpile_stfiwx(const STFIWX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
+        // Absolute address (rB contains absolute address) - should be resolved by transpiler
         return snprintf(o, s,
                        "{ union { double d; uint64_t i; } u; u.d = f%u; "
-                       "*(uint32_t*)translate_address(r%u) = (uint32_t)u.i; }",
+                       "*(uint32_t*)(uintptr_t)r%u = (uint32_t)u.i; }",
                        d->frS, d->rB);
     }
     return snprintf(o, s,
                    "{ union { double d; uint64_t i; } u; u.d = f%u; "
-                   "*(uint32_t*)translate_address(r%u + r%u) = (uint32_t)u.i; }",
+                   "*(uint32_t*)(r%u + r%u) = (uint32_t)u.i; }",
                    d->frS, d->rA, d->rB);
 }
 

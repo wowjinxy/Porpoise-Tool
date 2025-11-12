@@ -37,9 +37,10 @@ static inline bool decode_lhax(uint32_t inst, LHAX_Instruction *d) {
 
 static inline int transpile_lhax(const LHAX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
-        return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)translate_address(r%u);", d->rD, d->rB);
+        // Absolute address (rB contains absolute address) - should be resolved by transpiler
+        return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)(uintptr_t)r%u;", d->rD, d->rB);
     }
-    return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)translate_address(r%u + r%u);", d->rD, d->rA, d->rB);
+    return snprintf(o, s, "r%u = (int32_t)(int16_t)*(uint16_t*)(r%u + r%u);", d->rD, d->rA, d->rB);
 }
 
 static inline int comment_lhax(const LHAX_Instruction *d, char *o, size_t s) {

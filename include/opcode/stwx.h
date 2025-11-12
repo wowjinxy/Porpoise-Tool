@@ -25,9 +25,10 @@ static inline bool decode_stwx(uint32_t inst, STWX_Instruction *d) {
 
 static inline int transpile_stwx(const STWX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
-        return snprintf(o, s, "*(uint32_t*)translate_address(r%u) = r%u;", d->rB, d->rS);
+        // Absolute address (rB contains absolute address) - should be resolved by transpiler
+        return snprintf(o, s, "*(uint32_t*)(uintptr_t)r%u = r%u;", d->rB, d->rS);
     }
-    return snprintf(o, s, "*(uint32_t*)translate_address(r%u + r%u) = r%u;", d->rA, d->rB, d->rS);
+    return snprintf(o, s, "*(uint32_t*)(r%u + r%u) = r%u;", d->rA, d->rB, d->rS);
 }
 
 static inline int comment_stwx(const STWX_Instruction *d, char *o, size_t s) {

@@ -69,23 +69,24 @@ static inline int transpile_lhz(const LHZ_Instruction *decoded,
                                 char *output,
                                 size_t output_size) {
     if (decoded->rA == 0) {
-        // Load from absolute address
+        // Absolute address - should be resolved by transpiler to actual symbol/location
+        uint32_t abs_addr = (uint32_t)(int16_t)decoded->d;
         return snprintf(output, output_size,
-                       "r%u = *(uint16_t*)translate_address(0x%x);",
-                       decoded->rD, (uint32_t)decoded->d);
+                       "r%u = *(uint16_t*)(uintptr_t)0x%08X;",
+                       decoded->rD, abs_addr);
     } else {
-        // Load from address (rA + displacement)
+        // Register-based address - registers contain real host pointers, use direct cast
         if (decoded->d == 0) {
             return snprintf(output, output_size,
-                           "r%u = *(uint16_t*)translate_address(r%u);",
+                           "r%u = *(uint16_t*)(r%u);",
                            decoded->rD, decoded->rA);
         } else if (decoded->d > 0) {
             return snprintf(output, output_size,
-                           "r%u = *(uint16_t*)translate_address(r%u + 0x%x);",
+                           "r%u = *(uint16_t*)(r%u + 0x%x);",
                            decoded->rD, decoded->rA, (uint16_t)decoded->d);
         } else {
             return snprintf(output, output_size,
-                           "r%u = *(uint16_t*)translate_address(r%u - 0x%x);",
+                           "r%u = *(uint16_t*)(r%u - 0x%x);",
                            decoded->rD, decoded->rA, (uint16_t)(-decoded->d));
         }
     }

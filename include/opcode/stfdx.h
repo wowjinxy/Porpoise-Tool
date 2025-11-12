@@ -36,9 +36,10 @@ static inline bool decode_stfdx(uint32_t inst, STFDX_Instruction *d) {
 
 static inline int transpile_stfdx(const STFDX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
-        return snprintf(o, s, "*(double*)translate_address(r%u) = f%u;", d->rB, d->frS);
+        // Absolute address (rB contains absolute address) - should be resolved by transpiler
+        return snprintf(o, s, "*(double*)(uintptr_t)r%u = f%u;", d->rB, d->frS);
     }
-    return snprintf(o, s, "*(double*)translate_address(r%u + r%u) = f%u;", d->rA, d->rB, d->frS);
+    return snprintf(o, s, "*(double*)(r%u + r%u) = f%u;", d->rA, d->rB, d->frS);
 }
 
 static inline int comment_stfdx(const STFDX_Instruction *d, char *o, size_t s) {

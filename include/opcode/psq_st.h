@@ -33,16 +33,18 @@ static inline bool decode_psq_st(uint32_t inst, PSQ_ST_Instruction *d) {
 static inline int transpile_psq_st(const PSQ_ST_Instruction *d, char *o, size_t s) {
     // Simplified: treat as storing float data (actual implementation needs GQR quantization)
     if (d->rA == 0) {
+        // Absolute address - should be resolved by transpiler to actual symbol/location
+        uint32_t abs_addr = (uint32_t)(int16_t)d->d;
         return snprintf(o, s, "/* psq_st f%u, 0x%x, %u, qr%u */ "
-                       "*(double*)translate_address(0x%x) = f%u;", 
-                       d->frS, (uint32_t)d->d, d->W, d->I, (uint32_t)d->d, d->frS);
+                       "*(double*)(uintptr_t)0x%08X = f%u;", 
+                       d->frS, abs_addr, d->W, d->I, abs_addr, d->frS);
     } else if (d->d >= 0) {
         return snprintf(o, s, "/* psq_st f%u, 0x%x(r%u), %u, qr%u */ "
-                       "*(double*)translate_address(r%u + 0x%x) = f%u;",
+                       "*(double*)(r%u + 0x%x) = f%u;",
                        d->frS, (uint16_t)d->d, d->rA, d->W, d->I, d->rA, (uint16_t)d->d, d->frS);
     } else {
         return snprintf(o, s, "/* psq_st f%u, -0x%x(r%u), %u, qr%u */ "
-                       "*(double*)translate_address(r%u - 0x%x) = f%u;",
+                       "*(double*)(r%u - 0x%x) = f%u;",
                        d->frS, (uint16_t)(-d->d), d->rA, d->W, d->I, d->rA, (uint16_t)(-d->d), d->frS);
     }
 }

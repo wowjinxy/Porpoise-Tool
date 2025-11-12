@@ -31,9 +31,10 @@ static inline bool decode_lwzx(uint32_t inst, LWZX_Instruction *d) {
 
 static inline int transpile_lwzx(const LWZX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
-        return snprintf(o, s, "r%u = *(uint32_t*)translate_address(r%u);", d->rD, d->rB);
+        // Absolute address (rB contains absolute address) - should be resolved by transpiler
+        return snprintf(o, s, "r%u = *(uint32_t*)(uintptr_t)r%u;", d->rD, d->rB);
     }
-    return snprintf(o, s, "r%u = *(uint32_t*)translate_address(r%u + r%u);", d->rD, d->rA, d->rB);
+    return snprintf(o, s, "r%u = *(uint32_t*)(r%u + r%u);", d->rD, d->rA, d->rB);
 }
 
 static inline int comment_lwzx(const LWZX_Instruction *d, char *o, size_t s) {

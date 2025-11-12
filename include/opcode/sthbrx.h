@@ -38,14 +38,15 @@ static inline bool decode_sthbrx(uint32_t inst, STHBRX_Instruction *d) {
 
 static inline int transpile_sthbrx(const STHBRX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
+        // Absolute address (rB contains absolute address) - should be resolved by transpiler
         return snprintf(o, s,
                        "{ uint16_t val = (uint16_t)r%u; "
-                       "*(uint16_t*)translate_address(r%u) = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF); }",
+                       "*(uint16_t*)(uintptr_t)r%u = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF); }",
                        d->rS, d->rB);
     }
     return snprintf(o, s,
                    "{ uint16_t val = (uint16_t)r%u; "
-                   "*(uint16_t*)translate_address(r%u + r%u) = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF); }",
+                   "*(uint16_t*)(r%u + r%u) = ((val & 0xFF) << 8) | ((val >> 8) & 0xFF); }",
                    d->rS, d->rA, d->rB);
 }
 

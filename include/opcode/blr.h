@@ -77,20 +77,37 @@ static inline bool is_unconditional_blr(const BLR_Instruction *decoded) {
  * @param current_addr Current instruction address
  * @param output Buffer to write C code to
  * @param output_size Size of output buffer
+ * @param lookup_func Optional function to lookup function name by address (NULL if not available)
  * @return Number of characters written
  */
 static inline int transpile_blr(const BLR_Instruction *decoded,
                                 uint32_t current_addr,
                                 char *output,
-                                size_t output_size) {
+                                size_t output_size,
+                                const char* (*lookup_func)(uint32_t)) {
     if (is_unconditional_blr(decoded)) {
         if (decoded->LK) {
             // blrl - indirect call via LR
-            // Use function resolver to handle GameCube function pointers
+            // Try to resolve to direct function call at transpile time
             uint32_t return_addr = current_addr + 4;
-            return snprintf(output, output_size,
-                           "{ uintptr_t saved_lr = lr; lr = 0x%08X; call_indirect((uint32_t)saved_lr, r3, r4, r5, r6, r7, r8, r9, r10, f1, f2); }",
-                           return_addr);
+            
+            if (lookup_func) {
+                // Check if we can determine the function address at transpile time
+                // This requires analyzing previous instructions to see what's in LR
+                // For now, generate code that checks at runtime, but ideally we'd
+                // track register values and replace with direct calls
+                // TODO: Implement register value tracking to replace with direct calls
+                return snprintf(output, output_size,
+                               "{ uintptr_t saved_lr = lr; lr = 0x%08X; "
+                               "call_function_by_address((uint32_t)saved_lr, r3, r4, r5, r6, r7, r8, r9, r10, f1, f2); }",
+                               return_addr);
+            } else {
+                // No lookup available - generate runtime call
+                return snprintf(output, output_size,
+                               "{ uintptr_t saved_lr = lr; lr = 0x%08X; "
+                               "call_function_by_address((uint32_t)saved_lr, r3, r4, r5, r6, r7, r8, r9, r10, f1, f2); }",
+                               return_addr);
+            }
         } else {
             // blr - simple return
             return snprintf(output, output_size, "return;");

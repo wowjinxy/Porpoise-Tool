@@ -28,10 +28,10 @@ static inline bool decode_stbu(uint32_t inst, STBU_Instruction *d) {
 
 static inline int transpile_stbu(const STBU_Instruction *d, char *o, size_t s) {
     if (d->d >= 0) {
-        return snprintf(o, s, "r%u = r%u + 0x%x; *(uint8_t*)translate_address(r%u) = (uint8_t)r%u;",
+        return snprintf(o, s, "r%u = r%u + 0x%x; *(uint8_t*)(r%u) = (uint8_t)r%u;",
                        d->rA, d->rA, (uint16_t)d->d, d->rA, d->rS);
     } else {
-        return snprintf(o, s, "r%u = r%u - 0x%x; *(uint8_t*)translate_address(r%u) = (uint8_t)r%u;",
+        return snprintf(o, s, "r%u = r%u - 0x%x; *(uint8_t*)(r%u) = (uint8_t)r%u;",
                        d->rA, d->rA, (uint16_t)(-d->d), d->rA, d->rS);
     }
 }

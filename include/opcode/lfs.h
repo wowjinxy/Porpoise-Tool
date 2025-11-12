@@ -50,21 +50,23 @@ static inline int transpile_lfs(const LFS_Instruction *decoded,
                                 char *output,
                                 size_t output_size) {
     if (decoded->rA == 0) {
+        // Absolute address - should be resolved by transpiler to actual symbol/location
+        uint32_t abs_addr = (uint32_t)(int16_t)decoded->d;
         return snprintf(output, output_size,
-                       "f%u = (double)*(float*)translate_address(0x%x);",
-                       decoded->frD, (uint32_t)decoded->d);
+                       "f%u = (double)*(float*)(uintptr_t)0x%08X;",
+                       decoded->frD, abs_addr);
     } else {
         if (decoded->d == 0) {
             return snprintf(output, output_size,
-                           "f%u = (double)*(float*)translate_address(r%u);",
+                           "f%u = (double)*(float*)(r%u);",
                            decoded->frD, decoded->rA);
         } else if (decoded->d > 0) {
             return snprintf(output, output_size,
-                           "f%u = (double)*(float*)translate_address(r%u + 0x%x);",
+                           "f%u = (double)*(float*)(r%u + 0x%x);",
                            decoded->frD, decoded->rA, (uint16_t)decoded->d);
         } else {
             return snprintf(output, output_size,
-                           "f%u = (double)*(float*)translate_address(r%u - 0x%x);",
+                           "f%u = (double)*(float*)(r%u - 0x%x);",
                            decoded->frD, decoded->rA, (uint16_t)(-decoded->d));
         }
     }

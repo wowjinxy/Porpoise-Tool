@@ -69,21 +69,24 @@ static inline int transpile_lbz(const LBZ_Instruction *decoded,
                                 char *output,
                                 size_t output_size) {
     if (decoded->rA == 0) {
+        // Absolute address - should be resolved by transpiler to actual symbol/location
+        uint32_t abs_addr = (uint32_t)(int16_t)decoded->d;
         return snprintf(output, output_size,
-                       "r%u = *(uint8_t*)translate_address(0x%x);",
-                       decoded->rD, (uint32_t)decoded->d);
+                       "r%u = *(uint8_t*)(uintptr_t)0x%08X;",
+                       decoded->rD, abs_addr);
     } else {
+        // Register-based address - registers contain real host pointers, use direct cast
         if (decoded->d == 0) {
             return snprintf(output, output_size,
-                           "r%u = *(uint8_t*)translate_address(r%u);",
+                           "r%u = *(uint8_t*)(r%u);",
                            decoded->rD, decoded->rA);
         } else if (decoded->d > 0) {
             return snprintf(output, output_size,
-                           "r%u = *(uint8_t*)translate_address(r%u + 0x%x);",
+                           "r%u = *(uint8_t*)(r%u + 0x%x);",
                            decoded->rD, decoded->rA, (uint16_t)decoded->d);
         } else {
             return snprintf(output, output_size,
-                           "r%u = *(uint8_t*)translate_address(r%u - 0x%x);",
+                           "r%u = *(uint8_t*)(r%u - 0x%x);",
                            decoded->rD, decoded->rA, (uint16_t)(-decoded->d));
         }
     }

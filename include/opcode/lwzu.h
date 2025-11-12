@@ -53,12 +53,12 @@ static inline int transpile_lwzu(const LWZU_Instruction *decoded,
     // Load and update rA
     if (decoded->d >= 0) {
         return snprintf(output, output_size,
-                       "r%u = r%u + 0x%x; r%u = *(uint32_t*)translate_address(r%u);",
+                       "r%u = r%u + 0x%x; r%u = *(uint32_t*)(r%u);",
                        decoded->rA, decoded->rA, (uint16_t)decoded->d,
                        decoded->rD, decoded->rA);
     } else {
         return snprintf(output, output_size,
-                       "r%u = r%u - 0x%x; r%u = *(uint32_t*)translate_address(r%u);",
+                       "r%u = r%u - 0x%x; r%u = *(uint32_t*)(r%u);",
                        decoded->rA, decoded->rA, (uint16_t)(-decoded->d),
                        decoded->rD, decoded->rA);
     }

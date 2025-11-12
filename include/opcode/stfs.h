@@ -34,16 +34,18 @@ static inline bool decode_stfs(uint32_t inst, STFS_Instruction *d) {
 
 static inline int transpile_stfs(const STFS_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
-        return snprintf(o, s, "*(float*)(mem + (int16_t)0x%x) = (float)f%u;",
-                       (uint16_t)d->d, d->frS);
+        // Absolute address - should be resolved by transpiler to actual symbol/location
+        uint32_t abs_addr = (uint32_t)(int16_t)d->d;
+        return snprintf(o, s, "*(float*)(uintptr_t)0x%08X = (float)f%u;",
+                       abs_addr, d->frS);
     } else if (d->d == 0) {
-        return snprintf(o, s, "*(float*)translate_address(r%u) = (float)f%u;",
+        return snprintf(o, s, "*(float*)(r%u) = (float)f%u;",
                        d->rA, d->frS);
     } else if (d->d > 0) {
-        return snprintf(o, s, "*(float*)translate_address(r%u + 0x%x) = (float)f%u;",
+        return snprintf(o, s, "*(float*)(r%u + 0x%x) = (float)f%u;",
                        d->rA, (uint16_t)d->d, d->frS);
     } else {
-        return snprintf(o, s, "*(float*)translate_address(r%u - 0x%x) = (float)f%u;",
+        return snprintf(o, s, "*(float*)(r%u - 0x%x) = (float)f%u;",
                        d->rA, (uint16_t)(-d->d), d->frS);
     }
 }

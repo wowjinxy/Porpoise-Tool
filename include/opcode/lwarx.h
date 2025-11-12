@@ -28,9 +28,10 @@ static inline bool decode_lwarx(uint32_t inst, LWARX_Instruction *d) {
 
 static inline int transpile_lwarx(const LWARX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
-        return snprintf(o, s, "r%u = *(uint32_t*)translate_address(r%u);  /* reserve set */", d->rD, d->rB);
+        // Absolute address (rB contains absolute address) - should be resolved by transpiler
+        return snprintf(o, s, "r%u = *(uint32_t*)(uintptr_t)r%u;  /* reserve set */", d->rD, d->rB);
     }
-    return snprintf(o, s, "r%u = *(uint32_t*)translate_address(r%u + r%u);  /* reserve set */", d->rD, d->rA, d->rB);
+    return snprintf(o, s, "r%u = *(uint32_t*)(r%u + r%u);  /* reserve set */", d->rD, d->rA, d->rB);
 }
 
 static inline int comment_lwarx(const LWARX_Instruction *d, char *o, size_t s) {

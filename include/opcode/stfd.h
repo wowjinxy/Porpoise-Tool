@@ -30,13 +30,15 @@ static inline bool decode_stfd(uint32_t inst, STFD_Instruction *d) {
 
 static inline int transpile_stfd(const STFD_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
-        return snprintf(o, s, "*(double*)translate_address(0x%x) = f%u;", (uint32_t)d->d, d->frS);
+        // Absolute address - should be resolved by transpiler to actual symbol/location
+        uint32_t abs_addr = (uint32_t)(int16_t)d->d;
+        return snprintf(o, s, "*(double*)(uintptr_t)0x%08X = f%u;", abs_addr, d->frS);
     } else if (d->d == 0) {
-        return snprintf(o, s, "*(double*)translate_address(r%u) = f%u;", d->rA, d->frS);
+        return snprintf(o, s, "*(double*)(r%u) = f%u;", d->rA, d->frS);
     } else if (d->d > 0) {
-        return snprintf(o, s, "*(double*)translate_address(r%u + 0x%x) = f%u;", d->rA, (uint16_t)d->d, d->frS);
+        return snprintf(o, s, "*(double*)(r%u + 0x%x) = f%u;", d->rA, (uint16_t)d->d, d->frS);
     } else {
-        return snprintf(o, s, "*(double*)translate_address(r%u - 0x%x) = f%u;", d->rA, (uint16_t)(-d->d), d->frS);
+        return snprintf(o, s, "*(double*)(r%u - 0x%x) = f%u;", d->rA, (uint16_t)(-d->d), d->frS);
     }
 }
 

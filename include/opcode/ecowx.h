@@ -26,8 +26,11 @@ static inline bool decode_ecowx(uint32_t inst, ECOWX_Instruction *d) {
 }
 
 static inline int transpile_ecowx(const ECOWX_Instruction *d, char *o, size_t s) {
-    if (d->rA == 0) return snprintf(o, s, "*(uint32_t*)translate_address(r%u) = r%u;", d->rB, d->rS);
-    return snprintf(o, s, "*(uint32_t*)translate_address(r%u + r%u) = r%u;", d->rA, d->rB, d->rS);
+    if (d->rA == 0) {
+        // Absolute address (rB contains absolute address) - should be resolved by transpiler
+        return snprintf(o, s, "*(uint32_t*)(uintptr_t)r%u = r%u;", d->rB, d->rS);
+    }
+    return snprintf(o, s, "*(uint32_t*)(r%u + r%u) = r%u;", d->rA, d->rB, d->rS);
 }
 
 static inline int comment_ecowx(const ECOWX_Instruction *d, char *o, size_t s) {

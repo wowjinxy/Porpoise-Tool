@@ -105,6 +105,11 @@ static bool is_cstd_call(const char *name) {
 
 // Check if a function is an SDK or standard library function
 static bool is_sdk_or_stdlib_function(const char *name) {
+    // Skip our custom __init_registers (we provide our own implementation)
+    if (strcmp(name, "__init_registers") == 0) {
+        return true;
+    }
+    
     // Pattern-based detection: Skip functions with SDK prefixes
     // This catches SDK functions even if they're not explicitly listed
     // Always enabled (not controlled by config.transpile_sdk_functions)
@@ -432,6 +437,55 @@ static const SDK_Function_Info* get_sdk_function_info(const char *func_name) {
     return NULL;
 }
 
+// Helper function to check if an address is a GameCube address that should be converted
+// Returns true if the address should be converted to a host pointer
+static inline bool is_gamecube_address(uint32_t addr) {
+    // MEM1 cached: 0x80000000-0x84000000 (24 MB + some headroom)
+    if (addr >= 0x80000000 && addr < 0x84000000) return true;
+    // MEM1 uncached: 0xC0000000-0xC2000000
+    if (addr >= 0xC0000000 && addr < 0xC2000000) return true;
+    // Hardware I/O registers: 0xCC000000-0xCC010000 (VI, PI, MI, etc.)
+    if (addr >= 0xCC000000 && addr < 0xCC010000) return true;
+    // MEM2 cached (Wii): 0x90000000-0x94000000
+    if (addr >= 0x90000000 && addr < 0x94000000) return true;
+    // MEM2 uncached (Wii): 0xD0000000-0xD4000000
+    if (addr >= 0xD0000000 && addr < 0xD4000000) return true;
+    // Locked cache: 0xE0000000-0xE0010000
+    if (addr >= 0xE0000000 && addr < 0xE0010000) return true;
+    return false;
+}
+
+// Helper function to convert GameCube address to host pointer offset
+// Returns the offset from mem base, or 0xFFFFFFFF if not a known GameCube address
+static inline uint32_t gamecube_to_offset(uint32_t addr) {
+    // MEM1 cached: map to mem buffer
+    if (addr >= 0x80000000 && addr < 0x84000000) {
+        return addr - 0x80000000;
+    }
+    // MEM1 uncached: also map to mem buffer (same physical memory)
+    if (addr >= 0xC0000000 && addr < 0xC2000000) {
+        return addr - 0xC0000000;
+    }
+        // Hardware I/O: map to mem buffer (SDK will handle actual I/O)
+        // Use offset after MEM1 (24MB) but within 256MB buffer
+        if (addr >= 0xCC000000 && addr < 0xCC010000) {
+            return addr - 0xCC000000 + 0x1800000;  // After MEM1 (24MB), within 256MB buffer
+        }
+    // MEM2 cached: map to mem buffer (if allocated)
+    if (addr >= 0x90000000 && addr < 0x94000000) {
+        return addr - 0x90000000 + 0x1800000;  // After MEM1
+    }
+    // MEM2 uncached: map to mem buffer
+    if (addr >= 0xD0000000 && addr < 0xD4000000) {
+        return addr - 0xD0000000 + 0x1800000;  // After MEM1
+    }
+    // Locked cache: map to mem buffer
+    if (addr >= 0xE0000000 && addr < 0xE0010000) {
+        return addr - 0xE0000000 + 0x5800000;  // After MEM2
+    }
+    return 0xFFFFFFFF;  // Not a known GameCube address
+}
+
 /**
  * @brief Transpile from assembly text (mnemonic + operands)
  */
@@ -454,8 +508,28 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
         uint32_t value;
         if (sscanf(operands, "r%d, %i", &reg, &value) == 2 ||
             sscanf(operands, "r%d,%i", &reg, &value) == 2) {
+            uint32_t shifted_value = value << 16;  // lis shifts left by 16
+            
+            // Convert GameCube addresses to host pointers immediately
+            if (is_gamecube_address(shifted_value)) {
+                uint32_t offset = gamecube_to_offset(shifted_value);
+                if (offset != 0xFFFFFFFF) {
+                    // Generate code that directly creates host pointer: mem + offset
+                    snprintf(output, output_size, "r%d = (uintptr_t)(mem + 0x%08X);",
+                            reg, offset);
+                    snprintf(comment, comment_size, "lis r%d, %i (GC 0x%08X -> host ptr)",
+                            reg, value, shifted_value);
+                    // Don't track - register now contains host pointer, not GameCube address
+                    last_lis_reg = -1;  // Reset since we've converted it
+                    if (tracker) {
+                        register_tracker_clear(tracker, reg);
+                    }
+                    return true;
+                }
+            }
+            // Not a GameCube address - track it for potential addi/ori combination
             last_lis_reg = reg;
-            last_lis_value = value << 16;  // lis shifts left by 16
+            last_lis_value = shifted_value;
             // Track this partial address
             if (tracker) {
                 register_tracker_set(tracker, reg, last_lis_value);
@@ -473,28 +547,66 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
                 // Combine lis + addi to form full address
                 uint32_t full_addr = last_lis_value + simm;
                 
-                // Track the full address
-                if (tracker) {
-                    register_tracker_set(tracker, rD, full_addr);
-                }
-                
                 // Check if this address matches a string
                 if (string_table) {
                     const StringEntry *str_entry = string_table_find(string_table, full_addr);
                     if (str_entry) {
                         // Generate string reference instead of raw address
-                        snprintf(output, output_size, "r%d = (uint32_t)&%s;  /* \"%s\" */",
+                        snprintf(output, output_size, "r%d = (uintptr_t)&%s;  /* \"%s\" */",
                                 rD, str_entry->label, str_entry->content);
                         snprintf(comment, comment_size, "%s r%d, r%d, %d (string ref)",
                                 mnemonic, rD, rA, simm);
                         last_lis_reg = -1;  // Reset
+                        // Track as host pointer (string address)
+                        if (tracker) {
+                            register_tracker_clear(tracker, rD);  // Can't track string addresses
+                        }
                         return true;
                     }
+                }
+                
+                // Convert GameCube addresses to host pointers immediately
+                if (is_gamecube_address(full_addr)) {
+                    uint32_t offset = gamecube_to_offset(full_addr);
+                    if (offset != 0xFFFFFFFF) {
+                        // Generate code that directly creates host pointer: mem + offset
+                        snprintf(output, output_size, "r%d = (uintptr_t)(mem + 0x%08X);",
+                                rD, offset);
+                        snprintf(comment, comment_size, "%s r%d, r%d, %d (GC 0x%08X -> host ptr)",
+                                mnemonic, rD, rA, simm, full_addr);
+                        last_lis_reg = -1;  // Reset
+                        // Don't track - register now contains host pointer, not GameCube address
+                        if (tracker) {
+                            register_tracker_clear(tracker, rD);
+                        }
+                        return true;
+                    }
+                }
+                // Not a GameCube address - just set the value
+                // Track the full address
+                if (tracker) {
+                    register_tracker_set(tracker, rD, full_addr);
                 }
             } else if (tracker && tracker->r_known[rA]) {
                 // rA contains a known address, add offset to it
                 uint32_t base_addr = tracker->r[rA];
                 uint32_t new_addr = base_addr + simm;
+                
+                // Check if the result is a GameCube address - generate host pointer directly
+                if (is_gamecube_address(new_addr)) {
+                    uint32_t offset = gamecube_to_offset(new_addr);
+                    if (offset != 0xFFFFFFFF) {
+                        // Generate code that directly creates host pointer: mem + offset
+                        snprintf(output, output_size, "r%d = (uintptr_t)(mem + 0x%08X);",
+                                rD, offset);
+                        snprintf(comment, comment_size, "%s r%d, r%d, %d (GC 0x%08X -> host ptr)",
+                                mnemonic, rD, rA, simm, new_addr);
+                        // Don't track - register now contains host pointer
+                        register_tracker_clear(tracker, rD);
+                        return true;
+                    }
+                }
+                // Not a GameCube address - track it
                 register_tracker_set(tracker, rD, new_addr);
             } else {
                 // Unknown value - clear tracking
@@ -533,16 +645,134 @@ bool transpile_from_asm(const char *mnemonic, const char *operands, uint32_t add
         }
     }
     
-    // Track lwz (load word) - might load function pointers from vtables
+    // Track and transpile lwz (load word) - might load function pointers from vtables or function tables
     if (strcmp(mnemonic, "lwz") == 0) {
         int rD, rA;
         int32_t offset;
         if (sscanf(operands, "r%d, %i(r%d)", &rD, &offset, &rA) == 3 ||
             sscanf(operands, "r%d,%i(r%d)", &rD, &offset, &rA) == 3) {
-            // Can't determine the address at compile time (depends on runtime value of rA)
-            // But we can track that this register now contains a value from memory
-            // For now, mark as unknown - could be enhanced to track vtable patterns
-            if (tracker) register_tracker_clear(tracker, rD);
+            // Check if this is loading from an absolute address (rA == 0)
+            if (rA == 0) {
+                // Absolute address load: lwz rD, offset(0) means load from address = offset
+                uint32_t abs_addr = (uint32_t)offset;
+                
+                // Generate code with literal address (for transpiler resolution)
+                // Add conversion to handle GameCube addresses loaded from memory
+                snprintf(output, output_size, 
+                        "r%u = *(uint32_t*)(uintptr_t)0x%08X; "
+                        "r%u = convert_gc_address((uint32_t)r%u);", 
+                        rD, abs_addr, rD, rD);
+                snprintf(comment, comment_size, "lwz r%u, %i(0) [convert GC addr if needed]", rD, offset);
+                
+                // Check if this address contains a function pointer
+                const char *func_name = lookup_function_by_address(abs_addr);
+                if (func_name && tracker) {
+                    // The address itself is a function - track that rD contains this function address
+                    register_tracker_set(tracker, rD, abs_addr);
+                } else if (tracker) {
+                    // TODO: Parse assembly data sections to find what value is stored at abs_addr
+                    // For now, mark as unknown
+                    register_tracker_clear(tracker, rD);
+                }
+                return true;
+            } else {
+                // Register-based load: lwz rD, offset(rA)
+                // Check if rA contains a known address (from lis/addi)
+                if (tracker && tracker->r_known[rA]) {
+                    uint32_t base_addr = tracker->r[rA];
+                    uint32_t load_addr = base_addr + offset;
+                    
+                    // Generate code with literal address (for transpiler resolution)
+                    // Add conversion to handle GameCube addresses loaded from memory
+                    snprintf(output, output_size, 
+                            "r%u = *(uint32_t*)(uintptr_t)0x%08X; "
+                            "r%u = convert_gc_address((uint32_t)r%u);", 
+                            rD, load_addr, rD, rD);
+                    snprintf(comment, comment_size, "lwz r%u, %i(r%u) [resolved: 0x%08X, convert GC addr if needed]", rD, offset, rA, load_addr);
+                    
+                    // Check if the value at this address is a function pointer
+                    // TODO: Parse assembly data sections to find the actual value stored at load_addr
+                    const char *func_name = lookup_function_by_address(load_addr);
+                    if (func_name) {
+                        // The address being loaded from is a function - track it
+                        register_tracker_set(tracker, rD, load_addr);
+                    } else {
+                        // Can't determine what value is stored there at compile time
+                        register_tracker_clear(tracker, rD);
+                    }
+                    return true;
+                } else {
+                    // Base register unknown - fall through to opcode transpile function
+                    // Registers contain host pointers, so opcode will use direct cast
+                    if (tracker) register_tracker_clear(tracker, rD);
+                }
+            }
+        }
+    }
+    
+    // Track and transpile stw (store word)
+    if (strcmp(mnemonic, "stw") == 0) {
+        int rS, rA;
+        int32_t offset;
+        if (sscanf(operands, "r%d, %i(r%d)", &rS, &offset, &rA) == 3 ||
+            sscanf(operands, "r%d,%i(r%d)", &rS, &offset, &rA) == 3) {
+            // Check if this is storing to an absolute address (rA == 0)
+            if (rA == 0) {
+                // Absolute address store: stw rS, offset(0) means store to address = offset
+                uint32_t abs_addr = (uint32_t)offset;
+                
+                // Generate code with literal address (for transpiler resolution)
+                snprintf(output, output_size, "*(uint32_t*)(uintptr_t)0x%08X = r%u;", abs_addr, rS);
+                snprintf(comment, comment_size, "stw r%u, %i(0)", rS, offset);
+                return true;
+            } else {
+                // Register-based store: stw rS, offset(rA)
+                // Check if rA contains a known address (from lis/addi)
+                if (tracker && tracker->r_known[rA]) {
+                    uint32_t base_addr = tracker->r[rA];
+                    uint32_t store_addr = base_addr + offset;
+                    
+                    // Generate code with literal address (for transpiler resolution)
+                    snprintf(output, output_size, "*(uint32_t*)(uintptr_t)0x%08X = r%u;", store_addr, rS);
+                    snprintf(comment, comment_size, "stw r%u, %i(r%u) [resolved: 0x%08X]", rS, offset, rA, store_addr);
+                    return true;
+                } else {
+                    // Base register unknown - fall through to opcode transpile function
+                    // Registers contain host pointers, so opcode will use direct cast
+                }
+            }
+        }
+    }
+    
+    // Track and transpile stwu (store word with update)
+    if (strcmp(mnemonic, "stwu") == 0) {
+        int rS, rA;
+        int32_t offset;
+        if (sscanf(operands, "r%d, %i(r%d)", &rS, &offset, &rA) == 3 ||
+            sscanf(operands, "r%d,%i(r%d)", &rS, &offset, &rA) == 3) {
+            // Check if rA contains a known address (from lis/addi)
+            if (tracker && tracker->r_known[rA]) {
+                uint32_t base_addr = tracker->r[rA];
+                uint32_t store_addr = base_addr + offset;
+                
+                // Generate code with literal address (for transpiler resolution)
+                // Note: stwu updates rA, so we need to update the tracker too
+                if (offset >= 0) {
+                    snprintf(output, output_size, "r%u = r%u + 0x%x; *(uint32_t*)(uintptr_t)0x%08X = r%u;", 
+                            rA, rA, (uint16_t)offset, store_addr, rS);
+                } else {
+                    snprintf(output, output_size, "r%u = r%u - 0x%x; *(uint32_t*)(uintptr_t)0x%08X = r%u;", 
+                            rA, rA, (uint16_t)(-offset), store_addr, rS);
+                }
+                snprintf(comment, comment_size, "stwu r%u, %i(r%u) [resolved: 0x%08X]", rS, offset, rA, store_addr);
+                
+                // Update tracker with new rA value
+                register_tracker_set(tracker, rA, store_addr);
+                return true;
+            } else {
+                // Base register unknown or runtime address - use translate_address()
+                // Fall through to opcode transpile function which will use translate_address()
+            }
         }
     }
     
@@ -3013,6 +3243,16 @@ int transpile_file_to_project(const char *input_filename, const char *src_dir,
                     if (len > 0 && clean_name[len - 1] == '"') {
                         clean_name[len - 1] = '\0';
                     }
+                }
+                
+                // Skip __init_registers even if it's marked as local
+                if (strcmp(clean_name, "__init_registers") == 0) {
+                    continue;
+                }
+                
+                // Skip SDK functions even if they're marked as local
+                if (is_sdk_or_stdlib_function(clean_name)) {
+                    continue;
                 }
                 
                 // Check if it needs to be stubbed (contains invalid C identifier chars)

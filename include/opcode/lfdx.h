@@ -36,9 +36,10 @@ static inline bool decode_lfdx(uint32_t inst, LFDX_Instruction *d) {
 
 static inline int transpile_lfdx(const LFDX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
-        return snprintf(o, s, "f%u = *(double*)translate_address(r%u);", d->frD, d->rB);
+        // Absolute address (rB contains absolute address) - should be resolved by transpiler
+        return snprintf(o, s, "f%u = *(double*)(uintptr_t)r%u;", d->frD, d->rB);
     }
-    return snprintf(o, s, "f%u = *(double*)translate_address(r%u + r%u);", d->frD, d->rA, d->rB);
+    return snprintf(o, s, "f%u = *(double*)(r%u + r%u);", d->frD, d->rA, d->rB);
 }
 
 static inline int comment_lfdx(const LFDX_Instruction *d, char *o, size_t s) {

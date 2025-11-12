@@ -51,14 +51,15 @@ static inline int transpile_stwu(const STWU_Instruction *decoded,
                                  char *output,
                                  size_t output_size) {
     // Store and update rA
+    // Note: rA contains host pointer, so we can use direct cast
     if (decoded->d >= 0) {
         return snprintf(output, output_size,
-                       "r%u = r%u + 0x%x; *(uint32_t*)translate_address(r%u) = r%u;",
+                       "r%u = r%u + 0x%x; *(uint32_t*)(r%u) = r%u;",
                        decoded->rA, decoded->rA, (uint16_t)decoded->d,
                        decoded->rA, decoded->rS);
     } else {
         return snprintf(output, output_size,
-                       "r%u = r%u - 0x%x; *(uint32_t*)translate_address(r%u) = r%u;",
+                       "r%u = r%u - 0x%x; *(uint32_t*)(r%u) = r%u;",
                        decoded->rA, decoded->rA, (uint16_t)(-decoded->d),
                        decoded->rA, decoded->rS);
     }

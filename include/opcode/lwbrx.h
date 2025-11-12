@@ -38,14 +38,15 @@ static inline bool decode_lwbrx(uint32_t inst, LWBRX_Instruction *d) {
 
 static inline int transpile_lwbrx(const LWBRX_Instruction *d, char *o, size_t s) {
     if (d->rA == 0) {
+        // Absolute address (rB contains absolute address) - should be resolved by transpiler
         return snprintf(o, s,
-                       "{ uint32_t val = *(uint32_t*)translate_address(r%u); "
+                       "{ uint32_t val = *(uint32_t*)(uintptr_t)r%u; "
                        "r%u = ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) | "
                        "((val >> 8) & 0xFF00) | ((val >> 24) & 0xFF); }",
                        d->rB, d->rD);
     }
     return snprintf(o, s,
-                   "{ uint32_t val = *(uint32_t*)translate_address(r%u + r%u); "
+                   "{ uint32_t val = *(uint32_t*)(r%u + r%u); "
                    "r%u = ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) | "
                    "((val >> 8) & 0xFF00) | ((val >> 24) & 0xFF); }",
                    d->rA, d->rB, d->rD);
