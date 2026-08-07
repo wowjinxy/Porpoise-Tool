@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "functions": [
+    {
+      "kind": "import",
+      "symbol": "PorpoiseStubAdd",
+      "header": "porpoise/stub.h",
+      "return": {"type": "u32", "register": "r3"},
+      "arguments": [
+        {"name": "left", "type": "u32", "register": "r3"},
+        {"name": "right", "type": "u32", "register": "r4"}
+      ]
+    },
+    {
+      "kind": "import",
+      "symbol": "PorpoiseStubIdentity",
+      "header": "porpoise/stub.h",
+      "return": {"type": "pointer", "register": "r3"},
+      "arguments": [
+        {"name": "pointer", "type": "pointer", "register": "r3"}
+      ]
+    },
+    {
+      "kind": "import",
+      "symbol": "PorpoiseStubFloatMix",
+      "header": "porpoise/stub.h",
+      "return": {"type": "f64", "register": "f1"},
+      "arguments": [
+        {"name": "left", "type": "f32", "register": "f1"},
+        {"name": "right", "type": "f64", "register": "f2"}
+      ]
+    },
+    {
+      "kind": "import",
+      "symbol": "OSReport",
+      "header": "porpoise/stub.h",
+      "adapter": "PorpoiseStubReportAdapter",
+      "return": {"type": "void"},
+      "arguments": [
+        {"name": "format", "type": "pointer", "register": "r3"}
+      ]
+    }
+  ]
+}

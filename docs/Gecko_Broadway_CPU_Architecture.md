@@ -1,8 +1,10 @@
 # Gecko/Broadway CPU Architecture Reference
 
-## Complete Register and Memory Location Documentation
+> Background reference only. This document is not authoritative or a Porpoise Tool implementation claim.
 
-This document provides a comprehensive reference for all registers and memory locations in the Nintendo GameCube (Gekko) and Wii (Broadway) CPUs.
+## Register and memory notes
+
+This document collects working notes about registers and memory locations in the Nintendo GameCube (Gekko) and Wii (Broadway) CPUs.
 
 ---
 

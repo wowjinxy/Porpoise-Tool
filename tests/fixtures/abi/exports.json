@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "functions": [
+    {
+      "kind": "export",
+      "symbol": "add_one",
+      "wrapper": "PorpoiseAddOne",
+      "header": "porpoise/stub.h",
+      "return": {"type": "u32", "register": "r3"},
+      "arguments": [
+        {"name": "value", "type": "u32", "register": "r3"}
+      ]
+    },
+    {
+      "kind": "export",
+      "symbol": "add_float",
+      "wrapper": "PorpoiseAddFloat",
+      "header": "porpoise/stub.h",
+      "return": {"type": "f32", "register": "f1"},
+      "arguments": [
+        {"name": "left", "type": "f32", "register": "f1"},
+        {"name": "right", "type": "f32", "register": "f2"}
+      ]
+    },
+    {
+      "kind": "export",
+      "symbol": "add_double",
+      "wrapper": "PorpoiseAddDouble",
+      "header": "porpoise/stub.h",
+      "return": {"type": "f64", "register": "f1"},
+      "arguments": [
+        {"name": "left", "type": "f64", "register": "f1"},
+        {"name": "right", "type": "f64", "register": "f2"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "abi": "abi.example.json",
+  "entry": "main",
+  "strict": false,
+  "verbosity": "normal"
+}
