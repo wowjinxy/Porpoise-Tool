@@ -145,6 +145,14 @@ void porpoise_cr_set_bit(
 /* Defined shift helpers avoid C's undefined shift-by-width behavior. */
 uint32_t porpoise_shift_left32(uint32_t value, uint32_t shift_source);
 uint32_t porpoise_shift_right32(uint32_t value, uint32_t shift_source);
+uint32_t porpoise_sign_extend8(uint32_t value);
+uint32_t porpoise_sign_extend16(uint32_t value);
+uint32_t porpoise_count_leading_zeros32(uint32_t value);
+uint32_t porpoise_add_with_carry32(
+    PorpoisePpcState *state,
+    uint32_t left,
+    uint32_t right,
+    uint32_t carry_in);
 uint32_t porpoise_arithmetic_shift_right32(
     PorpoisePpcState *state,
     uint32_t value,
@@ -169,6 +177,10 @@ uint32_t porpoise_load_u32(PorpoisePpcState *state, uint32_t guest_address);
 uint64_t porpoise_load_u64(PorpoisePpcState *state, uint32_t guest_address);
 float porpoise_load_f32(PorpoisePpcState *state, uint32_t guest_address);
 double porpoise_load_f64(PorpoisePpcState *state, uint32_t guest_address);
+int porpoise_load_multiple_words(
+    PorpoisePpcState *state,
+    uint32_t guest_address,
+    unsigned int first_register);
 
 void porpoise_store_u8(
     PorpoisePpcState *state,
@@ -194,6 +206,10 @@ void porpoise_store_f64(
     PorpoisePpcState *state,
     uint32_t guest_address,
     double value);
+int porpoise_store_multiple_words(
+    PorpoisePpcState *state,
+    uint32_t guest_address,
+    unsigned int first_register);
 
 void *porpoise_decode_pointer(
     PorpoisePpcState *state,
