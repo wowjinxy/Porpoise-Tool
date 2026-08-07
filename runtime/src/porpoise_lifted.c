@@ -239,6 +239,56 @@ uint32_t porpoise_shift_right32(uint32_t value, uint32_t shift_source)
     return shift < 32U ? value >> shift : 0U;
 }
 
+uint32_t porpoise_sign_extend8(uint32_t value)
+{
+    value &= UINT32_C(0xFF);
+    return (value & UINT32_C(0x80)) != 0U
+               ? value | UINT32_C(0xFFFFFF00)
+               : value;
+}
+
+uint32_t porpoise_sign_extend16(uint32_t value)
+{
+    value &= UINT32_C(0xFFFF);
+    return (value & UINT32_C(0x8000)) != 0U
+               ? value | UINT32_C(0xFFFF0000)
+               : value;
+}
+
+uint32_t porpoise_count_leading_zeros32(uint32_t value)
+{
+    uint32_t count = 0U;
+
+    if (value == 0U) {
+        return 32U;
+    }
+    while ((value & UINT32_C(0x80000000)) == 0U) {
+        value <<= 1U;
+        count++;
+    }
+    return count;
+}
+
+uint32_t porpoise_add_with_carry32(
+    PorpoisePpcState *state,
+    uint32_t left,
+    uint32_t right,
+    uint32_t carry_in)
+{
+    const uint32_t carry_mask = UINT32_C(0x20000000);
+    uint64_t sum = (uint64_t)left + (uint64_t)right +
+                   (uint64_t)(carry_in & UINT32_C(1));
+
+    if (state != NULL) {
+        if (sum > UINT32_MAX) {
+            state->xer |= carry_mask;
+        } else {
+            state->xer &= ~carry_mask;
+        }
+    }
+    return (uint32_t)sum;
+}
+
 uint32_t porpoise_arithmetic_shift_right32(
     PorpoisePpcState *state,
     uint32_t value,
@@ -248,10 +298,13 @@ uint32_t porpoise_arithmetic_shift_right32(
     uint32_t discarded;
     const uint32_t carry_mask = UINT32_C(0x20000000);
 
-    shift &= 31U;
+    shift &= 63U;
     if (shift == 0U) {
         result = value;
         discarded = 0U;
+    } else if (shift >= 32U) {
+        result = (value & UINT32_C(0x80000000)) != 0U ? UINT32_MAX : 0U;
+        discarded = value;
     } else {
         uint32_t sign_fill = (value & UINT32_C(0x80000000)) != 0U
                                  ? UINT32_MAX << (32U - shift)
@@ -299,7 +352,9 @@ static uint8_t porpoise_condition_field(
 
 void porpoise_set_cr0_result(PorpoisePpcState *state, uint32_t value)
 {
-    int relation = (int32_t)value < 0 ? -1 : value != 0U ? 1 : 0;
+    int relation = (value & UINT32_C(0x80000000)) != 0U
+                       ? -1
+                       : value != 0U ? 1 : 0;
     porpoise_cr_set_field(state, 0U, porpoise_condition_field(state, relation));
 }
 
@@ -309,9 +364,11 @@ void porpoise_compare_signed(
     uint32_t left,
     uint32_t right)
 {
-    int32_t signed_left = (int32_t)left;
-    int32_t signed_right = (int32_t)right;
-    int relation = signed_left < signed_right ? -1 : signed_left > signed_right ? 1 : 0;
+    uint32_t ordered_left = left ^ UINT32_C(0x80000000);
+    uint32_t ordered_right = right ^ UINT32_C(0x80000000);
+    int relation = ordered_left < ordered_right
+                       ? -1
+                       : ordered_left > ordered_right ? 1 : 0;
     porpoise_cr_set_field(state, field_index, porpoise_condition_field(state, relation));
 }
 
@@ -432,6 +489,81 @@ static int porpoise_write_bytes(
     }
 
     return 1;
+}
+
+int porpoise_load_multiple_words(
+    PorpoisePpcState *state,
+    uint32_t guest_address,
+    unsigned int first_register)
+{
+    uint8_t bytes[32U * 4U];
+    size_t register_count;
+    size_t index;
+
+    if (state == NULL) {
+        return 0;
+    }
+    if (first_register >= 32U) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_ARGUMENT,
+            state->pc,
+            "first multiple-load register is outside 0..31");
+        return 0;
+    }
+    register_count = 32U - first_register;
+    if (!porpoise_read_bytes(
+            state,
+            guest_address,
+            bytes,
+            register_count * 4U)) {
+        return 0;
+    }
+    for (index = 0U; index < register_count; index++) {
+        const uint8_t *word = &bytes[index * 4U];
+        state->gpr[first_register + index] =
+            ((uint32_t)word[0] << 24U) |
+            ((uint32_t)word[1] << 16U) |
+            ((uint32_t)word[2] << 8U) |
+            (uint32_t)word[3];
+    }
+    return 1;
+}
+
+int porpoise_store_multiple_words(
+    PorpoisePpcState *state,
+    uint32_t guest_address,
+    unsigned int first_register)
+{
+    uint8_t bytes[32U * 4U] = {0U};
+    size_t register_count;
+    size_t index;
+
+    if (state == NULL) {
+        return 0;
+    }
+    if (first_register >= 32U) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_ARGUMENT,
+            state->pc,
+            "first multiple-store register is outside 0..31");
+        return 0;
+    }
+    register_count = 32U - first_register;
+    for (index = 0U; index < register_count; index++) {
+        uint32_t value = state->gpr[first_register + index];
+        uint8_t *word = &bytes[index * 4U];
+        word[0] = (uint8_t)(value >> 24U);
+        word[1] = (uint8_t)(value >> 16U);
+        word[2] = (uint8_t)(value >> 8U);
+        word[3] = (uint8_t)value;
+    }
+    return porpoise_write_bytes(
+        state,
+        guest_address,
+        bytes,
+        register_count * 4U);
 }
 
 uint8_t porpoise_load_u8(PorpoisePpcState *state, uint32_t guest_address)

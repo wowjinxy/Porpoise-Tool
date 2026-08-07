@@ -1,4 +1,5 @@
 * text=auto
+.gitattributes text eol=lf
 *.c text eol=lf
 *.h text eol=lf
 *.py text eol=lf
@@ -6,3 +7,5 @@
 *.json text eol=lf
 *.md text eol=lf
 *.yml text eol=lf
+meson.build text eol=lf
+meson_options.txt text eol=lf

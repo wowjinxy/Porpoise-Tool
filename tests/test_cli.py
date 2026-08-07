@@ -132,35 +132,131 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
 
     opcodes = temporary / "opcodes"
     run(TOOL, FIXTURES / "inputs" / "opcodes", "--output", opcodes)
+    opcode_report = json.loads((opcodes / "porpoise-report.json").read_text(encoding="utf-8"))
+    semantic_mnemonics = {
+        instruction["mnemonic"]
+        for instruction in opcode_report["instructions"]
+        if instruction["semantic_test"]
+    }
+    assert semantic_mnemonics == {
+        "add", "addc", "adde", "addi", "addic.", "addze", "andc",
+        "bctrl", "bl", "bne", "clrlslwi", "clrlwi", "clrrwi", "cmpwi",
+        "cntlzw", "crclr", "cror", "crset", "extlwi", "extrwi", "extsb",
+        "extsh", "fadd", "lbzx", "lfsx", "lhzx", "li", "lis", "lmw",
+        "lwz", "lwzux", "lwzx", "mtctr", "mullw", "neg", "nor", "ori",
+        "ps_add", "rlwinm", "rlwinm.", "rotlwi", "rotrwi", "slw", "slwi",
+        "sraw.", "srawi", "srwi", "srwi.", "stbx", "stfsx", "sthx",
+        "stmw", "stw", "stwux", "stwx", "subfc", "subfe", "subfic",
+        "subi", "subic", "subic.", "subis", "sync",
+    }
+    assert opcode_report["summary"]["unsupported"] == 0
     harness = opcodes / "tests" / "semantic_harness.c"
     harness.parent.mkdir(parents=True)
     harness.write_text(
-        "#include <assert.h>\n"
+        "#include <stdlib.h>\n"
         "#include \"porpoise_generated.h\"\n"
         "#include \"porpoise_libporpoise_adapter.h\"\n"
         "#include <porpoise/stub.h>\n"
+        "#define CHECK(condition) do { if (!(condition)) abort(); } while (0)\n"
         "int main(void) {\n"
         "  PorpoiseHostAdapter host; PorpoisePpcState state;\n"
-        "  assert(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
+        "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
         "  porpoise_state_init(&state, &host);\n"
         "  porpoise_lifted_integer_semantics(&state);\n"
-        "  assert(!porpoise_state_has_fault(&state));\n"
-        "  assert(state.gpr[3] == 7U && state.gpr[5] == 3U);\n"
-        "  assert(state.gpr[6] == 4U && state.gpr[8] == 2U && state.gpr[9] == 8U);\n"
+        "  CHECK(!porpoise_state_has_fault(&state));\n"
+        "  CHECK(state.gpr[3] == 7U && state.gpr[5] == 3U);\n"
+        "  CHECK(state.gpr[6] == 4U && state.gpr[8] == 2U && state.gpr[9] == 8U);\n"
         "  state.fpr[1].f64 = 1.25; state.fpr[2].f64 = 2.5;\n"
         "  porpoise_lifted_scalar_float_semantics(&state);\n"
-        "  assert(state.fpr[3].f64 == 3.75);\n"
+        "  CHECK(state.fpr[3].f64 == 3.75);\n"
         "  state.fpr[1].ps[0] = 1.0F; state.fpr[1].ps[1] = 2.0F;\n"
         "  state.fpr[2].ps[0] = 3.0F; state.fpr[2].ps[1] = 4.0F;\n"
         "  porpoise_lifted_paired_float_semantics(&state);\n"
-        "  assert(state.fpr[3].ps[0] == 4.0F && state.fpr[3].ps[1] == 6.0F);\n"
+        "  CHECK(state.fpr[3].ps[0] == 4.0F && state.fpr[3].ps[1] == 6.0F);\n"
         "  porpoise_lifted_direct_branch_semantics(&state);\n"
-        "  assert(state.gpr[3] == 5U);\n"
+        "  CHECK(state.gpr[3] == 5U);\n"
         "  porpoise_lifted_indirect_branch_semantics(&state);\n"
-        "  assert(state.gpr[3] == 11U);\n"
+        "  CHECK(state.gpr[3] == 11U);\n"
+        "  porpoise_lifted_extended_integer_semantics(&state);\n"
+        "  CHECK(state.gpr[4] == 0xFFU && state.gpr[5] == 0xFF000000U);\n"
+        "  CHECK(state.gpr[6] == 0xFF0U && state.gpr[7] == 0xFU);\n"
+        "  CHECK(state.gpr[8] == 0xFFU && state.gpr[9] == 0xFF000000U);\n"
+        "  CHECK(state.gpr[10] == 0xFFFFFFFFU && state.gpr[11] == 0xFFFF8001U);\n"
+        "  CHECK(state.gpr[12] == 24U && state.gpr[13] == 0xFFFFFF01U);\n"
+        "  CHECK(state.gpr[14] == 0xFE01U && state.gpr[15] == 0xFF000000U);\n"
+        "  CHECK(state.gpr[16] == 0xFFFFFF00U && state.gpr[17] == 0xFEU);\n"
+        "  CHECK(state.gpr[18] == 0x10000U && state.gpr[19] == 0x00FFFF00U);\n"
+        "  CHECK(state.gpr[20] == 0xFF00U && state.gpr[21] == 0xFF000000U);\n"
+        "  CHECK(state.gpr[22] == 0x12345678U && state.gpr[23] == 0x81000000U);\n"
+        "  porpoise_lifted_extended_carry_semantics(&state);\n"
+        "  CHECK(state.gpr[5] == 0U && state.gpr[6] == 5U && state.gpr[7] == 4U);\n"
+        "  CHECK(state.gpr[8] == 0xFFFFFFFFU && state.gpr[9] == 4U);\n"
+        "  CHECK(state.gpr[10] == 6U && state.gpr[12] == 6U);\n"
+        "  CHECK(state.gpr[13] == 0xFFFFFFFBU && state.gpr[14] == 0xFFFFFFFBU);\n"
+        "  CHECK(state.gpr[15] == 0U && (state.xer & 0x20000000U) != 0U);\n"
+        "  CHECK(porpoise_cr_get_field(&state, 0U) == 8U);\n"
+        "  state.gpr[3] = 0xFFFFFFFFU; state.xer = 0x80000000U;\n"
+        "  porpoise_lifted_extended_addic_record_semantics(&state);\n"
+        "  CHECK(state.gpr[5] == 0U && (state.xer & 0x20000000U) != 0U);\n"
+        "  CHECK(porpoise_cr_get_field(&state, 0U) == 3U);\n"
+        "  state.gpr[3] = 0U; state.xer = 0x20000000U;\n"
+        "  porpoise_lifted_extended_subic_carry_semantics(&state);\n"
+        "  CHECK(state.gpr[5] == 0xFFFFFFFFU && (state.xer & 0x20000000U) == 0U);\n"
+        "  state.gpr[3] = 6U; state.gpr[4] = 0U; state.xer = 0x20000000U;\n"
+        "  porpoise_lifted_extended_subfc_carry_semantics(&state);\n"
+        "  CHECK(state.gpr[5] == 0xFFFFFFFAU && (state.xer & 0x20000000U) == 0U);\n"
+        "  state.gpr[3] = 0xFFFFFFFFU; state.gpr[4] = 0U; state.xer = 0x20000000U;\n"
+        "  porpoise_lifted_extended_adde_carry_semantics(&state);\n"
+        "  CHECK(state.gpr[5] == 0U && (state.xer & 0x20000000U) != 0U);\n"
+        "  state.gpr[3] = 0xFFFFFFFFU; state.xer = 0x20000000U;\n"
+        "  porpoise_lifted_extended_addze_carry_semantics(&state);\n"
+        "  CHECK(state.gpr[5] == 0U && (state.xer & 0x20000000U) != 0U);\n"
+        "  state.gpr[3] = 0U; state.gpr[4] = 0U; state.xer = 0U;\n"
+        "  porpoise_lifted_extended_subfe_carry_semantics(&state);\n"
+        "  CHECK(state.gpr[5] == 0xFFFFFFFFU && (state.xer & 0x20000000U) == 0U);\n"
+        "  state.gpr[3] = 0x80000100U; state.gpr[4] = 4U; state.gpr[5] = 0x12345678U;\n"
+        "  state.gpr[7] = 8U; state.gpr[9] = 10U; state.gpr[11] = 12U; state.gpr[12] = 0x40U;\n"
+        "  state.gpr[28] = 0x11111111U; state.gpr[29] = 0x22222222U;\n"
+        "  state.gpr[30] = 0x33333333U; state.gpr[31] = 0x44444444U;\n"
+        "  state.fpr[1].f64 = 1.000000000931322574615478515625;\n"
+        "  porpoise_store_u32(&state, 0x80000110U, 0xA5A5A5A5U);\n"
+        "  porpoise_lifted_extended_memory_semantics(&state);\n"
+        "  CHECK(!porpoise_state_has_fault(&state));\n"
+        "  CHECK(state.gpr[6] == 0x12345678U && state.gpr[8] == 0x78U);\n"
+        "  CHECK(state.gpr[10] == 0x5678U && state.fpr[2].f64 == 1.0);\n"
+        "  CHECK(porpoise_load_u32(&state, 0x80000110U) == 0xA5A5A5A5U);\n"
+        "  CHECK(state.gpr[28] == 0x11111111U && state.gpr[31] == 0x44444444U);\n"
+        "  CHECK(state.gpr[20] == 0x80000140U && state.gpr[21] == 0x80000140U);\n"
+        "  CHECK(state.gpr[22] == 0x12345678U);\n"
+        "  state.gpr[21] = 0x70000000U; state.gpr[22] = 0xDEADBEEFU; state.gpr[12] = 0U;\n"
+        "  porpoise_lifted_extended_lwzux_fault_semantics(&state);\n"
+        "  CHECK(porpoise_state_has_fault(&state));\n"
+        "  CHECK(state.gpr[21] == 0x70000000U && state.gpr[22] == 0xDEADBEEFU);\n"
+        "  porpoise_state_clear_fault(&state);\n"
+        "  state.gpr[20] = 0x70000000U; state.gpr[5] = 0x12345678U; state.gpr[12] = 0U;\n"
+        "  porpoise_lifted_extended_stwux_fault_semantics(&state);\n"
+        "  CHECK(porpoise_state_has_fault(&state));\n"
+        "  CHECK(state.gpr[20] == 0x70000000U && state.gpr[5] == 0x12345678U);\n"
+        "  porpoise_state_clear_fault(&state);\n"
+        "  state.gpr[3] = 0x70000000U; state.gpr[28] = 0x11111111U; state.gpr[31] = 0x44444444U;\n"
+        "  porpoise_lifted_extended_stmw_fault_semantics(&state);\n"
+        "  CHECK(porpoise_state_has_fault(&state));\n"
+        "  CHECK(state.gpr[28] == 0x11111111U && state.gpr[31] == 0x44444444U);\n"
+        "  porpoise_state_clear_fault(&state);\n"
+        "  porpoise_cr_set_field(&state, 1U, 2U);\n"
+        "  porpoise_lifted_extended_cr_semantics(&state);\n"
+        "  CHECK(porpoise_cr_get_field(&state, 0U) == 6U);\n"
+        "  CHECK(porpoise_cr_get_field(&state, 1U) == 4U);\n"
+        "  porpoise_lifted_extended_rlwinm_record_semantics(&state);\n"
+        "  CHECK(state.gpr[4] == 0xFFFFFFFFU && porpoise_cr_get_field(&state, 0U) == 8U);\n"
+        "  porpoise_lifted_extended_alias_record_semantics(&state);\n"
+        "  CHECK(state.gpr[4] == 1U && porpoise_cr_get_field(&state, 0U) == 4U);\n"
+        "  porpoise_lifted_extended_sraw_record_semantics(&state);\n"
+        "  CHECK(state.gpr[5] == 0xFFFFFFFFU && porpoise_cr_get_field(&state, 0U) == 8U);\n"
+        "  CHECK((state.xer & 0x20000000U) != 0U);\n"
         "  porpoise_lifted_fault_propagation(&state);\n"
-        "  assert(porpoise_state_has_fault(&state));\n"
-        "  assert(state.gpr[5] == 1U);\n"
+        "  CHECK(porpoise_state_has_fault(&state));\n"
+        "  CHECK(state.gpr[5] == 1U);\n"
         "  return 0;\n"
         "}\n",
         encoding="utf-8",
@@ -225,6 +321,34 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     )
     run(TOOL, invalid_noop, "--output", temporary / "invalid-noop-output", expected=3)
 
+    invalid_opcode_cases = {
+        "slwi-width": "slwi r3, r4, 32",
+        "extrwi-zero": "extrwi r3, r4, 0, 0",
+        "extrwi-range": "extrwi r3, r4, 8, 28",
+        "clrlslwi-range": "clrlslwi r3, r4, 3, 4",
+        "subi-range": "subi r3, r4, 0x8001",
+        "lmw-overlap": "lmw r3, 0(r4)",
+        "lmw-zero-overlap": "lmw r0, 0(r0)",
+        "lwzux-zero-base": "lwzux r3, r0, r4",
+        "lwzux-destination-base": "lwzux r3, r3, r4",
+        "cr-bit-range": "crclr cr8eq",
+    }
+    for case_name, instruction in invalid_opcode_cases.items():
+        invalid_opcode = temporary / f"invalid-opcode-{case_name}.s"
+        invalid_opcode.write_text(
+            ".text\n.fn invalid_opcode, global\n"
+            f"/* 80006100 00000000  60 00 00 00 */ {instruction}\n"
+            ".endfn invalid_opcode\n",
+            encoding="utf-8",
+        )
+        run(
+            TOOL,
+            invalid_opcode,
+            "--output",
+            temporary / f"invalid-opcode-{case_name}-output",
+            expected=3,
+        )
+
     malformed_annotation = temporary / "malformed-annotation.s"
     malformed_annotation.write_text(
         ".text\n.fn malformed_annotation, global\n"
@@ -288,21 +412,22 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     abi_harness = imported / "tests" / "abi_harness.c"
     abi_harness.parent.mkdir(parents=True)
     abi_harness.write_text(
-        "#include <assert.h>\n"
+        "#include <stdlib.h>\n"
         "#include \"porpoise_generated.h\"\n"
         "#include \"porpoise_libporpoise_adapter.h\"\n"
         "#include <porpoise/stub.h>\n"
+        "#define CHECK(condition) do { if (!(condition)) abort(); } while (0)\n"
         "int main(void) {\n"
         "  PorpoiseHostAdapter host; PorpoisePpcState state;\n"
-        "  assert(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
+        "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
         "  porpoise_state_init(&state, &host);\n"
         "  state.gpr[3] = 1U; state.gpr[4] = 2U;\n"
         "  state.fpr[1].f64 = 1.5; state.fpr[2].f64 = 2.25;\n"
         "  porpoise_lifted_call_imports(&state);\n"
-        "  assert(!porpoise_state_has_fault(&state));\n"
-        "  assert(state.gpr[3] == 0x80000003U);\n"
-        "  assert(state.fpr[1].f64 == 3.75);\n"
-        "  assert(PorpoiseStubReportCount() == 1U);\n"
+        "  CHECK(!porpoise_state_has_fault(&state));\n"
+        "  CHECK(state.gpr[3] == 0x80000003U);\n"
+        "  CHECK(state.fpr[1].f64 == 3.75);\n"
+        "  CHECK(PorpoiseStubReportCount() == 1U);\n"
         "  return 0;\n"
         "}\n",
         encoding="utf-8",
@@ -331,16 +456,17 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     export_harness = exported / "tests" / "export_harness.c"
     export_harness.parent.mkdir(parents=True)
     export_harness.write_text(
-        "#include <assert.h>\n"
+        "#include <stdlib.h>\n"
         "#include \"porpoise_exports.h\"\n"
         "#include \"porpoise_libporpoise_adapter.h\"\n"
+        "#define CHECK(condition) do { if (!(condition)) abort(); } while (0)\n"
         "int main(void) {\n"
         "  PorpoiseHostAdapter host; PorpoisePpcState state;\n"
-        "  assert(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
+        "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
         "  porpoise_state_init(&state, &host); porpoise_bind_export_state(&state);\n"
-        "  assert(PorpoiseAddOne(41U) == 42U);\n"
-        "  assert(PorpoiseAddFloat(1.25F, 2.5F) == 3.75F);\n"
-        "  assert(PorpoiseAddDouble(1.25, 2.5) == 3.75);\n"
+        "  CHECK(PorpoiseAddOne(41U) == 42U);\n"
+        "  CHECK(PorpoiseAddFloat(1.25F, 2.5F) == 3.75F);\n"
+        "  CHECK(PorpoiseAddDouble(1.25, 2.5) == 3.75);\n"
         "  porpoise_bind_export_state(0);\n"
         "  return 0;\n"
         "}\n",
@@ -366,6 +492,43 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         FIXTURES / "abi" / "invalid_unknown_key.json",
         expected=2,
     )
+
+    new_runtime_helpers = (
+        "porpoise_sign_extend8",
+        "porpoise_sign_extend16",
+        "porpoise_count_leading_zeros32",
+        "porpoise_add_with_carry32",
+        "porpoise_load_multiple_words",
+        "porpoise_store_multiple_words",
+    )
+    for helper_name in new_runtime_helpers:
+        reserved_abi = temporary / f"reserved-{helper_name}.json"
+        reserved_abi.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "functions": [
+                        {
+                            "kind": "import",
+                            "symbol": helper_name,
+                            "header": "porpoise/stub.h",
+                            "return": {"type": "void"},
+                            "arguments": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        run(
+            TOOL,
+            FIXTURES / "inputs" / "basic",
+            "--output",
+            temporary / f"reserved-{helper_name}-output",
+            "--abi",
+            reserved_abi,
+            expected=2,
+        )
 
     protected = temporary / "protected"
     protected.mkdir()
