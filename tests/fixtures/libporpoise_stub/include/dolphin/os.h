@@ -1,0 +1,18 @@
+#ifndef TEST_LIBPORPOISE_DOLPHIN_OS_H
+#define TEST_LIBPORPOISE_DOLPHIN_OS_H
+
+#include <dolphin/os/OSHostAddress.h>
+#include <dolphin/os/OSHostMemory.h>
+#include <dolphin/types.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void OSInit(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

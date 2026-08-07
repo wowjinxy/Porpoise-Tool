@@ -1,6 +1,10 @@
-# Build artifacts
-bin/
-build/
+# Meson and compiler artifacts
+/build/
+/build-*/
+/meson-private/
+/meson-logs/
+/meson-info/
+/compile_commands.json
 *.exe
 *.o
 *.obj
@@ -10,13 +14,13 @@ build/
 *.dll
 *.dylib
 
-# Generated projects
-projects/
+# Python test artifacts
+__pycache__/
+*.py[cod]
 
-# Generated transpiler output (optional - may want to commit these)
-# Uncomment if you don't want to track generated .c/.h files
-# Test Asm/*.c
-# Test Asm/*.h
+# Interrupted atomic-publication siblings
+.*.porpoise-stage-*
+.*.porpoise-backup-*
 
 # Editor/IDE files
 .vscode/
@@ -41,10 +45,3 @@ desktop.ini
 # Temporary files
 *.tmp
 *.temp
-
-/GameCube_Project
-/PikminProject
-*.bat
-/build_runtime
-/COLORASM_Project
-/include/opcode

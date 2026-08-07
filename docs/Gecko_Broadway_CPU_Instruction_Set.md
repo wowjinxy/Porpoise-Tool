@@ -1,4 +1,6 @@
-# Gecko/Broadway CPU Complete Instruction Set
+# Gecko/Broadway CPU Instruction Notes
+
+> Background reference only. This document is not authoritative, exhaustive, or a Porpoise Tool coverage claim. Use `porpoise-report.json` and semantic tests to assess an actual translation.
 
 ## Overview
 The Gecko CPU (GameCube) and Broadway CPU (Wii) are based on the IBM PowerPC 750CXe architecture with Nintendo-specific extensions.

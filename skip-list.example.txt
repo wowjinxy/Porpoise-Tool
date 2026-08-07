@@ -1,0 +1,2 @@
+# One exact input function symbol per line.
+# Functions supplied by an explicit ABI import may be skipped here.
