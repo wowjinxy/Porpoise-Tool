@@ -1384,11 +1384,13 @@ int porpoise_frsp(
     return porpoise_scalar_fp_finish(state, record);
 }
 
-int porpoise_fctiwz(
+static int porpoise_fctiw_with_rounding(
     PorpoisePpcState *state,
     unsigned int destination_register,
     unsigned int source_register,
-    int record)
+    int record,
+    unsigned int rounding_mode,
+    const char *instruction_name)
 {
     uint64_t source_bits;
     uint64_t magnitude_bits;
@@ -1399,6 +1401,7 @@ int porpoise_fctiwz(
     int negative;
     int invalid = 0;
     int inexact = 0;
+    int incremented = 0;
 
     if (state == NULL || state->fault != PORPOISE_FAULT_NONE) {
         return 0;
@@ -1444,19 +1447,18 @@ int porpoise_fctiwz(
             significand = source_bits & PORPOISE_F64_FRACTION_MASK;
         }
 
-        if (exponent < 0) {
-            inexact = 1;
-            integer_magnitude = 0U;
-        } else if (exponent > 31) {
+        if (exponent > 31) {
             invalid = 1;
         } else {
-            unsigned int shift = 52U - (unsigned int)exponent;
-            uint64_t mask = (UINT64_C(1) << shift) - UINT64_C(1);
-            uint64_t remainder;
+            unsigned int shift = (unsigned int)(52 - exponent);
 
-            integer_magnitude = significand >> shift;
-            remainder = significand & mask;
-            inexact = remainder != 0U;
+            integer_magnitude = porpoise_round_right(
+                significand,
+                shift,
+                negative,
+                rounding_mode,
+                &inexact,
+                &incremented);
             if ((!negative && integer_magnitude > UINT64_C(0x7FFFFFFF)) ||
                 (negative && integer_magnitude > UINT64_C(0x80000000))) {
                 invalid = 1;
@@ -1482,10 +1484,10 @@ int porpoise_fctiwz(
             return porpoise_scalar_fp_invalid_fault(
                 state,
                 record,
-                "enabled invalid operation during fctiwz");
+                instruction_name);
         }
     } else {
-        porpoise_fpscr_set_rounding(state, inexact, 0, 0U);
+        porpoise_fpscr_set_rounding(state, inexact, incremented, 0U);
     }
 
     result_bits = UINT64_C(0xFFF8000000000000) | result_word;
@@ -1494,6 +1496,40 @@ int porpoise_fctiwz(
     }
     state->fpr[destination_register].lane_bits[0] = result_bits;
     return porpoise_scalar_fp_finish(state, record);
+}
+
+int porpoise_fctiw(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int source_register,
+    int record)
+{
+    unsigned int rounding_mode = state != NULL
+                                     ? state->fpscr & PORPOISE_FPSCR_RN_MASK
+                                     : 0U;
+
+    return porpoise_fctiw_with_rounding(
+        state,
+        destination_register,
+        source_register,
+        record,
+        rounding_mode,
+        "enabled invalid operation during fctiw");
+}
+
+int porpoise_fctiwz(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int source_register,
+    int record)
+{
+    return porpoise_fctiw_with_rounding(
+        state,
+        destination_register,
+        source_register,
+        record,
+        1U,
+        "enabled invalid operation during fctiwz");
 }
 
 int porpoise_mffs(

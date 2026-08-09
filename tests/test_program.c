@@ -528,6 +528,44 @@ static void test_coalesced_alias_diagnostic_provenance(
     porpoise_program_free(&program);
 }
 
+static void test_gap_duplicate_precedence(const char *source_root) {
+    char path[PORPOISE_PATH_CAPACITY];
+    PorpoiseProgram program;
+    PorpoiseDiagnostics diagnostics;
+    const PorpoiseFunction *after;
+    const PorpoiseFunction *before;
+    size_t file_index;
+    size_t function_count = 0U;
+    size_t data_word_count = 0U;
+    int result;
+
+    CHECK(make_fixture_path(
+        path, sizeof(path), source_root, "gap_duplicate_precedence"));
+    porpoise_program_init(&program);
+    porpoise_diagnostics_init(&diagnostics);
+    result = porpoise_program_load(&program, path, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    CHECK(!porpoise_diagnostics_have_errors(&diagnostics));
+    for (file_index = 0U; file_index < program.file_count; file_index++) {
+        function_count += program.files[file_index].function_count;
+        data_word_count += program.files[file_index].data_word_count;
+    }
+    CHECK(function_count == 2U);
+    CHECK(data_word_count == 0U);
+    after = porpoise_program_find_function(&program, "real_after_gap");
+    before = porpoise_program_find_function(&program, "real_before_gap");
+    CHECK(after != NULL && strcmp(after->name, "real_after_gap") == 0);
+    CHECK(before != NULL && strcmp(before->name, "real_before_gap") == 0);
+    CHECK(after != NULL && !after->data_region && !after->skipped);
+    CHECK(before != NULL && !before->data_region && !before->skipped);
+    CHECK(porpoise_program_find_function(
+              &program, "gap_01_8000B000_text") == after);
+    CHECK(porpoise_program_find_function(
+              &program, "gap_01_8000B100_text") == before);
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_program_free(&program);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s SOURCE_ROOT\n", argv[0]);
@@ -539,6 +577,7 @@ int main(int argc, char **argv) {
     test_multiline_comments(argv[1]);
     test_exact_duplicate_functions(argv[1]);
     test_coalesced_alias_diagnostic_provenance(argv[1]);
+    test_gap_duplicate_precedence(argv[1]);
     test_double_load_rejected(argv[1]);
     test_atomic_skip_list(argv[1]);
     test_invalid_program(argv[1], "symbol_aliases_malformed.s",

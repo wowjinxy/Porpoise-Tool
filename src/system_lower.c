@@ -36,6 +36,10 @@ static const char DETAIL_DCBZ_L[] =
     "locked-cache allocation is unsupported";
 static const char DETAIL_UNKNOWN_SPR[] =
     "unknown special-purpose register";
+static const char DETAIL_OPAQUE_SPR[] =
+    "opaque special-purpose register state is preserved but hardware side effects are not modeled";
+static const char DETAIL_MCRXR[] =
+    "XER summary, overflow, and carry bits are transferred to the selected CR field and cleared";
 static const char DETAIL_READ_ONLY[] =
     "write to a read-only special-purpose register is unsupported";
 static const char DETAIL_INVALID[] =
@@ -98,6 +102,9 @@ static const SprDescriptor SPR_DESCRIPTORS[] = {
               PORPOISE_LOWERED, PORPOISE_LOWERED, DETAIL_RAW, DETAIL_RAW),
     SPR_ENTRY("SPRG3", 275U, PORPOISE_SYSTEM_STORAGE_SPRG, 3U, true,
               PORPOISE_LOWERED, PORPOISE_LOWERED, DETAIL_RAW, DETAIL_RAW),
+    SPR_ENTRY("ASR", 280U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 280U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_UNSUPPORTED,
+              DETAIL_OPAQUE_SPR, DETAIL_READ_ONLY),
     SPR_ENTRY("EAR", 282U, PORPOISE_SYSTEM_STORAGE_EAR, 0U, true,
               PORPOISE_LOWERED, PORPOISE_APPROXIMATE,
               DETAIL_RAW, DETAIL_CONTROL),
@@ -131,6 +138,12 @@ static const SprDescriptor SPR_DESCRIPTORS[] = {
     SPR_ENTRY("DMA_L", 923U, PORPOISE_SYSTEM_STORAGE_DMA_LOWER, 0U, true,
               PORPOISE_LOWERED, PORPOISE_APPROXIMATE,
               DETAIL_RAW, DETAIL_CONTROL),
+    SPR_ENTRY("UMMCR2", 928U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 928U, false,
+              PORPOISE_APPROXIMATE, PORPOISE_UNSUPPORTED,
+              DETAIL_OPAQUE_SPR, DETAIL_READ_ONLY),
+    SPR_ENTRY("UBAMR", 935U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 935U, false,
+              PORPOISE_APPROXIMATE, PORPOISE_UNSUPPORTED,
+              DETAIL_OPAQUE_SPR, DETAIL_READ_ONLY),
     SPR_ENTRY("UMMCR0", 936U, PORPOISE_SYSTEM_STORAGE_MMCR, 0U, false,
               PORPOISE_APPROXIMATE, PORPOISE_UNSUPPORTED,
               DETAIL_PERFORMANCE, DETAIL_READ_ONLY),
@@ -155,6 +168,12 @@ static const SprDescriptor SPR_DESCRIPTORS[] = {
     SPR_ENTRY("USDA", 943U, PORPOISE_SYSTEM_STORAGE_SDA, 0U, false,
               PORPOISE_APPROXIMATE, PORPOISE_HOST_NOOP,
               DETAIL_PERFORMANCE, DETAIL_SDA_NOOP),
+    SPR_ENTRY("MMCR2", 944U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 944U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_OPAQUE_SPR, DETAIL_OPAQUE_SPR),
+    SPR_ENTRY("BAMR", 951U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 951U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_OPAQUE_SPR, DETAIL_OPAQUE_SPR),
     SPR_ENTRY("MMCR0", 952U, PORPOISE_SYSTEM_STORAGE_MMCR, 0U, true,
               PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
               DETAIL_PERFORMANCE, DETAIL_PERFORMANCE),
@@ -179,6 +198,27 @@ static const SprDescriptor SPR_DESCRIPTORS[] = {
     SPR_ENTRY("SDA", 959U, PORPOISE_SYSTEM_STORAGE_SDA, 0U, true,
               PORPOISE_APPROXIMATE, PORPOISE_HOST_NOOP,
               DETAIL_PERFORMANCE, DETAIL_SDA_NOOP),
+    SPR_ENTRY("DMISS", 976U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 976U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_OPAQUE_SPR, DETAIL_OPAQUE_SPR),
+    SPR_ENTRY("DCMP", 977U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 977U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_OPAQUE_SPR, DETAIL_OPAQUE_SPR),
+    SPR_ENTRY("HASH1", 978U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 978U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_OPAQUE_SPR, DETAIL_OPAQUE_SPR),
+    SPR_ENTRY("HASH2", 979U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 979U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_OPAQUE_SPR, DETAIL_OPAQUE_SPR),
+    SPR_ENTRY("IMISS", 980U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 980U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_OPAQUE_SPR, DETAIL_OPAQUE_SPR),
+    SPR_ENTRY("ICMP", 981U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 981U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_OPAQUE_SPR, DETAIL_OPAQUE_SPR),
+    SPR_ENTRY("RPA", 982U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 982U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_OPAQUE_SPR, DETAIL_OPAQUE_SPR),
     SPR_ENTRY("HID0", 1008U, PORPOISE_SYSTEM_STORAGE_HID0, 0U, true,
               PORPOISE_LOWERED, PORPOISE_APPROXIMATE,
               DETAIL_RAW, DETAIL_CONTROL),
@@ -193,12 +233,30 @@ static const SprDescriptor SPR_DESCRIPTORS[] = {
     SPR_ENTRY("DABR", 1013U, PORPOISE_SYSTEM_STORAGE_DABR, 0U, true,
               PORPOISE_LOWERED, PORPOISE_APPROXIMATE,
               DETAIL_RAW, DETAIL_CONTROL),
+    SPR_ENTRY("MSSCR0", 1014U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 1014U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_OPAQUE_SPR, DETAIL_OPAQUE_SPR),
+    SPR_ENTRY("MSSCR1", 1015U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 1015U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_OPAQUE_SPR, DETAIL_OPAQUE_SPR),
     SPR_ENTRY("L2CR", 1017U, PORPOISE_SYSTEM_STORAGE_L2CR, 0U, true,
               PORPOISE_LOWERED, PORPOISE_APPROXIMATE,
               DETAIL_RAW, DETAIL_CONTROL),
     SPR_ENTRY("ICTC", 1019U, PORPOISE_SYSTEM_STORAGE_ICTC, 0U, true,
               PORPOISE_LOWERED, PORPOISE_APPROXIMATE,
               DETAIL_RAW, DETAIL_CONTROL),
+    SPR_ENTRY("THRM1", 1020U, PORPOISE_SYSTEM_STORAGE_THERMAL, 0U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_CONTROL, DETAIL_CONTROL),
+    SPR_ENTRY("THRM2", 1021U, PORPOISE_SYSTEM_STORAGE_THERMAL, 1U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_CONTROL, DETAIL_CONTROL),
+    SPR_ENTRY("THRM3", 1022U, PORPOISE_SYSTEM_STORAGE_THERMAL, 2U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_CONTROL, DETAIL_CONTROL),
+    SPR_ENTRY("PIR", 1023U, PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR, 1023U, true,
+              PORPOISE_APPROXIMATE, PORPOISE_APPROXIMATE,
+              DETAIL_OPAQUE_SPR, DETAIL_OPAQUE_SPR),
 };
 
 static const FixedSprAlias FIXED_SPR_ALIASES[] = {
@@ -510,6 +568,8 @@ static bool spr_transfer_has_semantic_test(
     }
     if (descriptor->storage == PORPOISE_SYSTEM_STORAGE_XER ||
         descriptor->storage == PORPOISE_SYSTEM_STORAGE_GQR ||
+        descriptor->storage == PORPOISE_SYSTEM_STORAGE_THERMAL ||
+        descriptor->storage == PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR ||
         (write && descriptor->storage == PORPOISE_SYSTEM_STORAGE_SIA) ||
         descriptor->storage == PORPOISE_SYSTEM_STORAGE_IBAT_UPPER ||
         descriptor->storage == PORPOISE_SYSTEM_STORAGE_IBAT_LOWER ||
@@ -738,7 +798,7 @@ static bool is_system_mnemonic(const char *mnemonic)
         "mfspr", "mtspr", "mfsprg", "mtsprg",
         "mftb", "mftbu", "mttbl", "mttbu",
         "mfmsr", "mtmsr", "mfsr", "mtsr",
-        "mtcrf", "mtcr", "rfi", "dcbz", "dcbi", "dcbz_l",
+        "mtcrf", "mtcr", "mcrxr", "rfi", "dcbz", "dcbi", "dcbz_l",
         "twui", "sc",
     };
     uint32_t ignored_number;
@@ -994,6 +1054,25 @@ PorpoiseSystemResolveResult porpoise_system_resolve(
         return PORPOISE_SYSTEM_RESOLVED;
     }
 
+    if (strcmp(mnemonic, "mcrxr") == 0) {
+        uint32_t field;
+
+        if (operands.count != 1U ||
+            strncmp(operands.values[0], "cr", 2U) != 0 ||
+            !parse_unsigned(operands.values[0] + 2U, 7U, &field) ||
+            word != ((UINT32_C(31) << 26U) |
+                     (field << 23U) |
+                     (UINT32_C(512) << 1U))) {
+            return invalid_instruction(instruction);
+        }
+        instruction->operation = PORPOISE_SYSTEM_MCRXR;
+        instruction->status = PORPOISE_LOWERED;
+        instruction->semantic_test = true;
+        instruction->detail = DETAIL_MCRXR;
+        instruction->storage_index = (unsigned int)field;
+        return PORPOISE_SYSTEM_RESOLVED;
+    }
+
     if (strcmp(mnemonic, "rfi") == 0) {
         if (operands.count != 0U || word != UINT32_C(0x4C000064)) {
             return invalid_instruction(instruction);
@@ -1140,6 +1219,8 @@ static bool storage_expression(
             case PORPOISE_SYSTEM_STORAGE_DBAT_LOWER: array = "state->dbat_lower"; break;
             case PORPOISE_SYSTEM_STORAGE_MMCR: array = "state->mmcr"; break;
             case PORPOISE_SYSTEM_STORAGE_PMC: array = "state->pmc"; break;
+            case PORPOISE_SYSTEM_STORAGE_THERMAL: array = "state->thermal_management"; break;
+            case PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR: array = "state->opaque_spr"; break;
             default: return false;
         }
         result = snprintf(
@@ -1269,6 +1350,11 @@ bool porpoise_system_emit(
                 (unsigned long)instruction->cr_mask,
                 instruction->source_register,
                 (unsigned long)instruction->cr_mask);
+        case PORPOISE_SYSTEM_MCRXR:
+            return file_printf(
+                output,
+                "    porpoise_cr_set_field(state, %uU, (uint8_t)((state->xer >> 28U) & UINT32_C(0xF)));\n    state->xer &= UINT32_C(0x0FFFFFFF);\n",
+                instruction->storage_index);
         case PORPOISE_SYSTEM_RFI:
             return file_printf(
                 output,

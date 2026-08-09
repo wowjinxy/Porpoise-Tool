@@ -176,6 +176,8 @@ static void test_state_and_explicit_faults(void)
     CHECK(state.pmc[3] == 0U);
     CHECK(state.sia == 0U);
     CHECK(state.sda == 0U);
+    CHECK(state.thermal_management[2] == 0U);
+    CHECK(state.opaque_spr[1023] == 0U);
     CHECK(state.time_base_bias == UINT64_C(0));
     CHECK(state.decrementer_valid == 0);
 

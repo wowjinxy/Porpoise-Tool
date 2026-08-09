@@ -90,6 +90,8 @@ Rules:
 
 An opcode known to the registry can still fail if its operand form is invalid or represents a case the lowering does not support. An unknown mnemonic always fails translation. There is intentionally no static “percentage supported” promise; the current registry and the per-run report are the sources of truth.
 
+Inside an ordinary function, a `.4byte` record is not assumed to be data or silently decoded as an arbitrary instruction. Its numeric operand must match the annotated word. Records explicitly tagged by decomp-toolkit with `/* invalid */` or `/* illegal: ... */` become an approximate terminal illegal-instruction fault because the lifted shim does not dispatch a guest program-exception vector. The characterized reserved `lmw` overlap form is decoded only when the register fields actually overlap and the metadata begins `/* illegal: lmw ... */`; its effective address is captured before the overlapping register restore. Other raw words are unsupported and fail translation. `--strict` rejects both accepted raw-word approximations.
+
 ### Already-linked relocation operands
 
 Porpoise Tool does not link symbols or emit relocation records. It accepts a small set of relocation-decorated operands only when the annotation already contains the final linked instruction word:
@@ -146,6 +148,8 @@ sample_data:
 The four encoded bytes in the annotation are authoritative. Successful projects expose `porpoise_initialize_data(PorpoisePpcState *)`, which writes each word to its 32-bit guest address through the same endian-safe host adapter used by lifted loads and stores. `DolphinMain` calls this initializer after host memory setup and before the lifted entry. This does not allocate memory or compete with `libPorpoise`.
 
 Unannotated data directives, BSS sizing, unresolved relocations, macros, and linker metadata are not emitted. Overlapping annotated words and words crossing the 32-bit address boundary are rejected rather than guessed.
+
+decomp-toolkit may wrap otherwise unclaimed section bytes in a synthetic function record named `gap_SS_AAAAAAAA_section`, for example `gap_03_80004000_text`. Porpoise recognizes that exact naming shape as dialect metadata only when `AAAAAAAA` equals the first annotated address: every annotated word in the record is preserved as guest data, the record is excluded from lifting and address dispatch, and its function-report status is `data`. This prevents strings, vector tables, and padding that happen to decode as valid opcodes from being reported as executable code. Similar-looking names and records whose embedded address does not match remain ordinary functions. If an exact duplicate has both a synthetic gap name and an ordinary function name, the ordinary declaration is retained as the canonical lifted function regardless of input-file order.
 
 Blank lines, ordinary `#` comment lines, and complete C-style block comments are ignored. A block comment may span physical lines and may appear inside or outside a function; it is metadata only. Annotated instruction records remain active because their mnemonic follows `*/` on the same physical line. An unterminated block comment is an error reported at its opening line. Lines longer than 4095 bytes and unrecognized non-directive lines inside a function are errors.
 

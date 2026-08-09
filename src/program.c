@@ -393,6 +393,83 @@ static void file_rollback_last_data_word(
     file->data_word_count--;
 }
 
+/*
+ * decomp-toolkit represents otherwise unclaimed section bytes with a strict
+ * gap_SS_AAAAAAAA_section symbol. Although emitted with .fn/.endfn markers,
+ * those records are byte containers rather than inferred executable code.
+ */
+static bool is_annotated_gap_data_name(
+    const char *name,
+    uint32_t *address_out) {
+    size_t index;
+    uint32_t address = 0U;
+
+    if (name == NULL || strlen(name) < 17U ||
+        strncmp(name, "gap_", 4U) != 0 ||
+        !isxdigit((unsigned char)name[4]) ||
+        !isxdigit((unsigned char)name[5]) ||
+        name[6] != '_') {
+        return false;
+    }
+    for (index = 7U; index < 15U; index++) {
+        unsigned char character = (unsigned char)name[index];
+        uint32_t digit;
+
+        if (!isxdigit(character)) return false;
+        if (character >= '0' && character <= '9') {
+            digit = (uint32_t)(character - '0');
+        } else {
+            digit = (uint32_t)(toupper(character) - 'A' + 10);
+        }
+        address = (address << 4U) | digit;
+    }
+    if (name[15] != '_' || name[16] == '\0') return false;
+    for (index = 16U; name[index] != '\0'; index++) {
+        if (!isalnum((unsigned char)name[index]) && name[index] != '_') {
+            return false;
+        }
+    }
+    if (address_out != NULL) *address_out = address;
+    return true;
+}
+
+static bool materialize_gap_data_regions(PorpoiseProgram *program) {
+    size_t file_index;
+
+    for (file_index = 0U; file_index < program->file_count; file_index++) {
+        PorpoiseSourceFile *file = &program->files[file_index];
+        size_t function_index;
+
+        for (function_index = 0U;
+             function_index < file->function_count;
+             function_index++) {
+            const PorpoiseFunction *function = &file->functions[function_index];
+            size_t item_index;
+
+            if (!function->data_region) continue;
+            for (item_index = 0U;
+                 item_index < function->item_count;
+                 item_index++) {
+                const PorpoiseAsmItem *item = &function->items[item_index];
+                PorpoiseDataWord *word;
+
+                if (item->kind != PORPOISE_ASM_INSTRUCTION) continue;
+                word = file_add_data_word(file);
+                if (word == NULL) return false;
+                word->source_line = item->source_line;
+                word->address = item->address;
+                word->word = item->word;
+                word->directive = porpoise_strdup(".4byte");
+                if (word->directive == NULL) {
+                    file_rollback_last_data_word(file, word);
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static bool directive_selects_data(const char *line, bool *is_data) {
     const char *cursor = line;
     while (isspace((unsigned char)*cursor)) cursor++;
@@ -784,6 +861,7 @@ static bool parse_file(
         }
         if (parse_function_end(line, function_end_name, sizeof(function_end_name))) {
             size_t pending_index;
+            uint32_t gap_address = 0U;
             if (current == NULL) {
                 porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, file->path,
                                          line_number, 0U, ".endfn without .fn");
@@ -814,6 +892,10 @@ static bool parse_file(
                                          function_end_name, current->name);
                 ok = false;
             }
+            current->data_region =
+                is_annotated_gap_data_name(current->name, &gap_address) &&
+                gap_address == current->start_address;
+            current->skipped = current->data_region;
             current = NULL;
             have_previous_instruction = false;
             continue;
@@ -1332,6 +1414,9 @@ static int compare_function_coalesce_refs(const void *left, const void *right) {
         return 1;
     if (left_ref->function->size < right_ref->function->size) return -1;
     if (left_ref->function->size > right_ref->function->size) return 1;
+    if (left_ref->function->data_region != right_ref->function->data_region) {
+        return left_ref->function->data_region ? 1 : -1;
+    }
     if (left_ref->order < right_ref->order) return -1;
     if (left_ref->order > right_ref->order) return 1;
     return 0;
@@ -1676,6 +1761,11 @@ static bool merge_duplicate_function(
         function_first_instruction_item_index(duplicate);
     size_t alias_index;
     size_t source_line;
+
+    /* A real function declaration takes precedence over a redundant gap name. */
+    canonical->data_region =
+        canonical->data_region && duplicate->data_region;
+    canonical->skipped = canonical->data_region;
 
     if (first_instruction_item_index == SIZE_MAX ||
         duplicate_first_instruction_item_index == SIZE_MAX) {
@@ -2198,6 +2288,7 @@ int porpoise_program_load(
     }
     path_list_free(&paths);
     if (ok && !coalesce_exact_duplicate_functions(program)) ok = false;
+    if (ok && !materialize_gap_data_regions(program)) ok = false;
     if (ok && !ensure_unique_symbols(program, diagnostics)) ok = false;
     if (ok && !program_build_lookup_indices(program)) ok = false;
     if (!ok) {

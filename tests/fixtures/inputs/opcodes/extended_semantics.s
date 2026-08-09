@@ -553,3 +553,43 @@ unique_cross_target:
 /* 80006E00 00000E00  E2 71 90 00 */ psq_l f19, (r17), 1, qr1
 /* 80006E04 00000E04  4E 80 00 20 */ blr
 .endfn psq_empty_displacement_semantics
+
+.global integer_alias_semantics
+.fn integer_alias_semantics, global
+/* 80006E20 00000E20  7C 65 22 38 */ eqv r5, r3, r4
+/* 80006E24 00000E24  5C 67 40 3E */ rotlw r7, r3, r8
+/* 80006E28 00000E28  4E 80 00 20 */ blr
+.endfn integer_alias_semantics
+
+.global predicted_not_equal_branch_semantics
+.fn predicted_not_equal_branch_semantics, global
+/* 80006E40 00000E40  38 80 00 00 */ li r4, 0
+/* 80006E44 00000E44  2C 03 00 00 */ cmpwi r3, 0
+/* 80006E48 00000E48  40 A2 00 08 */ bne+ predicted_not_equal_branch_done
+/* 80006E4C 00000E4C  38 80 00 01 */ li r4, 1
+predicted_not_equal_branch_done:
+/* 80006E50 00000E50  4E 80 00 20 */ blr
+.endfn predicted_not_equal_branch_semantics
+
+.global counter_zero_branch_semantics
+.fn counter_zero_branch_semantics, global
+/* 80006E60 00000E60  38 A0 00 01 */ li r5, 1
+/* 80006E64 00000E64  42 40 00 08 */ bdz counter_zero_branch_done
+/* 80006E68 00000E68  38 A0 00 02 */ li r5, 2
+counter_zero_branch_done:
+/* 80006E6C 00000E6C  4E 80 00 20 */ blr
+.endfn counter_zero_branch_semantics
+
+.global absolute_link_branch_semantics
+.fn absolute_link_branch_semantics, global
+/* 80006E80 00000E80  38 C0 00 00 */ li r6, 0
+/* 80006E84 00000E84  48 00 00 63 */ bla 0x60
+/* 80006E88 00000E88  7C E8 02 A6 */ mflr r7
+/* 80006E8C 00000E8C  4E 80 00 20 */ blr
+.endfn absolute_link_branch_semantics
+
+.global absolute_branch_target
+.fn absolute_branch_target, global
+/* 00000060 00000060  38 C0 00 33 */ li r6, 0x33
+/* 00000064 00000064  4E 80 00 20 */ blr
+.endfn absolute_branch_target

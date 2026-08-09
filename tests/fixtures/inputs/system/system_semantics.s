@@ -39,3 +39,13 @@
 .fn system_rfi_semantics, global
 /* 80008200 00000200  4C 00 00 64 */ rfi
 .endfn system_rfi_semantics
+
+.global system_extended_register_semantics
+.fn system_extended_register_semantics, global
+/* 80008280 00000280  7D 80 04 00 */ mcrxr cr3
+/* 80008284 00000284  7E D0 F2 A6 */ mfspr r22, 976
+/* 80008288 00000288  7E F0 F3 A6 */ mtspr 976, r23
+/* 8000828C 0000028C  7F 1C FA A6 */ mfspr r24, THRM1
+/* 80008290 00000290  7F 3D FB A6 */ mtspr THRM2, r25
+/* 80008294 00000294  4E 80 00 20 */ blr
+.endfn system_extended_register_semantics

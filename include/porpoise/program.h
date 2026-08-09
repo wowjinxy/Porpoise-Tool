@@ -34,6 +34,7 @@ typedef struct PorpoiseFunction {
     char *c_name;
     bool is_global;
     bool skipped;
+    bool data_region;
     uint32_t start_address;
     uint32_t size;
     PorpoiseAsmItem *items;

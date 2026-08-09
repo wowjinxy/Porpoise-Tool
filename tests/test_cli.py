@@ -104,9 +104,25 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     data_output = temporary / "data-output"
     run(TOOL, FIXTURES / "inputs" / "data", "--output", data_output)
     data_report = json.loads((data_output / "porpoise-report.json").read_text(encoding="utf-8"))
-    assert data_report["summary"]["functions"] == 1
-    assert data_report["summary"]["data_words"] == 2
-    assert "0x80300000" in (data_output / "src" / "porpoise_data.c").read_text(encoding="utf-8")
+    assert data_report["summary"]["functions"] == 3
+    assert data_report["summary"]["data_words"] == 4
+    data_statuses = {
+        function["symbol"]: function["status"]
+        for function in data_report["functions"]
+    }
+    assert data_statuses == {
+        "data_user": "lifted",
+        "gap_01_80300100_text": "data",
+        "gap_02_80300200_text": "lifted",
+        "gap_helper": "lifted",
+    }
+    data_source = (data_output / "src" / "porpoise_data.c").read_text(encoding="utf-8")
+    assert "0x80300000" in data_source
+    assert "0x80300100" in data_source
+    assert "0x4D657472" in data_source
+    assert "porpoise_lifted_gap_01_80300100_text" not in (
+        data_output / "include" / "porpoise_generated.h"
+    ).read_text(encoding="utf-8")
 
     no_entry = temporary / "no-entry"
     run(TOOL, FIXTURES / "inputs" / "basic", "--output", no_entry)
@@ -140,15 +156,17 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         if instruction["semantic_test"]
     }
     assert semantic_mnemonics == {
+        ".4byte",
         "add", "addc", "adde", "addi", "addic.", "addze", "andc",
-        "bctrl", "beq+", "beqlr", "bgelr", "bgtlr", "bl", "ble+", "blelr",
-        "blrl", "bltlr", "bne", "bnelr", "clrlslwi", "clrlwi", "clrrwi",
+        "bctrl", "bdz", "beq+", "beqlr", "bgelr", "bgtlr", "bl", "bla",
+        "ble+", "blelr", "blrl", "bltlr", "bne", "bne+", "bnelr",
+        "clrlslwi", "clrlwi", "clrrwi",
         "cmpwi", "cntlzw", "crclr", "cror", "crset", "divw", "divw.",
-        "divwu", "divwu.", "extlwi", "extrwi", "extsb", "extsh", "fabs.",
-        "fadd", "fadds", "fcmpo", "fcmpu", "fctiwz", "fctiwz.", "fmadd",
+        "divwu", "divwu.", "eqv", "extlwi", "extrwi", "extsb", "extsh", "fabs.",
+        "fadd", "fadds", "fcmpo", "fcmpu", "fctiw", "fctiw.", "fctiwz", "fctiwz.", "fmadd",
         "fmadd.", "fmadds", "fmadds.", "fmr.", "fmsub", "fmsubs", "fnabs.",
         "fneg.", "fnmadd", "fnmadds", "fnmsub", "fnmsubs", "frsp", "frsp.",
-        "fsel", "fsel.", "lbzx", "lfsx", "lhzx", "li", "lis", "lmw", "mffs",
+        "fsel", "fsel.", "lbzx", "lfsx", "lhbrx", "lhzx", "li", "lis", "lmw", "mffs",
         "mffs.",
         "lwz", "lwzux", "lwzx", "mtctr", "mulhw", "mulhwu", "mullw", "neg",
         "mtfsb1", "mtfsb1.", "mtfsf", "mtfsf.", "nor", "orc", "ori",
@@ -158,8 +176,8 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "ps_neg", "ps_nmadd", "ps_nmsub", "ps_sel", "ps_sum0", "ps_sum1",
         "psq_l", "psq_lu", "psq_lux", "psq_lx", "psq_st", "psq_stu",
         "psq_stux", "psq_stx",
-        "rlwinm", "rlwinm.", "rlwnm", "rotlwi", "rotrwi", "slw", "slwi", "sraw.", "srawi", "srwi",
-        "srwi.", "stbx", "stfsx", "sthbrx", "sthx", "stmw", "stw", "stwux",
+        "rlwinm", "rlwinm.", "rlwnm", "rotlw", "rotlwi", "rotrwi", "slw", "slwi", "sraw.", "srawi", "srwi",
+        "srwi.", "stbx", "stfiwx", "stfsx", "sthbrx", "sthx", "stmw", "stw", "stwux",
         "stwx", "subfc", "subfe", "subfic", "subfze", "subfze.", "subi",
         "subic", "subic.", "subis", "sync",
     }
@@ -178,11 +196,11 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         assert all(instruction["detail"] == conditional_return_detail for instruction in entries)
         assert all(instruction["semantic_test"] for instruction in entries)
     for mnemonic in {
-        "beq+", "ble+", "blrl", "divw", "divw.", "divwu", "divwu.",
-        "fctiwz", "fctiwz.", "mffs", "mffs.", "mtfsb1", "mtfsb1.",
-        "mtfsf", "mtfsf.", "mulhw", "mulhwu", "orc", "ps_cmpo0", "ps_merge00", "ps_merge01",
-        "ps_merge10", "ps_merge11", "ps_mr", "ps_neg", "ps_sel", "rlwnm",
-        "sthbrx", "subfze", "subfze.",
+        "bdz", "beq+", "bla", "ble+", "blrl", "bne+", "divw", "divw.", "divwu", "divwu.",
+        "fctiw", "fctiw.", "fctiwz", "fctiwz.", "lhbrx", "mffs", "mffs.", "mtfsb1", "mtfsb1.",
+        "eqv", "mtfsf", "mtfsf.", "mulhw", "mulhwu", "orc", "ps_cmpo0", "ps_merge00", "ps_merge01",
+        "ps_merge10", "ps_merge11", "ps_mr", "ps_neg", "ps_sel", "rlwnm", "rotlw",
+        "stfiwx", "sthbrx", "subfze", "subfze.",
     }:
         entries = [
             instruction
@@ -205,6 +223,15 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
             )
             for instruction in entries
         )
+    raw_entries = [
+        instruction
+        for instruction in opcode_report["instructions"]
+        if instruction["mnemonic"] == ".4byte"
+    ]
+    assert [(entry["status"], entry["semantic_test"]) for entry in raw_entries] == [
+        ("approximate", True),
+        ("approximate", True),
+    ]
     scalar_frsp_detail = (
         "runtime duplicates lane 0 into architecturally undefined destination lane 1 "
         "for deterministic compatibility"
@@ -305,7 +332,7 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "#include <porpoise/stub.h>\n"
         "#define CHECK(condition) do { if (!(condition)) abort(); } while (0)\n"
         "int main(void) {\n"
-        "  PorpoiseHostAdapter host; PorpoisePpcState state;\n"
+        "  PorpoiseHostAdapter host; PorpoisePpcState state; unsigned int raw_index;\n"
         "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
         "  porpoise_state_init(&state, &host);\n"
         "  porpoise_lifted_integer_semantics(&state);\n"
@@ -379,6 +406,13 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "  porpoise_lifted_scalar_fctiwz_semantics(&state);\n"
         "  CHECK(porpoise_fpr_get_bits(&state, 2U, 0U) == UINT64_C(0xFFF8000000000001) && porpoise_fpr_get_bits(&state, 2U, 1U) == UINT64_C(0x1122334455667788));\n"
         "  CHECK(porpoise_fpr_get_bits(&state, 3U, 0U) == UINT64_C(0xFFF8000000000001) && porpoise_fpr_get_bits(&state, 3U, 1U) == UINT64_C(0x8877665544332211));\n"
+        "  CHECK(porpoise_cr_get_field(&state, 1U) == (uint8_t)((state.fpscr >> 28U) & 0xFU));\n"
+        "  state.fpscr = 0U; porpoise_fpr_set_f64(&state, 1U, 0U, 1.5);\n"
+        "  porpoise_fpr_set_bits(&state, 2U, 1U, UINT64_C(0x1020304050607080)); porpoise_fpr_set_bits(&state, 3U, 1U, UINT64_C(0x8070605040302010));\n"
+        "  porpoise_lifted_scalar_fctiw_semantics(&state);\n"
+        "  CHECK(!porpoise_state_has_fault(&state));\n"
+        "  CHECK(porpoise_fpr_get_bits(&state, 2U, 0U) == UINT64_C(0xFFF8000000000002) && porpoise_fpr_get_bits(&state, 2U, 1U) == UINT64_C(0x1020304050607080));\n"
+        "  CHECK(porpoise_fpr_get_bits(&state, 3U, 0U) == UINT64_C(0xFFF8000000000002) && porpoise_fpr_get_bits(&state, 3U, 1U) == UINT64_C(0x8070605040302010));\n"
         "  CHECK(porpoise_cr_get_field(&state, 1U) == (uint8_t)((state.fpscr >> 28U) & 0xFU));\n"
         "  state.fpscr = PORPOISE_FPSCR_FX | PORPOISE_FPSCR_OX | PORPOISE_FPSCR_NI | 1U;\n"
         "  porpoise_fpr_set_bits(&state, 2U, 1U, UINT64_C(0x13579BDF2468ACE0)); porpoise_fpr_set_bits(&state, 3U, 1U, UINT64_C(0x02468ACE13579BDF));\n"
@@ -483,6 +517,9 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "  CHECK(state.gpr[5] == 0xFFFFFFFBU && state.gpr[6] == 5U);\n"
         "  CHECK(state.gpr[9] == 0xFFFFFFFFU && state.gpr[12] == 2U);\n"
         "  CHECK(state.gpr[13] == 0x00567800U && state.gpr[16] == 0xFFFFFF0FU);\n"
+        "  state.gpr[3] = 0x12345678U; state.gpr[4] = 0x00FF00FFU; state.gpr[8] = 8U;\n"
+        "  porpoise_lifted_integer_alias_semantics(&state);\n"
+        "  CHECK(state.gpr[5] == 0xED34A978U && state.gpr[7] == 0x34567812U);\n"
         "  state.gpr[3] = 0xFFFFFFFFU; state.gpr[4] = 0U; state.gpr[7] = 123U; state.gpr[8] = 0U;\n"
         "  state.gpr[10] = 0x80000000U; state.gpr[11] = 0xFFFFFFFFU; state.xer = 0x80000000U;\n"
         "  porpoise_lifted_remaining_divide_exception_semantics(&state);\n"
@@ -502,8 +539,31 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "  state.gpr[3] = 0x80000500U; state.gpr[4] = 2U; state.gpr[5] = 0x1234U;\n"
         "  porpoise_lifted_remaining_sthbrx_semantics(&state);\n"
         "  CHECK(!porpoise_state_has_fault(&state) && porpoise_load_u16(&state, 0x80000502U) == 0x3412U);\n"
+        "  state.gpr[0] = UINT32_C(0xDEADBEEF); state.gpr[3] = UINT32_C(0x80000700); state.gpr[5] = 1U; state.gpr[7] = 7U; state.gpr[9] = UINT32_C(0x80000710);\n"
+        "  porpoise_fpr_set_bits(&state, 4U, 0U, UINT64_C(0xAABBCCDD11223344)); porpoise_fpr_set_bits(&state, 4U, 1U, UINT64_C(0x5566778899AABBCC));\n"
+        "  porpoise_store_u16(&state, UINT32_C(0x80000707), UINT16_C(0x1234)); porpoise_store_u16(&state, UINT32_C(0x80000710), UINT16_C(0xABCD));\n"
+        "  porpoise_lifted_integer_word_memory_semantics(&state);\n"
+        "  CHECK(!porpoise_state_has_fault(&state) && porpoise_load_u32(&state, UINT32_C(0x80000701)) == UINT32_C(0x11223344));\n"
+        "  CHECK(state.gpr[6] == UINT32_C(0x3412) && state.gpr[8] == UINT32_C(0xCDAB));\n"
+        "  CHECK(porpoise_fpr_get_bits(&state, 4U, 0U) == UINT64_C(0xAABBCCDD11223344) && porpoise_fpr_get_bits(&state, 4U, 1U) == UINT64_C(0x5566778899AABBCC));\n"
         "  porpoise_lifted_remaining_branch_hint_semantics(&state);\n"
         "  CHECK(state.gpr[4] == 0U);\n"
+        "  state.pc = 0U; state.gpr[3] = 1U;\n"
+        "  porpoise_lifted_predicted_not_equal_branch_semantics(&state);\n"
+        "  CHECK(state.gpr[4] == 0U);\n"
+        "  state.pc = 0U; state.gpr[3] = 0U;\n"
+        "  porpoise_lifted_predicted_not_equal_branch_semantics(&state);\n"
+        "  CHECK(state.gpr[4] == 1U);\n"
+        "  state.pc = 0U; state.ctr = 1U;\n"
+        "  porpoise_lifted_counter_zero_branch_semantics(&state);\n"
+        "  CHECK(state.ctr == 0U && state.gpr[5] == 1U);\n"
+        "  state.pc = 0U; state.ctr = 2U;\n"
+        "  porpoise_lifted_counter_zero_branch_semantics(&state);\n"
+        "  CHECK(state.ctr == 1U && state.gpr[5] == 2U);\n"
+        "  state.pc = 0U;\n"
+        "  porpoise_lifted_absolute_link_branch_semantics(&state);\n"
+        "  CHECK(!porpoise_state_has_fault(&state) && state.gpr[6] == 0x33U);\n"
+        "  CHECK(state.gpr[7] == 0x80006E88U && state.lr == 0x80006E88U);\n"
         "  state.gpr[3] = 0xA1U; porpoise_cr_set_field(&state, 0U, 2U);\n"
         "  porpoise_lifted_remaining_beqlr_semantics(&state); CHECK(state.gpr[3] == 0xA1U);\n"
         "  state.gpr[3] = 0xA2U; porpoise_cr_set_field(&state, 1U, 0U);\n"
@@ -685,6 +745,19 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "  porpoise_lifted_fault_propagation(&state);\n"
         "  CHECK(porpoise_state_has_fault(&state));\n"
         "  CHECK(state.gpr[5] == 1U);\n"
+        "  porpoise_state_init(&state, &host);\n"
+        "  for (raw_index = 0U; raw_index < 32U; raw_index++)\n"
+        "    porpoise_store_u32(&state, 0x80000600U + raw_index * 4U, 0xA0000000U + raw_index);\n"
+        "  CHECK(!porpoise_state_has_fault(&state)); state.gpr[3] = 0x80000600U;\n"
+        "  porpoise_lifted_raw_lmw_overlap_semantics(&state);\n"
+        "  CHECK(!porpoise_state_has_fault(&state));\n"
+        "  for (raw_index = 0U; raw_index < 32U; raw_index++)\n"
+        "    CHECK(state.gpr[raw_index] == 0xA0000000U + raw_index);\n"
+        "  CHECK(state.pc == 0x80019014U);\n"
+        "  porpoise_state_init(&state, &host);\n"
+        "  porpoise_lifted_raw_invalid_encoding_semantics(&state);\n"
+        "  CHECK(state.fault == PORPOISE_FAULT_ILLEGAL_INSTRUCTION);\n"
+        "  CHECK(state.fault_address == 0x80019000U);\n"
         "  porpoise_libporpoise_adapter_shutdown(&host);\n"
         "  return 0;\n"
         "}\n",
@@ -760,6 +833,65 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     )
     run(TOOL, invalid_noop, "--output", temporary / "invalid-noop-output", expected=3)
 
+    unsupported_raw = temporary / "unsupported-raw.s"
+    unsupported_raw.write_text(
+        ".text\n.fn unsupported_raw, global\n"
+        "/* 80006080 00000000  FF FF FF FF */ .4byte 0xFFFFFFFF\n"
+        ".endfn unsupported_raw\n",
+        encoding="utf-8",
+    )
+    unsupported_raw_result = run(
+        TOOL,
+        unsupported_raw,
+        "--output",
+        temporary / "unsupported-raw-output",
+        expected=3,
+    )
+    assert "unsupported raw-word directive .4byte" in unsupported_raw_result.stderr
+
+    mismatched_raw = temporary / "mismatched-raw.s"
+    mismatched_raw.write_text(
+        ".text\n.fn mismatched_raw, global\n"
+        "/* 80006080 00000000  FF FF FF FF */ .4byte 0x00000000 /* invalid */\n"
+        ".endfn mismatched_raw\n",
+        encoding="utf-8",
+    )
+    mismatched_raw_result = run(
+        TOOL,
+        mismatched_raw,
+        "--output",
+        temporary / "mismatched-raw-output",
+        expected=3,
+    )
+    assert "invalid raw-word directive .4byte" in mismatched_raw_result.stderr
+
+    approximate_raw = temporary / "approximate-raw.s"
+    approximate_raw.write_text(
+        ".text\n.fn approximate_raw, global\n"
+        "/* 80006080 00000000  B8 03 00 00 */ .4byte 0xB8030000 /* illegal: lmw r0, 0x0(r3) */\n"
+        "/* 80006084 00000004  4E 80 00 20 */ blr\n"
+        ".endfn approximate_raw\n",
+        encoding="utf-8",
+    )
+    approximate_raw_output = temporary / "approximate-raw-output"
+    approximate_raw_result = run(
+        TOOL,
+        approximate_raw,
+        "--output",
+        approximate_raw_output,
+    )
+    assert ".4byte directive uses approximate host semantics" in approximate_raw_result.stderr
+    approximate_raw_strict = temporary / "approximate-raw-strict"
+    run(
+        TOOL,
+        approximate_raw,
+        "--output",
+        approximate_raw_strict,
+        "--strict",
+        expected=3,
+    )
+    assert not approximate_raw_strict.exists()
+
     invalid_opcode_cases = {
         "slwi-width": "slwi r3, r4, 32",
         "extrwi-zero": "extrwi r3, r4, 0, 0",
@@ -771,10 +903,17 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "lwzux-zero-base": "lwzux r3, r0, r4",
         "lwzux-destination-base": "lwzux r3, r3, r4",
         "rlwnm-mask-range": "rlwnm r3, r4, r5, 32, 0",
+        "rotlw-register-kind": "rotlw r3, r4, 8",
+        "eqv-arity": "eqv r3, r4",
+        "bdz-arity": "bdz cr0, target",
+        "bla-misaligned-target": "bla 3",
         "conditional-return-operands": "beqlr cr0, extra",
         "paired-madd-arity": "ps_madd f3, f1, f2",
         "paired-compare-field": "ps_cmpo0 cr8, f1, f2",
         "frsp-arity": "frsp f2",
+        "fctiw-arity": "fctiw f2",
+        "stfiwx-register-kind": "stfiwx r3, r4, r5",
+        "lhbrx-arity": "lhbrx r3, r4",
         "mtfsf-mask-range": "mtfsf 256, f1",
         "mtfsb1-bit-range": "mtfsb1 32",
         "mtfsb1-field-range": "mtfsb1 cr8gt",

@@ -682,7 +682,9 @@ static bool write_report(ProjectContext *context) {
             fputs(", \"file\": ", output); porpoise_json_write_string(output, file->relative_path);
             fprintf(output, ", \"address\": %lu, \"size\": %lu, \"status\": \"%s\"}",
                     (unsigned long)function->start_address, (unsigned long)function->size,
-                    function->skipped ? "skipped" : "lifted");
+                    function->data_region
+                        ? "data"
+                        : (function->skipped ? "skipped" : "lifted"));
         }
     }
     fputs("\n  ],\n  \"data\": [\n", output);

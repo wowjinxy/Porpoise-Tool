@@ -221,6 +221,14 @@ struct PorpoisePpcState {
     uint32_t pmc[4];
     uint32_t sia;
     uint32_t sda;
+    uint32_t thermal_management[3];
+
+    /*
+     * Architecturally named registers use the fields above. Other encoded
+     * SPR numbers are retained here so monitor/debug save-and-restore code
+     * remains reversible even when host hardware side effects are absent.
+     */
+    uint32_t opaque_spr[1024];
 
     uint64_t time_base_bias;
     uint32_t decrementer_value;
@@ -353,6 +361,11 @@ int porpoise_frsp(
     unsigned int source_register,
     int record);
 int porpoise_fctiwz(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int source_register,
+    int record);
+int porpoise_fctiw(
     PorpoisePpcState *state,
     unsigned int destination_register,
     unsigned int source_register,

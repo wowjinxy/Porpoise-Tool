@@ -139,10 +139,33 @@ static void test_spr_half_swap_and_statuses(void)
     CHECK(instruction.storage_index == 2U);
     CHECK(instruction.status == PORPOISE_LOWERED);
 
+    instruction = resolve_ok("mfspr", "r3, 976", spr_word(false, 3U, 976U));
+    CHECK(instruction.storage == PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR);
+    CHECK(instruction.storage_index == 976U);
+    CHECK(instruction.status == PORPOISE_APPROXIMATE);
+    CHECK(instruction.semantic_test);
+
     instruction = resolve_ok("mfspr", "r3, 600", spr_word(false, 3U, 600U));
     CHECK(instruction.storage == PORPOISE_SYSTEM_STORAGE_UNKNOWN);
     CHECK(instruction.status == PORPOISE_UNSUPPORTED);
     CHECK(!instruction.semantic_test);
+
+    instruction = resolve_ok("mfspr", "r4, THRM1", spr_word(false, 4U, 1020U));
+    CHECK(instruction.storage == PORPOISE_SYSTEM_STORAGE_THERMAL);
+    CHECK(instruction.storage_index == 0U);
+    CHECK(instruction.status == PORPOISE_APPROXIMATE);
+    CHECK(instruction.semantic_test);
+    instruction = resolve_ok("mtspr", "THRM3, r5", spr_word(true, 5U, 1022U));
+    CHECK(instruction.storage == PORPOISE_SYSTEM_STORAGE_THERMAL);
+    CHECK(instruction.storage_index == 2U);
+    CHECK(instruction.status == PORPOISE_APPROXIMATE);
+    CHECK(instruction.semantic_test);
+
+    instruction = resolve_ok("mtspr", "MSSCR1, r6", spr_word(true, 6U, 1015U));
+    CHECK(instruction.storage == PORPOISE_SYSTEM_STORAGE_OPAQUE_SPR);
+    CHECK(instruction.storage_index == 1015U);
+    CHECK(instruction.status == PORPOISE_APPROXIMATE);
+    CHECK(instruction.semantic_test);
 
     instruction = resolve_ok("mfspr", "r4, DSISR", spr_word(false, 4U, 18U));
     CHECK(instruction.storage == PORPOISE_SYSTEM_STORAGE_DSISR);
@@ -367,6 +390,24 @@ static void test_special_resolution_and_emission(void)
     CHECK(strstr(text, "state->gpr[5] & UINT32_C(0xF000000F)") != NULL);
     instruction = resolve_ok("mtcr", "r6", mtcrf_word(6U, 0xFFU));
     CHECK(instruction.cr_mask == UINT32_MAX);
+
+    instruction = resolve_ok(
+        "mcrxr", "cr3", x_word(31U, 12U, 0U, 0U, 512U));
+    CHECK(instruction.operation == PORPOISE_SYSTEM_MCRXR);
+    CHECK(instruction.storage_index == 3U);
+    CHECK(instruction.status == PORPOISE_LOWERED);
+    emit_text(&instruction, UINT32_C(0x8000100A), text, sizeof(text));
+    CHECK(strstr(text, "porpoise_cr_set_field(state, 3U") != NULL);
+    CHECK(strstr(text, "state->xer &= UINT32_C(0x0FFFFFFF)") != NULL);
+
+    instruction = resolve_ok(
+        "mfspr", "r20, 976", spr_word(false, 20U, 976U));
+    emit_text(&instruction, UINT32_C(0x8000100B), text, sizeof(text));
+    check_before(text, "porpoise_require_supervisor", "state->gpr[20] = state->opaque_spr[976]");
+    instruction = resolve_ok(
+        "mtspr", "THRM2, r21", spr_word(true, 21U, 1021U));
+    emit_text(&instruction, UINT32_C(0x8000100C), text, sizeof(text));
+    check_before(text, "porpoise_require_supervisor", "state->thermal_management[1] = state->gpr[21]");
 
     instruction = resolve_ok(
         "mftb", "r7", mftb_word(7U, 268U));

@@ -1,4 +1,5 @@
 #include "porpoise/lower.h"
+#include "porpoise/raw_word.h"
 #include "porpoise/system_lower.h"
 #include "porpoise/util.h"
 
@@ -41,12 +42,14 @@ typedef enum LoweringOperation {
     OP_RLWINM,
     OP_RLWIMI,
     OP_RLWNM,
+    OP_ROTLW,
     OP_ROTATE_ALIAS,
     OP_INTEGER_UNARY,
     OP_LOAD,
     OP_STORE,
     OP_INDEXED_LOAD,
     OP_INDEXED_STORE,
+    OP_BYTE_REVERSE_LOAD,
     OP_BYTE_REVERSE_STORE,
     OP_PSQ_DFORM,
     OP_PSQ_INDEXED,
@@ -61,6 +64,7 @@ typedef enum LoweringOperation {
     OP_CONDITIONAL_BRANCH,
     OP_CONDITIONAL_RETURN,
     OP_BDNZ,
+    OP_BDZ,
     OP_MFLR,
     OP_MTLR,
     OP_MFCTR,
@@ -73,6 +77,7 @@ typedef enum LoweringOperation {
     OP_FLOAT_COMPARE,
     OP_FLOAT_SELECT,
     OP_FRSP,
+    OP_FCTIW,
     OP_FCTIWZ,
     OP_MFFS,
     OP_MTFSF,
@@ -105,7 +110,8 @@ enum {
     MEMORY_S16,
     MEMORY_U32,
     MEMORY_F32,
-    MEMORY_F64
+    MEMORY_F64,
+    MEMORY_FPR_U32
 };
 
 enum {
@@ -133,6 +139,7 @@ enum {
 
 enum {
     LOGICAL_AND_COMPLEMENT = 1,
+    LOGICAL_EQUIVALENT,
     LOGICAL_NOR,
     LOGICAL_NOT,
     LOGICAL_OR_COMPLEMENT
@@ -255,6 +262,8 @@ static const OpcodeSpec OPCODES[] = {
     {"andc", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, true, LOGICAL_AND_COMPLEMENT},
     {"andc.", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, false, LOGICAL_AND_COMPLEMENT},
     {"orc", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, true, LOGICAL_OR_COMPLEMENT},
+    {"eqv", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, true, LOGICAL_EQUIVALENT},
+    {"eqv.", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, false, LOGICAL_EQUIVALENT},
     {"nor", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, true, LOGICAL_NOR},
     {"nor.", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, false, LOGICAL_NOR},
     {"not", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, false, LOGICAL_NOT},
@@ -276,6 +285,8 @@ static const OpcodeSpec OPCODES[] = {
     {"rlwimi", OP_RLWIMI, PORPOISE_LOWERED, false, 0},
     {"rlwimi.", OP_RLWIMI, PORPOISE_LOWERED, false, 0},
     {"rlwnm", OP_RLWNM, PORPOISE_LOWERED, true, 0},
+    {"rotlw", OP_ROTLW, PORPOISE_LOWERED, true, 0},
+    {"rotlw.", OP_ROTLW, PORPOISE_LOWERED, false, 0},
     {"slwi", OP_ROTATE_ALIAS, PORPOISE_LOWERED, true, ROTATE_SHIFT_LEFT_IMMEDIATE},
     {"slwi.", OP_ROTATE_ALIAS, PORPOISE_LOWERED, false, ROTATE_SHIFT_LEFT_IMMEDIATE},
     {"srwi", OP_ROTATE_ALIAS, PORPOISE_LOWERED, true, ROTATE_SHIFT_RIGHT_IMMEDIATE},
@@ -346,6 +357,8 @@ static const OpcodeSpec OPCODES[] = {
     {"stfsux", OP_INDEXED_STORE, PORPOISE_LOWERED, false, -MEMORY_F32},
     {"stfdx", OP_INDEXED_STORE, PORPOISE_LOWERED, false, MEMORY_F64},
     {"stfdux", OP_INDEXED_STORE, PORPOISE_LOWERED, false, -MEMORY_F64},
+    {"stfiwx", OP_INDEXED_STORE, PORPOISE_LOWERED, true, MEMORY_FPR_U32},
+    {"lhbrx", OP_BYTE_REVERSE_LOAD, PORPOISE_LOWERED, true, 0},
     {"sthbrx", OP_BYTE_REVERSE_STORE, PORPOISE_LOWERED, true, 0},
     {"psq_l", OP_PSQ_DFORM, PORPOISE_APPROXIMATE, true, 0},
     {"psq_lu", OP_PSQ_DFORM, PORPOISE_APPROXIMATE, true, PSQ_UPDATE},
@@ -359,6 +372,7 @@ static const OpcodeSpec OPCODES[] = {
     {"stmw", OP_STORE_MULTIPLE, PORPOISE_LOWERED, true, 0},
     {"b", OP_B, PORPOISE_LOWERED, false, 0},
     {"bl", OP_BL, PORPOISE_LOWERED, true, 0},
+    {"bla", OP_BL, PORPOISE_LOWERED, true, 0},
     {"blr", OP_BLR, PORPOISE_APPROXIMATE, false, 0},
     {"blrl", OP_BLRL, PORPOISE_LOWERED, true, 0},
     {"bctr", OP_BCTR, PORPOISE_LOWERED, false, 0},
@@ -366,6 +380,7 @@ static const OpcodeSpec OPCODES[] = {
     {"beq", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, false, 2},
     {"beq+", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, true, 2},
     {"bne", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, true, -2},
+    {"bne+", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, true, -2},
     {"blt", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, false, 0},
     {"bge", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, false, 0x100},
     {"bgt", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, false, 1},
@@ -378,6 +393,7 @@ static const OpcodeSpec OPCODES[] = {
     {"bgtlr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, 1},
     {"blelr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, 0x101},
     {"bdnz", OP_BDNZ, PORPOISE_LOWERED, false, 0},
+    {"bdz", OP_BDZ, PORPOISE_LOWERED, true, 0},
     {"mflr", OP_MFLR, PORPOISE_LOWERED, false, 0},
     {"mtlr", OP_MTLR, PORPOISE_LOWERED, false, 0},
     {"mfctr", OP_MFCTR, PORPOISE_LOWERED, false, 0},
@@ -412,6 +428,8 @@ static const OpcodeSpec OPCODES[] = {
     {"fsel.", OP_FLOAT_SELECT, PORPOISE_LOWERED, true, 0},
     {"frsp", OP_FRSP, PORPOISE_APPROXIMATE, true, 0},
     {"frsp.", OP_FRSP, PORPOISE_APPROXIMATE, true, 0},
+    {"fctiw", OP_FCTIW, PORPOISE_LOWERED, true, 0},
+    {"fctiw.", OP_FCTIW, PORPOISE_LOWERED, true, 0},
     {"fctiwz", OP_FCTIWZ, PORPOISE_LOWERED, true, 0},
     {"fctiwz.", OP_FCTIWZ, PORPOISE_LOWERED, true, 0},
     {"mffs", OP_MFFS, PORPOISE_LOWERED, true, 0},
@@ -915,6 +933,15 @@ static bool emit_branch_target(
     uint32_t target_address;
     size_t target_item_index;
     if (!normalize_branch_target(target_text, target, sizeof(target))) return false;
+    if (parse_unsigned(target, &target_address)) {
+        if ((target_address & UINT32_C(3)) != 0U) return false;
+        if (!file_printf(output,
+            "    if (!porpoise_call_address(state, UINT32_C(0x%08lX))) return;\n",
+            (unsigned long)target_address)) return false;
+        if (link)
+            return file_printf(output, "    if (porpoise_state_should_stop(state)) return;\n");
+        return file_printf(output, "    return;\n");
+    }
     if (function_resolve_local_label(function, target, &target_item_index)) {
         if (link) {
             porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, source->relative_path,
@@ -975,6 +1002,12 @@ static bool emit_conditional_target(
     uint32_t target_address;
     size_t target_item_index;
     if (!normalize_branch_target(target_text, target, sizeof(target))) return false;
+    if (parse_unsigned(target, &target_address)) {
+        if ((target_address & UINT32_C(3)) != 0U) return false;
+        return file_printf(output,
+            "    if (%s) { (void)porpoise_call_address(state, UINT32_C(0x%08lX)); return; }\n",
+            condition, (unsigned long)target_address);
+    }
     if (function_resolve_local_label(function, target, &target_item_index)) {
         return file_printf(output, "    if (%s) goto porpoise_entry_item_%lu;\n",
                            condition, (unsigned long)target_item_index);
@@ -1256,6 +1289,8 @@ static bool emit_instruction(
                     !file_printf(output, "    state->gpr[%u] = state->gpr[%u] & ~state->gpr[%u];\n", rd, ra, rb)) return false;
                 if (spec->detail == LOGICAL_OR_COMPLEMENT &&
                     !file_printf(output, "    state->gpr[%u] = state->gpr[%u] | ~state->gpr[%u];\n", rd, ra, rb)) return false;
+                if (spec->detail == LOGICAL_EQUIVALENT &&
+                    !file_printf(output, "    state->gpr[%u] = ~(state->gpr[%u] ^ state->gpr[%u]);\n", rd, ra, rb)) return false;
                 if (spec->detail == LOGICAL_NOR &&
                     !file_printf(output, "    state->gpr[%u] = ~(state->gpr[%u] | state->gpr[%u]);\n", rd, ra, rb)) return false;
             }
@@ -1338,6 +1373,14 @@ static bool emit_instruction(
                     rd, ra, rb, (unsigned long)mb, (unsigned long)me)) return false;
                 return emit_record_update(output, record, rd);
             }
+        case OP_ROTLW:
+            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
+                !parse_register(operands.values[1], 'r', &ra) ||
+                !parse_register(operands.values[2], 'r', &rb) ||
+                !file_printf(output,
+                    "    state->gpr[%u] = porpoise_rotate_left32(state->gpr[%u], state->gpr[%u] & 31U);\n",
+                    rd, ra, rb)) return false;
+            return emit_record_update(output, record, rd);
         case OP_ROTATE_ALIAS: {
             uint32_t first, second = 0U;
             uint32_t shift, mask_begin, mask_end;
@@ -1496,6 +1539,8 @@ static bool emit_instruction(
                     "if (!porpoise_fpr_store_binary32(state, %uU, 0U, ea)) return; ", rd)) return false;
                 if (kind == MEMORY_F64 && !file_printf(output,
                     "if (!porpoise_fpr_store_binary64(state, %uU, 0U, ea)) return; ", rd)) return false;
+                if (kind == MEMORY_FPR_U32 && !file_printf(output,
+                    "porpoise_store_u32(state, ea, (uint32_t)porpoise_fpr_get_bits(state, %uU, 0U)); ", rd)) return false;
             }
             if (!file_printf(output, "if (porpoise_state_has_fault(state)) return; ")) return false;
             if (spec->operation == OP_INDEXED_LOAD) {
@@ -1507,6 +1552,17 @@ static bool emit_instruction(
             if (update && !file_printf(output, "state->gpr[%u] = ea; ", ra)) return false;
             return file_printf(output, "}\n");
         }
+        case OP_BYTE_REVERSE_LOAD:
+            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
+                !parse_register(operands.values[1], 'r', &ra) ||
+                !parse_register(operands.values[2], 'r', &rb)) return false;
+            if (ra == 0U) {
+                if (!file_printf(output, "    { uint32_t ea = state->gpr[%u]; ", rb)) return false;
+            } else if (!file_printf(output,
+                "    { uint32_t ea = state->gpr[%u] + state->gpr[%u]; ", ra, rb)) return false;
+            return file_printf(output,
+                "uint32_t value = porpoise_load_u16(state, ea); if (porpoise_state_has_fault(state)) return; state->gpr[%u] = ((value & UINT32_C(0xFF)) << 8U) | ((value >> 8U) & UINT32_C(0xFF)); }\n",
+                rd);
         case OP_BYTE_REVERSE_STORE:
             if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
                 !parse_register(operands.values[1], 'r', &ra) ||
@@ -1663,10 +1719,14 @@ static bool emit_instruction(
                                negate ? "!" : "", field * 4U + bit);
         }
         case OP_BDNZ:
+        case OP_BDZ:
             if (operands.count != 1U) return false;
             if (!file_printf(output, "    state->ctr -= UINT32_C(1);\n")) return false;
             return emit_conditional_target(output, program, function, abi, operands.values[0],
-                                           "state->ctr != UINT32_C(0)", diagnostics, source, item);
+                                           spec->operation == OP_BDNZ
+                                               ? "state->ctr != UINT32_C(0)"
+                                               : "state->ctr == UINT32_C(0)",
+                                           diagnostics, source, item);
         case OP_MFLR:
         case OP_MFCTR:
         case OP_MFCR:
@@ -1901,11 +1961,13 @@ static bool emit_instruction(
             return file_printf(output,
                 "    if (!porpoise_frsp(state, %uU, %uU, %d)) return;\n",
                 rd, ra, record ? 1 : 0);
+        case OP_FCTIW:
         case OP_FCTIWZ:
             if (operands.count != 2U || !parse_register(operands.values[0], 'f', &rd) ||
                 !parse_register(operands.values[1], 'f', &ra)) return false;
             return file_printf(output,
-                "    if (!porpoise_fctiwz(state, %uU, %uU, %d)) return;\n",
+                "    if (!porpoise_fctiw%s(state, %uU, %uU, %d)) return;\n",
+                spec->operation == OP_FCTIWZ ? "z" : "",
                 rd, ra, record ? 1 : 0);
         case OP_MFFS:
             if (operands.count != 1U || !parse_register(operands.values[0], 'f', &rd))
@@ -1983,6 +2045,122 @@ int porpoise_lower_function(
                 !file_printf(output, "porpoise_entry_item_%lu:\n    ;\n", (unsigned long)index))
                 return PORPOISE_EXIT_IO;
             if (spec == NULL) {
+                PorpoiseRawWordInstruction raw_instruction;
+                PorpoiseRawWordResolveResult raw_result =
+                    porpoise_raw_word_resolve(
+                        item->mnemonic,
+                        item->operands,
+                        item->word,
+                        &raw_instruction);
+
+                if (raw_result == PORPOISE_RAW_WORD_INVALID) {
+                    if (!porpoise_report_add(
+                            report,
+                            source->relative_path,
+                            item->source_line,
+                            item->address,
+                            item->mnemonic,
+                            PORPOISE_UNSUPPORTED,
+                            false,
+                            "raw directive operand does not match the annotated word")) {
+                        return PORPOISE_EXIT_INTERNAL;
+                    }
+                    if (!porpoise_diagnostics_add(
+                            diagnostics,
+                            PORPOISE_SEVERITY_ERROR,
+                            source->relative_path,
+                            item->source_line,
+                            item->address,
+                            "invalid raw-word directive %s: %s",
+                            item->mnemonic,
+                            item->operands)) {
+                        return PORPOISE_EXIT_INTERNAL;
+                    }
+                    result = PORPOISE_EXIT_TRANSLATION;
+                    continue;
+                }
+                if (raw_result == PORPOISE_RAW_WORD_UNSUPPORTED) {
+                    if (!porpoise_report_add(
+                            report,
+                            source->relative_path,
+                            item->source_line,
+                            item->address,
+                            item->mnemonic,
+                            PORPOISE_UNSUPPORTED,
+                            false,
+                            "raw word is not a characterized supported encoding")) {
+                        return PORPOISE_EXIT_INTERNAL;
+                    }
+                    if (!porpoise_diagnostics_add(
+                            diagnostics,
+                            PORPOISE_SEVERITY_ERROR,
+                            source->relative_path,
+                            item->source_line,
+                            item->address,
+                            "unsupported raw-word directive %s: %s",
+                            item->mnemonic,
+                            item->operands)) {
+                        return PORPOISE_EXIT_INTERNAL;
+                    }
+                    result = PORPOISE_EXIT_TRANSLATION;
+                    continue;
+                }
+                if (raw_result == PORPOISE_RAW_WORD_RESOLVED) {
+                    if (!porpoise_report_add(
+                            report,
+                            source->relative_path,
+                            item->source_line,
+                            item->address,
+                            item->mnemonic,
+                            raw_instruction.status,
+                            raw_instruction.semantic_test,
+                            raw_instruction.detail)) {
+                        return PORPOISE_EXIT_INTERNAL;
+                    }
+                    if (raw_instruction.status == PORPOISE_APPROXIMATE) {
+                        if (!porpoise_diagnostics_add(
+                                diagnostics,
+                                options->strict
+                                    ? PORPOISE_SEVERITY_ERROR
+                                    : PORPOISE_SEVERITY_WARNING,
+                                source->relative_path,
+                                item->source_line,
+                                item->address,
+                                "%s directive uses approximate host semantics",
+                                item->mnemonic)) {
+                            return PORPOISE_EXIT_INTERNAL;
+                        }
+                        if (options->strict) {
+                            result = PORPOISE_EXIT_TRANSLATION;
+                            continue;
+                        }
+                    }
+                    if (!file_printf(
+                            output,
+                            "    state->pc = UINT32_C(0x%08lX);\n",
+                            (unsigned long)item->address)) {
+                        return PORPOISE_EXIT_IO;
+                    }
+                    if (!porpoise_raw_word_emit(
+                            output,
+                            &raw_instruction,
+                            item->address)) {
+                        if (ferror(output) != 0) return PORPOISE_EXIT_IO;
+                        if (!porpoise_diagnostics_add(
+                                diagnostics,
+                                PORPOISE_SEVERITY_ERROR,
+                                source->relative_path,
+                                item->source_line,
+                                item->address,
+                                "internal raw-word lowering failure for %s",
+                                item->mnemonic)) {
+                            return PORPOISE_EXIT_INTERNAL;
+                        }
+                        return PORPOISE_EXIT_INTERNAL;
+                    }
+                    continue;
+                }
+
                 PorpoiseSystemInstruction system_instruction;
                 PorpoiseSystemResolveResult system_result =
                     porpoise_system_resolve(

@@ -29,6 +29,7 @@ porpoise_core_sources = files(
   'src/options.c',
   'src/program.c',
   'src/project.c',
+  'src/raw_word.c',
   'src/report.c',
   'src/system_lower.c',
   'src/util.c',
@@ -135,6 +136,17 @@ system_lower_test = executable(
   c_args: ['-Werror'],
 )
 test('system-lowering', system_lower_test)
+
+raw_word_test = executable(
+  'test_raw_word',
+  [
+    'tests/test_raw_word.c',
+    'src/raw_word.c',
+  ],
+  include_directories: porpoise_inc,
+  c_args: ['-Werror'],
+)
+test('raw-word-lowering', raw_word_test)
 
 program_test = executable(
   'test_program',

@@ -141,6 +141,37 @@ EXPECTED_INSTRUCTIONS = {
         True,
         "interrupt-state restoration is modeled but host interrupt machinery is not",
     ),
+    0x80008280: (
+        "mcrxr",
+        "lowered",
+        True,
+        "XER summary, overflow, and carry bits are transferred to the selected CR field and cleared",
+    ),
+    0x80008284: (
+        "mfspr",
+        "approximate",
+        True,
+        "opaque special-purpose register state is preserved but hardware side effects are not modeled",
+    ),
+    0x80008288: (
+        "mtspr",
+        "approximate",
+        True,
+        "opaque special-purpose register state is preserved but hardware side effects are not modeled",
+    ),
+    0x8000828C: (
+        "mfspr",
+        "approximate",
+        True,
+        "state is preserved but hardware control side effects are not modeled",
+    ),
+    0x80008290: (
+        "mtspr",
+        "approximate",
+        True,
+        "state is preserved but hardware control side effects are not modeled",
+    ),
+    0x80008294: ("blr", "approximate", False, RETURN_DETAIL),
 }
 
 
@@ -165,11 +196,11 @@ with tempfile.TemporaryDirectory(
 
     assert report["summary"] == {
         "files": 1,
-        "functions": 3,
+        "functions": 4,
         "data_words": 0,
-        "lowered": 11,
+        "lowered": 12,
         "host_equivalent_noop": 2,
-        "approximate": 14,
+        "approximate": 19,
         "unsupported": 0,
     }
     approximation_addresses = {
@@ -198,6 +229,11 @@ with tempfile.TemporaryDirectory(
         "state->gpr[14] = state->dbat_upper[3]",
         "state->dbat_lower[7] = state->gpr[19]",
         "state->sia = state->gpr[24]",
+        "porpoise_cr_set_field(state, 3U",
+        "state->gpr[22] = state->opaque_spr[976]",
+        "state->opaque_spr[976] = state->gpr[23]",
+        "state->gpr[24] = state->thermal_management[0]",
+        "state->thermal_management[1] = state->gpr[25]",
     ):
         assert fragment in lifted_source
     dispatch_header = (output / "include" / "porpoise_dispatch.h").read_text(
@@ -215,7 +251,7 @@ with tempfile.TemporaryDirectory(
         expected=3,
     )
     assert not strict_output.exists()
-    for mnemonic in ("mftb", "dcbz", "mtibatu", "mtdbatl", "twui", "sc", "rfi"):
+    for mnemonic in ("mftb", "dcbz", "mtibatu", "mtdbatl", "mfspr", "mtspr", "twui", "sc", "rfi"):
         assert f"{mnemonic} instruction uses approximate host semantics" in strict_result.stderr
 
     invalid_word = temporary / "invalid-word.s"
@@ -408,6 +444,23 @@ with tempfile.TemporaryDirectory(
                 for (index = 0U; index < sizeof(read_block); index++) {
                     CHECK(read_block[index] == 0U);
                 }
+
+                porpoise_state_init(&state, &host);
+                state.xer = UINT32_C(0xE1234567);
+                state.cr = UINT32_C(0x89ABCDEF);
+                state.opaque_spr[976] = UINT32_C(0x11112222);
+                state.gpr[23] = UINT32_C(0x33334444);
+                state.thermal_management[0] = UINT32_C(0x55556666);
+                state.gpr[25] = UINT32_C(0x77778888);
+                porpoise_lifted_system_extended_register_semantics(&state);
+                CHECK(!porpoise_state_has_fault(&state));
+                CHECK(state.xer == UINT32_C(0x01234567));
+                CHECK(state.cr == UINT32_C(0x89AECDEF));
+                CHECK(state.gpr[22] == UINT32_C(0x11112222));
+                CHECK(state.opaque_spr[976] == UINT32_C(0x33334444));
+                CHECK(state.gpr[24] == UINT32_C(0x55556666));
+                CHECK(state.thermal_management[1] == UINT32_C(0x77778888));
+                CHECK(state.pc == UINT32_C(0x80008294));
 
                 porpoise_state_init(&state, &host);
                 state.gpr[1] = UINT32_C(0x817FF000);

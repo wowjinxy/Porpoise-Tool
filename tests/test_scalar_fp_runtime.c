@@ -229,6 +229,90 @@ static void test_fctiwz(void)
     CHECK((state.fpscr & PORPOISE_FPSCR_FI) == 0U);
 }
 
+static void test_fctiw_rounding_modes(void)
+{
+    static const struct {
+        uint32_t rounding_mode;
+        double source;
+        uint32_t expected_word;
+        int rounded_away_from_zero;
+    } cases[] = {
+        {0U, 1.5, UINT32_C(2), 1},
+        {0U, 2.5, UINT32_C(2), 0},
+        {0U, -1.5, UINT32_C(0xFFFFFFFE), 1},
+        {1U, 1.75, UINT32_C(1), 0},
+        {1U, -1.75, UINT32_C(0xFFFFFFFF), 0},
+        {2U, 1.25, UINT32_C(2), 1},
+        {2U, -1.25, UINT32_C(0xFFFFFFFF), 0},
+        {3U, 1.25, UINT32_C(1), 0},
+        {3U, -1.25, UINT32_C(0xFFFFFFFE), 1},
+    };
+    size_t index;
+
+    for (index = 0U; index < sizeof(cases) / sizeof(cases[0]); index++) {
+        PorpoisePpcState state;
+
+        porpoise_state_init(&state, NULL);
+        state.fpscr = cases[index].rounding_mode;
+        set_double(&state, 1U, cases[index].source);
+        state.fpr[2].lane_bits[1] = UINT64_C(0x1122334455667788);
+        CHECK(porpoise_fctiw(&state, 2U, 1U, 0));
+        CHECK((uint32_t)state.fpr[2].lane_bits[0] == cases[index].expected_word);
+        CHECK((state.fpr[2].lane_bits[0] >> 32U) == UINT32_C(0xFFF80000));
+        CHECK(state.fpr[2].lane_bits[1] == UINT64_C(0x1122334455667788));
+        CHECK((state.fpscr & (PORPOISE_FPSCR_FI | PORPOISE_FPSCR_XX)) ==
+              (PORPOISE_FPSCR_FI | PORPOISE_FPSCR_XX));
+        CHECK(((state.fpscr & PORPOISE_FPSCR_FR) != 0U) ==
+              cases[index].rounded_away_from_zero);
+    }
+}
+
+static void test_fctiw_boundaries_and_exceptions(void)
+{
+    PorpoisePpcState state;
+
+    porpoise_state_init(&state, NULL);
+    state.fpscr = 0U;
+    set_double(&state, 1U, 2147483647.5);
+    CHECK(porpoise_fctiw(&state, 2U, 1U, 0));
+    CHECK(state.fpr[2].lane_bits[0] == UINT64_C(0xFFF800007FFFFFFF));
+    CHECK((state.fpscr & PORPOISE_FPSCR_VXCVI) != 0U);
+    CHECK((state.fpscr & (PORPOISE_FPSCR_FR | PORPOISE_FPSCR_FI)) == 0U);
+
+    porpoise_state_init(&state, NULL);
+    state.fpscr = 3U;
+    set_double(&state, 1U, -2147483648.25);
+    CHECK(porpoise_fctiw(&state, 2U, 1U, 0));
+    CHECK(state.fpr[2].lane_bits[0] == UINT64_C(0xFFF8000080000000));
+    CHECK((state.fpscr & PORPOISE_FPSCR_VXCVI) != 0U);
+
+    porpoise_state_init(&state, NULL);
+    state.fpscr = 2U;
+    set_double(&state, 1U, -0.25);
+    CHECK(porpoise_fctiw(&state, 2U, 1U, 0));
+    CHECK(state.fpr[2].lane_bits[0] == UINT64_C(0xFFF8000100000000));
+    CHECK((state.fpscr & PORPOISE_FPSCR_FR) == 0U);
+
+    porpoise_state_init(&state, NULL);
+    state.pc = UINT32_C(0x80001234);
+    state.fpscr = PORPOISE_FPSCR_VE | UINT32_C(0x00004000);
+    set_bits(&state, 1U, UINT64_C(0x7FF0000000001234), 0U);
+    set_bits(
+        &state,
+        2U,
+        UINT64_C(0xA5A5A5A5A5A5A5A5),
+        UINT64_C(0x5A5A5A5A5A5A5A5A));
+    CHECK(!porpoise_fctiw(&state, 2U, 1U, 1));
+    CHECK(state.fpr[2].lane_bits[0] == UINT64_C(0xA5A5A5A5A5A5A5A5));
+    CHECK(state.fpr[2].lane_bits[1] == UINT64_C(0x5A5A5A5A5A5A5A5A));
+    CHECK((state.fpscr & (PORPOISE_FPSCR_VXSNAN |
+                          PORPOISE_FPSCR_VXCVI)) ==
+          (PORPOISE_FPSCR_VXSNAN | PORPOISE_FPSCR_VXCVI));
+    CHECK(state.fault == PORPOISE_FAULT_FLOATING_POINT_EXCEPTION);
+    CHECK(porpoise_cr_get_field(&state, 1U) ==
+          (uint8_t)((state.fpscr >> 28U) & 0xFU));
+}
+
 static void test_fpscr_moves(void)
 {
     PorpoisePpcState state;
@@ -433,6 +517,8 @@ int main(void)
 {
     test_frsp_rounding_modes();
     test_frsp_specials_and_range();
+    test_fctiw_rounding_modes();
+    test_fctiw_boundaries_and_exceptions();
     test_fctiwz();
     test_fpscr_moves();
     test_fma_numeric_and_lanes();
