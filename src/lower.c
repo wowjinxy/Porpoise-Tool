@@ -1,4 +1,5 @@
 #include "porpoise/lower.h"
+#include "porpoise/system_lower.h"
 #include "porpoise/util.h"
 
 #include <ctype.h>
@@ -19,7 +20,10 @@ typedef enum LoweringOperation {
     OP_SUBF,
     OP_MULLI,
     OP_MULLW,
+    OP_DIVIDE_WORD,
+    OP_MULTIPLY_HIGH,
     OP_CARRY_ARITHMETIC,
+    OP_SUBFZE,
     OP_AND,
     OP_OR,
     OP_XOR,
@@ -36,20 +40,26 @@ typedef enum LoweringOperation {
     OP_SRAWI,
     OP_RLWINM,
     OP_RLWIMI,
+    OP_RLWNM,
     OP_ROTATE_ALIAS,
     OP_INTEGER_UNARY,
     OP_LOAD,
     OP_STORE,
     OP_INDEXED_LOAD,
     OP_INDEXED_STORE,
+    OP_BYTE_REVERSE_STORE,
+    OP_PSQ_DFORM,
+    OP_PSQ_INDEXED,
     OP_LOAD_MULTIPLE,
     OP_STORE_MULTIPLE,
     OP_B,
     OP_BL,
     OP_BLR,
+    OP_BLRL,
     OP_BCTR,
     OP_BCTRL,
     OP_CONDITIONAL_BRANCH,
+    OP_CONDITIONAL_RETURN,
     OP_BDNZ,
     OP_MFLR,
     OP_MTLR,
@@ -60,7 +70,23 @@ typedef enum LoweringOperation {
     OP_COMPARE,
     OP_FLOAT_BINARY,
     OP_FLOAT_UNARY,
+    OP_FLOAT_COMPARE,
+    OP_FLOAT_SELECT,
+    OP_FRSP,
+    OP_FCTIWZ,
+    OP_MFFS,
+    OP_MTFSF,
+    OP_MTFSB1,
+    OP_FLOAT_FMA,
     OP_PAIRED_BINARY,
+    OP_PAIRED_TERNARY,
+    OP_PAIRED_SCALAR_MADD,
+    OP_PAIRED_SCALAR_MULTIPLY,
+    OP_PAIRED_SUM,
+    OP_PAIRED_MERGE,
+    OP_PAIRED_UNARY,
+    OP_PAIRED_COMPARE,
+    OP_PAIRED_SELECT,
     OP_HOST_NOOP,
     OP_RECIPROCAL_APPROX
 } LoweringOperation;
@@ -83,6 +109,19 @@ enum {
 };
 
 enum {
+    PSQ_STORE = 1,
+    PSQ_UPDATE = 2
+};
+
+typedef enum RelocationKind {
+    RELOCATION_NONE = 0,
+    RELOCATION_LOW,
+    RELOCATION_HIGH,
+    RELOCATION_HIGH_ADJUSTED,
+    RELOCATION_SDA21
+} RelocationKind;
+
+enum {
     CARRY_ADD_IMMEDIATE = 1,
     CARRY_SUBF_IMMEDIATE,
     CARRY_ADD,
@@ -95,7 +134,8 @@ enum {
 enum {
     LOGICAL_AND_COMPLEMENT = 1,
     LOGICAL_NOR,
-    LOGICAL_NOT
+    LOGICAL_NOT,
+    LOGICAL_OR_COMPLEMENT
 };
 
 enum {
@@ -134,6 +174,33 @@ enum {
     FLOAT_NABS
 };
 
+enum {
+    PAIRED_MADD = 1,
+    PAIRED_MSUB,
+    PAIRED_NMADD,
+    PAIRED_NMSUB
+};
+
+enum {
+    PAIRED_MERGE_00 = 1,
+    PAIRED_MERGE_01,
+    PAIRED_MERGE_10,
+    PAIRED_MERGE_11
+};
+
+enum {
+    PAIRED_MOVE = 1,
+    PAIRED_NEGATE
+};
+
+enum {
+    SCALAR_FMA_MADD = 0,
+    SCALAR_FMA_MSUB,
+    SCALAR_FMA_NMADD,
+    SCALAR_FMA_NMSUB,
+    SCALAR_FMA_SINGLE = 0x100
+};
+
 /*
  * This table is deliberately conservative. An opcode is only marked lowered
  * when the generated C implements the behavior represented by the mnemonic.
@@ -154,6 +221,12 @@ static const OpcodeSpec OPCODES[] = {
     {"mulli", OP_MULLI, PORPOISE_LOWERED, false, 0},
     {"mullw", OP_MULLW, PORPOISE_LOWERED, true, 0},
     {"mullw.", OP_MULLW, PORPOISE_LOWERED, false, 0},
+    {"divw", OP_DIVIDE_WORD, PORPOISE_LOWERED, true, 1},
+    {"divw.", OP_DIVIDE_WORD, PORPOISE_LOWERED, true, 1},
+    {"divwu", OP_DIVIDE_WORD, PORPOISE_LOWERED, true, 0},
+    {"divwu.", OP_DIVIDE_WORD, PORPOISE_LOWERED, true, 0},
+    {"mulhw", OP_MULTIPLY_HIGH, PORPOISE_LOWERED, true, 1},
+    {"mulhwu", OP_MULTIPLY_HIGH, PORPOISE_LOWERED, true, 0},
     {"addic", OP_CARRY_ARITHMETIC, PORPOISE_LOWERED, false, CARRY_ADD_IMMEDIATE},
     {"addic.", OP_CARRY_ARITHMETIC, PORPOISE_LOWERED, true, CARRY_ADD_IMMEDIATE},
     {"subic", OP_CARRY_ARITHMETIC, PORPOISE_LOWERED, true, -CARRY_ADD_IMMEDIATE},
@@ -169,6 +242,8 @@ static const OpcodeSpec OPCODES[] = {
     {"subfc.", OP_CARRY_ARITHMETIC, PORPOISE_LOWERED, false, CARRY_SUBF},
     {"subfe", OP_CARRY_ARITHMETIC, PORPOISE_LOWERED, true, CARRY_SUBF_EXTENDED},
     {"subfe.", OP_CARRY_ARITHMETIC, PORPOISE_LOWERED, false, CARRY_SUBF_EXTENDED},
+    {"subfze", OP_SUBFZE, PORPOISE_LOWERED, true, 0},
+    {"subfze.", OP_SUBFZE, PORPOISE_LOWERED, true, 0},
     {"and", OP_AND, PORPOISE_LOWERED, false, 0},
     {"and.", OP_AND, PORPOISE_LOWERED, false, 0},
     {"or", OP_OR, PORPOISE_LOWERED, false, 0},
@@ -179,6 +254,7 @@ static const OpcodeSpec OPCODES[] = {
     {"xor.", OP_XOR, PORPOISE_LOWERED, false, 0},
     {"andc", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, true, LOGICAL_AND_COMPLEMENT},
     {"andc.", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, false, LOGICAL_AND_COMPLEMENT},
+    {"orc", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, true, LOGICAL_OR_COMPLEMENT},
     {"nor", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, true, LOGICAL_NOR},
     {"nor.", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, false, LOGICAL_NOR},
     {"not", OP_LOGICAL_COMPLEMENT, PORPOISE_LOWERED, false, LOGICAL_NOT},
@@ -199,6 +275,7 @@ static const OpcodeSpec OPCODES[] = {
     {"rlwinm.", OP_RLWINM, PORPOISE_LOWERED, true, 0},
     {"rlwimi", OP_RLWIMI, PORPOISE_LOWERED, false, 0},
     {"rlwimi.", OP_RLWIMI, PORPOISE_LOWERED, false, 0},
+    {"rlwnm", OP_RLWNM, PORPOISE_LOWERED, true, 0},
     {"slwi", OP_ROTATE_ALIAS, PORPOISE_LOWERED, true, ROTATE_SHIFT_LEFT_IMMEDIATE},
     {"slwi.", OP_ROTATE_ALIAS, PORPOISE_LOWERED, false, ROTATE_SHIFT_LEFT_IMMEDIATE},
     {"srwi", OP_ROTATE_ALIAS, PORPOISE_LOWERED, true, ROTATE_SHIFT_RIGHT_IMMEDIATE},
@@ -269,19 +346,37 @@ static const OpcodeSpec OPCODES[] = {
     {"stfsux", OP_INDEXED_STORE, PORPOISE_LOWERED, false, -MEMORY_F32},
     {"stfdx", OP_INDEXED_STORE, PORPOISE_LOWERED, false, MEMORY_F64},
     {"stfdux", OP_INDEXED_STORE, PORPOISE_LOWERED, false, -MEMORY_F64},
+    {"sthbrx", OP_BYTE_REVERSE_STORE, PORPOISE_LOWERED, true, 0},
+    {"psq_l", OP_PSQ_DFORM, PORPOISE_APPROXIMATE, true, 0},
+    {"psq_lu", OP_PSQ_DFORM, PORPOISE_APPROXIMATE, true, PSQ_UPDATE},
+    {"psq_st", OP_PSQ_DFORM, PORPOISE_APPROXIMATE, true, PSQ_STORE},
+    {"psq_stu", OP_PSQ_DFORM, PORPOISE_APPROXIMATE, true, PSQ_STORE | PSQ_UPDATE},
+    {"psq_lx", OP_PSQ_INDEXED, PORPOISE_APPROXIMATE, true, 0},
+    {"psq_lux", OP_PSQ_INDEXED, PORPOISE_APPROXIMATE, true, PSQ_UPDATE},
+    {"psq_stx", OP_PSQ_INDEXED, PORPOISE_APPROXIMATE, true, PSQ_STORE},
+    {"psq_stux", OP_PSQ_INDEXED, PORPOISE_APPROXIMATE, true, PSQ_STORE | PSQ_UPDATE},
     {"lmw", OP_LOAD_MULTIPLE, PORPOISE_LOWERED, true, 0},
     {"stmw", OP_STORE_MULTIPLE, PORPOISE_LOWERED, true, 0},
     {"b", OP_B, PORPOISE_LOWERED, false, 0},
     {"bl", OP_BL, PORPOISE_LOWERED, true, 0},
     {"blr", OP_BLR, PORPOISE_APPROXIMATE, false, 0},
+    {"blrl", OP_BLRL, PORPOISE_LOWERED, true, 0},
     {"bctr", OP_BCTR, PORPOISE_LOWERED, false, 0},
     {"bctrl", OP_BCTRL, PORPOISE_LOWERED, true, 0},
     {"beq", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, false, 2},
+    {"beq+", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, true, 2},
     {"bne", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, true, -2},
     {"blt", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, false, 0},
     {"bge", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, false, 0x100},
     {"bgt", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, false, 1},
     {"ble", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, false, 0x101},
+    {"ble+", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, true, 0x101},
+    {"beqlr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, 2},
+    {"bnelr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, -2},
+    {"bltlr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, 0},
+    {"bgelr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, 0x100},
+    {"bgtlr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, 1},
+    {"blelr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, 0x101},
     {"bdnz", OP_BDNZ, PORPOISE_LOWERED, false, 0},
     {"mflr", OP_MFLR, PORPOISE_LOWERED, false, 0},
     {"mtlr", OP_MTLR, PORPOISE_LOWERED, false, 0},
@@ -295,21 +390,74 @@ static const OpcodeSpec OPCODES[] = {
     {"cmplwi", OP_COMPARE, PORPOISE_LOWERED, false, 2},
     {"cmpw", OP_COMPARE, PORPOISE_LOWERED, false, 3},
     {"cmplw", OP_COMPARE, PORPOISE_LOWERED, false, 4},
-    {"fadd", OP_FLOAT_BINARY, PORPOISE_LOWERED, true, FLOAT_ADD},
-    {"fadds", OP_FLOAT_BINARY, PORPOISE_LOWERED, false, FLOAT_ADD},
-    {"fsub", OP_FLOAT_BINARY, PORPOISE_LOWERED, false, FLOAT_SUB},
-    {"fsubs", OP_FLOAT_BINARY, PORPOISE_LOWERED, false, FLOAT_SUB},
-    {"fmul", OP_FLOAT_BINARY, PORPOISE_LOWERED, false, FLOAT_MUL},
-    {"fmuls", OP_FLOAT_BINARY, PORPOISE_LOWERED, false, FLOAT_MUL},
-    {"fdiv", OP_FLOAT_BINARY, PORPOISE_LOWERED, false, FLOAT_DIV},
-    {"fdivs", OP_FLOAT_BINARY, PORPOISE_LOWERED, false, FLOAT_DIV},
+    {"fadd", OP_FLOAT_BINARY, PORPOISE_APPROXIMATE, true, FLOAT_ADD},
+    {"fadds", OP_FLOAT_BINARY, PORPOISE_APPROXIMATE, true, FLOAT_ADD},
+    {"fsub", OP_FLOAT_BINARY, PORPOISE_APPROXIMATE, false, FLOAT_SUB},
+    {"fsubs", OP_FLOAT_BINARY, PORPOISE_APPROXIMATE, false, FLOAT_SUB},
+    {"fmul", OP_FLOAT_BINARY, PORPOISE_APPROXIMATE, false, FLOAT_MUL},
+    {"fmuls", OP_FLOAT_BINARY, PORPOISE_APPROXIMATE, false, FLOAT_MUL},
+    {"fdiv", OP_FLOAT_BINARY, PORPOISE_APPROXIMATE, false, FLOAT_DIV},
+    {"fdivs", OP_FLOAT_BINARY, PORPOISE_APPROXIMATE, false, FLOAT_DIV},
     {"fmr", OP_FLOAT_UNARY, PORPOISE_LOWERED, false, FLOAT_MOVE},
+    {"fmr.", OP_FLOAT_UNARY, PORPOISE_LOWERED, true, FLOAT_MOVE},
     {"fneg", OP_FLOAT_UNARY, PORPOISE_LOWERED, false, FLOAT_NEG},
+    {"fneg.", OP_FLOAT_UNARY, PORPOISE_LOWERED, true, FLOAT_NEG},
     {"fabs", OP_FLOAT_UNARY, PORPOISE_LOWERED, false, FLOAT_ABS},
+    {"fabs.", OP_FLOAT_UNARY, PORPOISE_LOWERED, true, FLOAT_ABS},
     {"fnabs", OP_FLOAT_UNARY, PORPOISE_LOWERED, false, FLOAT_NABS},
-    {"ps_add", OP_PAIRED_BINARY, PORPOISE_LOWERED, true, FLOAT_ADD},
-    {"ps_sub", OP_PAIRED_BINARY, PORPOISE_LOWERED, false, FLOAT_SUB},
-    {"ps_mul", OP_PAIRED_BINARY, PORPOISE_LOWERED, false, FLOAT_MUL},
+    {"fnabs.", OP_FLOAT_UNARY, PORPOISE_LOWERED, true, FLOAT_NABS},
+    {"fcmpo", OP_FLOAT_COMPARE, PORPOISE_LOWERED, true, 1},
+    {"fcmpu", OP_FLOAT_COMPARE, PORPOISE_LOWERED, true, 0},
+    {"fsel", OP_FLOAT_SELECT, PORPOISE_LOWERED, true, 0},
+    {"fsel.", OP_FLOAT_SELECT, PORPOISE_LOWERED, true, 0},
+    {"frsp", OP_FRSP, PORPOISE_APPROXIMATE, true, 0},
+    {"frsp.", OP_FRSP, PORPOISE_APPROXIMATE, true, 0},
+    {"fctiwz", OP_FCTIWZ, PORPOISE_LOWERED, true, 0},
+    {"fctiwz.", OP_FCTIWZ, PORPOISE_LOWERED, true, 0},
+    {"mffs", OP_MFFS, PORPOISE_LOWERED, true, 0},
+    {"mffs.", OP_MFFS, PORPOISE_LOWERED, true, 0},
+    {"mtfsf", OP_MTFSF, PORPOISE_LOWERED, true, 0},
+    {"mtfsf.", OP_MTFSF, PORPOISE_LOWERED, true, 0},
+    {"mtfsb1", OP_MTFSB1, PORPOISE_LOWERED, true, 0},
+    {"mtfsb1.", OP_MTFSB1, PORPOISE_LOWERED, true, 0},
+    {"fmadd", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, true, SCALAR_FMA_MADD},
+    {"fmadd.", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, true, SCALAR_FMA_MADD},
+    {"fmadds", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, true, SCALAR_FMA_MADD | SCALAR_FMA_SINGLE},
+    {"fmadds.", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, true, SCALAR_FMA_MADD | SCALAR_FMA_SINGLE},
+    {"fmsub", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, true, SCALAR_FMA_MSUB},
+    {"fmsub.", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, false, SCALAR_FMA_MSUB},
+    {"fmsubs", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, true, SCALAR_FMA_MSUB | SCALAR_FMA_SINGLE},
+    {"fmsubs.", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, false, SCALAR_FMA_MSUB | SCALAR_FMA_SINGLE},
+    {"fnmadd", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, true, SCALAR_FMA_NMADD},
+    {"fnmadd.", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, false, SCALAR_FMA_NMADD},
+    {"fnmadds", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, true, SCALAR_FMA_NMADD | SCALAR_FMA_SINGLE},
+    {"fnmadds.", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, false, SCALAR_FMA_NMADD | SCALAR_FMA_SINGLE},
+    {"fnmsub", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, true, SCALAR_FMA_NMSUB},
+    {"fnmsub.", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, false, SCALAR_FMA_NMSUB},
+    {"fnmsubs", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, true, SCALAR_FMA_NMSUB | SCALAR_FMA_SINGLE},
+    {"fnmsubs.", OP_FLOAT_FMA, PORPOISE_APPROXIMATE, false, SCALAR_FMA_NMSUB | SCALAR_FMA_SINGLE},
+    {"ps_add", OP_PAIRED_BINARY, PORPOISE_APPROXIMATE, true, FLOAT_ADD},
+    {"ps_sub", OP_PAIRED_BINARY, PORPOISE_APPROXIMATE, false, FLOAT_SUB},
+    {"ps_mul", OP_PAIRED_BINARY, PORPOISE_APPROXIMATE, false, FLOAT_MUL},
+    {"ps_div", OP_PAIRED_BINARY, PORPOISE_APPROXIMATE, true, FLOAT_DIV},
+    {"ps_madd", OP_PAIRED_TERNARY, PORPOISE_APPROXIMATE, true, PAIRED_MADD},
+    {"ps_msub", OP_PAIRED_TERNARY, PORPOISE_APPROXIMATE, true, PAIRED_MSUB},
+    {"ps_nmadd", OP_PAIRED_TERNARY, PORPOISE_APPROXIMATE, true, PAIRED_NMADD},
+    {"ps_nmsub", OP_PAIRED_TERNARY, PORPOISE_APPROXIMATE, true, PAIRED_NMSUB},
+    {"ps_madds0", OP_PAIRED_SCALAR_MADD, PORPOISE_APPROXIMATE, true, 0},
+    {"ps_madds1", OP_PAIRED_SCALAR_MADD, PORPOISE_APPROXIMATE, true, 1},
+    {"ps_muls0", OP_PAIRED_SCALAR_MULTIPLY, PORPOISE_APPROXIMATE, true, 0},
+    {"ps_muls1", OP_PAIRED_SCALAR_MULTIPLY, PORPOISE_APPROXIMATE, true, 1},
+    {"ps_sum0", OP_PAIRED_SUM, PORPOISE_APPROXIMATE, true, 0},
+    {"ps_sum1", OP_PAIRED_SUM, PORPOISE_APPROXIMATE, true, 1},
+    {"ps_merge00", OP_PAIRED_MERGE, PORPOISE_LOWERED, true, PAIRED_MERGE_00},
+    {"ps_merge01", OP_PAIRED_MERGE, PORPOISE_LOWERED, true, PAIRED_MERGE_01},
+    {"ps_merge10", OP_PAIRED_MERGE, PORPOISE_LOWERED, true, PAIRED_MERGE_10},
+    {"ps_merge11", OP_PAIRED_MERGE, PORPOISE_LOWERED, true, PAIRED_MERGE_11},
+    {"ps_mr", OP_PAIRED_UNARY, PORPOISE_LOWERED, true, PAIRED_MOVE},
+    {"ps_neg", OP_PAIRED_UNARY, PORPOISE_LOWERED, true, PAIRED_NEGATE},
+    {"ps_cmpo0", OP_PAIRED_COMPARE, PORPOISE_LOWERED, true, 0},
+    {"ps_sel", OP_PAIRED_SELECT, PORPOISE_LOWERED, true, 0},
     {"sync", OP_HOST_NOOP, PORPOISE_HOST_NOOP, true, 0},
     {"isync", OP_HOST_NOOP, PORPOISE_HOST_NOOP, false, 0},
     {"eieio", OP_HOST_NOOP, PORPOISE_HOST_NOOP, false, 0},
@@ -350,13 +498,57 @@ static bool split_operands(const char *text, OperandList *list) {
         if (*cursor == '\0') break;
         if (list->count == sizeof(list->values) / sizeof(list->values[0])) return false;
         start = cursor;
-        while (*cursor != '\0' && *cursor != ',') cursor++;
+        {
+            bool in_quotes = false;
+            while (*cursor != '\0') {
+                if (in_quotes && *cursor == '\\' &&
+                    (cursor[1] == '\\' || cursor[1] == '"')) {
+                    cursor += 2;
+                    continue;
+                }
+                if (*cursor == '"') {
+                    in_quotes = !in_quotes;
+                    cursor++;
+                    continue;
+                }
+                if (!in_quotes && *cursor == ',') break;
+                cursor++;
+            }
+            if (in_quotes) return false;
+        }
         end = cursor;
         if (*cursor == ',') *cursor++ = '\0';
         while (end > start && isspace((unsigned char)end[-1])) *--end = '\0';
         if (*start == '\0') return false;
         list->values[list->count++] = start;
     }
+    return true;
+}
+
+static bool normalize_branch_target(const char *text, char *target, size_t capacity) {
+    size_t input_index;
+    size_t output_index = 0U;
+    size_t length;
+    if (text == NULL || target == NULL || capacity == 0U) return false;
+    length = strlen(text);
+    if (length == 0U) return false;
+    if (text[0] != '"') {
+        if (strchr(text, '"') != NULL) return false;
+        return porpoise_copy_string(target, capacity, text);
+    }
+    if (length < 2U || text[length - 1U] != '"') return false;
+    for (input_index = 1U; input_index + 1U < length; input_index++) {
+        char character = text[input_index];
+        if (character == '"') return false;
+        if (character == '\\' && input_index + 2U < length &&
+            (text[input_index + 1U] == '\\' || text[input_index + 1U] == '"')) {
+            character = text[++input_index];
+        }
+        if (output_index + 1U >= capacity) return false;
+        target[output_index++] = character;
+    }
+    if (output_index == 0U) return false;
+    target[output_index] = '\0';
     return true;
 }
 
@@ -369,6 +561,11 @@ static bool parse_register(const char *text, char prefix, unsigned int *index) {
     if (errno != 0 || *end != '\0' || value > 31UL) return false;
     *index = (unsigned int)value;
     return true;
+}
+
+static bool parse_gqr_register(const char *text, unsigned int *index) {
+    return text != NULL && text[0] == 'q' &&
+           parse_register(text + 1, 'r', index) && *index < 8U;
 }
 
 static bool parse_unsigned(const char *text, uint32_t *value) {
@@ -399,10 +596,80 @@ static bool parse_signed(const char *text, int32_t *value) {
     return true;
 }
 
-static bool parse_memory_operand(const char *text, int32_t *offset, unsigned int *base) {
+static bool parse_relocation(const char *text, RelocationKind *kind) {
+    const char *at;
+    const char *cursor;
+    if (text == NULL || kind == NULL) return false;
+    at = strrchr(text, '@');
+    if (at == NULL || at == text) return false;
+    if (strcmp(at, "@l") == 0) *kind = RELOCATION_LOW;
+    else if (strcmp(at, "@h") == 0) *kind = RELOCATION_HIGH;
+    else if (strcmp(at, "@ha") == 0) *kind = RELOCATION_HIGH_ADJUSTED;
+    else if (strcmp(at, "@sda21") == 0) *kind = RELOCATION_SDA21;
+    else return false;
+    for (cursor = text; cursor < at; cursor++) {
+        unsigned char character = (unsigned char)*cursor;
+        if (iscntrl(character) || isspace(character) || *cursor == '(' ||
+            *cursor == ')' || *cursor == ',') return false;
+    }
+    return true;
+}
+
+static int32_t decode_signed_immediate(uint32_t word) {
+    uint32_t bits = word & UINT32_C(0xFFFF);
+    return bits <= (uint32_t)INT16_MAX
+        ? (int32_t)bits
+        : (int32_t)bits - INT32_C(65536);
+}
+
+static int32_t decode_psq_displacement(uint32_t word) {
+    uint32_t bits = word & UINT32_C(0xFFF);
+    return bits <= UINT32_C(0x7FF)
+        ? (int32_t)bits
+        : (int32_t)bits - INT32_C(4096);
+}
+
+static bool parse_signed_or_relocated(
+    const char *text,
+    uint32_t word,
+    unsigned int allowed_relocations,
+    int32_t *value,
+    RelocationKind *relocation) {
+    RelocationKind parsed = RELOCATION_NONE;
+    if (parse_signed(text, value)) {
+        *relocation = RELOCATION_NONE;
+        return true;
+    }
+    if (!parse_relocation(text, &parsed) ||
+        (allowed_relocations & (1U << (unsigned int)parsed)) == 0U) return false;
+    *value = decode_signed_immediate(word);
+    *relocation = parsed;
+    return true;
+}
+
+static bool parse_unsigned_or_relocated(
+    const char *text,
+    uint32_t word,
+    unsigned int allowed_relocations,
+    uint32_t *value) {
+    RelocationKind relocation = RELOCATION_NONE;
+    if (parse_unsigned(text, value)) return true;
+    if (!parse_relocation(text, &relocation) ||
+        (allowed_relocations & (1U << (unsigned int)relocation)) == 0U) return false;
+    *value = word & UINT32_C(0xFFFF);
+    return true;
+}
+
+static bool parse_memory_operand(
+    const char *text,
+    uint32_t word,
+    int32_t *offset,
+    unsigned int *base) {
     char copy[128];
     char *open;
     char *close;
+    unsigned int encoded_base;
+    RelocationKind relocation = RELOCATION_NONE;
     if (!porpoise_copy_string(copy, sizeof(copy), text)) return false;
     open = strchr(copy, '(');
     close = strrchr(copy, ')');
@@ -411,10 +678,78 @@ static bool parse_memory_operand(const char *text, int32_t *offset, unsigned int
     *close = '\0';
     if (copy[0] == '\0') {
         *offset = 0;
+    } else if (!parse_signed_or_relocated(
+                   copy,
+                   word,
+                   (1U << RELOCATION_LOW) | (1U << RELOCATION_SDA21),
+                   offset,
+                   &relocation)) {
+        return false;
+    }
+    if (!parse_register(open + 1, 'r', base)) return false;
+    encoded_base = (unsigned int)((word >> 16U) & 31U);
+    if (relocation == RELOCATION_SDA21) {
+        *base = encoded_base;
+    } else if (relocation == RELOCATION_LOW && *base != encoded_base) {
+        return false;
+    }
+    return true;
+}
+
+static bool parse_psq_memory_operand(
+    const char *text,
+    int32_t *offset,
+    unsigned int *base) {
+    char copy[128];
+    char *open;
+    char *close;
+
+    if (!porpoise_copy_string(copy, sizeof(copy), text)) return false;
+    open = strchr(copy, '(');
+    close = strrchr(copy, ')');
+    if (open == NULL || close == NULL || close[1] != '\0' || open >= close)
+        return false;
+    *open = '\0';
+    *close = '\0';
+    if (copy[0] == '\0') {
+        *offset = 0;
     } else if (!parse_signed(copy, offset)) {
         return false;
     }
     return parse_register(open + 1, 'r', base);
+}
+
+static bool psq_dform_operands_match_word(
+    uint32_t word,
+    unsigned int expected_opcode,
+    unsigned int fpr,
+    unsigned int base,
+    int32_t displacement,
+    unsigned int w,
+    unsigned int gqr) {
+    return (word >> 26U) == expected_opcode &&
+           ((word >> 21U) & 31U) == fpr &&
+           ((word >> 16U) & 31U) == base &&
+           decode_psq_displacement(word) == displacement &&
+           ((word >> 15U) & 1U) == w &&
+           ((word >> 12U) & 7U) == gqr;
+}
+
+static bool psq_indexed_operands_match_word(
+    uint32_t word,
+    unsigned int expected_xo,
+    unsigned int fpr,
+    unsigned int base,
+    unsigned int index,
+    unsigned int w,
+    unsigned int gqr) {
+    return (word >> 26U) == 4U &&
+           ((word >> 21U) & 31U) == fpr &&
+           ((word >> 16U) & 31U) == base &&
+           ((word >> 11U) & 31U) == index &&
+           ((word >> 10U) & 1U) == w &&
+           ((word >> 7U) & 7U) == gqr &&
+           (word & UINT32_C(0x7F)) == (uint32_t)(expected_xo << 1U);
 }
 
 static bool parse_cr_bit(const char *text, unsigned int *bit_index) {
@@ -467,13 +802,100 @@ static bool emit_record_update(FILE *output, bool record, unsigned int destinati
         destination);
 }
 
-static bool function_has_label(const PorpoiseFunction *function, const char *name) {
+static bool function_resolve_local_label(
+    const PorpoiseFunction *function,
+    const char *label_name,
+    size_t *instruction_item_index) {
     size_t index;
     for (index = 0U; index < function->item_count; index++) {
-        if (function->items[index].kind == PORPOISE_ASM_LABEL &&
-            strcmp(function->items[index].label, name) == 0) return true;
+        const PorpoiseAsmItem *item = &function->items[index];
+        size_t target_index;
+        if (item->kind != PORPOISE_ASM_LABEL ||
+            strcmp(item->label, label_name) != 0) continue;
+        for (target_index = index + 1U;
+             target_index < function->item_count;
+             target_index++) {
+            if (function->items[target_index].kind == PORPOISE_ASM_INSTRUCTION) {
+                if (instruction_item_index != NULL) *instruction_item_index = target_index;
+                return true;
+            }
+        }
+        return false;
     }
     return false;
+}
+
+static bool function_alias_address_seen_before(
+    const PorpoiseFunction *function,
+    size_t limit,
+    uint32_t address) {
+    size_t index;
+    for (index = 0U; index < limit; index++) {
+        if (function->aliases[index].address == address) return true;
+    }
+    return false;
+}
+
+static bool function_has_alias_address(
+    const PorpoiseFunction *function,
+    uint32_t address) {
+    return function_alias_address_seen_before(function, function->alias_count, address);
+}
+
+static bool function_item_has_preceding_label(
+    const PorpoiseFunction *function,
+    size_t item_index) {
+    return item_index != 0U &&
+           function->items[item_index - 1U].kind == PORPOISE_ASM_LABEL;
+}
+
+static bool function_item_needs_entry_label(
+    const PorpoiseFunction *function,
+    size_t item_index) {
+    size_t alias_index;
+    const PorpoiseAsmItem *item = &function->items[item_index];
+    if (item->kind != PORPOISE_ASM_INSTRUCTION) return false;
+    if (function_item_has_preceding_label(function, item_index)) return true;
+    for (alias_index = 0U; alias_index < function->alias_count; alias_index++) {
+        if (function->aliases[alias_index].instruction_item_index == item_index)
+            return true;
+    }
+    return false;
+}
+
+static bool emit_function_entry_dispatch(
+    FILE *output,
+    const PorpoiseFunction *function) {
+    size_t alias_index;
+    size_t item_index;
+    bool opened = false;
+    for (alias_index = 0U; alias_index < function->alias_count; alias_index++) {
+        const PorpoiseAddressAlias *alias = &function->aliases[alias_index];
+        if (function_alias_address_seen_before(function, alias_index, alias->address)) continue;
+        if (!opened) {
+            if (!file_printf(output, "    switch (state->pc) {\n")) return false;
+            opened = true;
+        }
+        if (!file_printf(output,
+            "        case UINT32_C(0x%08lX): goto porpoise_entry_item_%lu;\n",
+            (unsigned long)alias->address,
+            (unsigned long)alias->instruction_item_index)) return false;
+    }
+    for (item_index = 0U; item_index < function->item_count; item_index++) {
+        const PorpoiseAsmItem *item = &function->items[item_index];
+        if (item->kind != PORPOISE_ASM_INSTRUCTION ||
+            !function_item_has_preceding_label(function, item_index) ||
+            function_has_alias_address(function, item->address)) continue;
+        if (!opened) {
+            if (!file_printf(output, "    switch (state->pc) {\n")) return false;
+            opened = true;
+        }
+        if (!file_printf(output,
+            "        case UINT32_C(0x%08lX): goto porpoise_entry_item_%lu;\n",
+            (unsigned long)item->address, (unsigned long)item_index)) return false;
+    }
+    if (!opened) return true;
+    return file_printf(output, "        default: break;\n    }\n");
 }
 
 static bool emit_branch_target(
@@ -481,42 +903,57 @@ static bool emit_branch_target(
     const PorpoiseProgram *program,
     const PorpoiseFunction *function,
     const PorpoiseAbiManifest *abi,
-    const char *target,
+    const char *target_text,
     bool link,
     PorpoiseDiagnostics *diagnostics,
     const PorpoiseSourceFile *source,
     const PorpoiseAsmItem *item) {
-    char c_name[PORPOISE_NAME_CAPACITY];
+    char target[PORPOISE_NAME_CAPACITY];
     const PorpoiseFunction *callee;
+    const PorpoiseAddressAlias *alias;
     const PorpoiseAbiFunction *imported;
-    if (function_has_label(function, target)) {
+    uint32_t target_address;
+    size_t target_item_index;
+    if (!normalize_branch_target(target_text, target, sizeof(target))) return false;
+    if (function_resolve_local_label(function, target, &target_item_index)) {
         if (link) {
             porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, source->relative_path,
                                      item->source_line, item->address,
                                      "linked branches to local labels are not yet supported");
             return false;
         }
-        porpoise_sanitize_identifier(target, c_name, sizeof(c_name));
-        return file_printf(output, "    goto porpoise_label_%s;\n", c_name);
+        return file_printf(output, "    goto porpoise_entry_item_%lu;\n",
+                           (unsigned long)target_item_index);
     }
-    callee = porpoise_program_find_function(program, target);
-    if (callee != NULL) {
-        if (!file_printf(output, "    porpoise_lifted_%s(state);\n", callee->c_name)) return false;
-        if (link)
-            return file_printf(output, "    if (porpoise_state_has_fault(state)) return;\n");
+    if (porpoise_program_resolve_symbol(
+            program, target, &callee, &alias, &target_address)) {
+        if (!file_printf(output,
+            "    if (!porpoise_call_address(state, UINT32_C(0x%08lX))) return;\n",
+            (unsigned long)target_address)) return false;
+        if (link) return file_printf(output, "    if (porpoise_state_should_stop(state)) return;\n");
+        return file_printf(output, "    return;\n");
+    }
+    if (porpoise_program_resolve_unique_label(
+            program, target, &callee, &target_address, &target_item_index)) {
+        (void)target_item_index;
+        if (!file_printf(output,
+            "    if (!porpoise_call_address(state, UINT32_C(0x%08lX))) return;\n",
+            (unsigned long)target_address)) return false;
+        if (link) return file_printf(output, "    if (porpoise_state_should_stop(state)) return;\n");
         return file_printf(output, "    return;\n");
     }
     imported = porpoise_abi_find_import(abi, target);
     if (imported != NULL) {
+        char c_name[PORPOISE_NAME_CAPACITY];
         porpoise_sanitize_identifier(imported->symbol, c_name, sizeof(c_name));
         if (!file_printf(output, "    porpoise_import_%s(state);\n", c_name)) return false;
         if (link)
-            return file_printf(output, "    if (porpoise_state_has_fault(state)) return;\n");
+            return file_printf(output, "    if (porpoise_state_should_stop(state)) return;\n");
         return file_printf(output, "    return;\n");
     }
     porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, source->relative_path,
                              item->source_line, item->address,
-                             "branch target %s is neither a lifted function nor a declared ABI import",
+                             "branch target %s is neither a lifted symbol, unique label, nor declared ABI import",
                              target);
     return false;
 }
@@ -526,32 +963,45 @@ static bool emit_conditional_target(
     const PorpoiseProgram *program,
     const PorpoiseFunction *function,
     const PorpoiseAbiManifest *abi,
-    const char *target,
+    const char *target_text,
     const char *condition,
     PorpoiseDiagnostics *diagnostics,
     const PorpoiseSourceFile *source,
     const PorpoiseAsmItem *item) {
-    char c_name[PORPOISE_NAME_CAPACITY];
+    char target[PORPOISE_NAME_CAPACITY];
     const PorpoiseFunction *callee;
+    const PorpoiseAddressAlias *alias;
     const PorpoiseAbiFunction *imported;
-    if (function_has_label(function, target)) {
-        porpoise_sanitize_identifier(target, c_name, sizeof(c_name));
-        return file_printf(output, "    if (%s) goto porpoise_label_%s;\n", condition, c_name);
+    uint32_t target_address;
+    size_t target_item_index;
+    if (!normalize_branch_target(target_text, target, sizeof(target))) return false;
+    if (function_resolve_local_label(function, target, &target_item_index)) {
+        return file_printf(output, "    if (%s) goto porpoise_entry_item_%lu;\n",
+                           condition, (unsigned long)target_item_index);
     }
-    callee = porpoise_program_find_function(program, target);
-    if (callee != NULL) {
-        return file_printf(output, "    if (%s) { porpoise_lifted_%s(state); return; }\n",
-                           condition, callee->c_name);
+    if (porpoise_program_resolve_symbol(
+            program, target, &callee, &alias, &target_address)) {
+        return file_printf(output,
+            "    if (%s) { (void)porpoise_call_address(state, UINT32_C(0x%08lX)); return; }\n",
+            condition, (unsigned long)target_address);
+    }
+    if (porpoise_program_resolve_unique_label(
+            program, target, &callee, &target_address, &target_item_index)) {
+        (void)target_item_index;
+        return file_printf(output,
+            "    if (%s) { (void)porpoise_call_address(state, UINT32_C(0x%08lX)); return; }\n",
+            condition, (unsigned long)target_address);
     }
     imported = porpoise_abi_find_import(abi, target);
     if (imported != NULL) {
+        char c_name[PORPOISE_NAME_CAPACITY];
         porpoise_sanitize_identifier(imported->symbol, c_name, sizeof(c_name));
         return file_printf(output, "    if (%s) { porpoise_import_%s(state); return; }\n",
                            condition, c_name);
     }
     porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, source->relative_path,
                              item->source_line, item->address,
-                             "branch target %s is neither a local label, lifted function, nor ABI import",
+                             "branch target %s is neither a local label, lifted symbol, unique label, nor ABI import",
                              target);
     return false;
 }
@@ -566,7 +1016,7 @@ static bool emit_instruction(
     const PorpoiseAbiManifest *abi,
     PorpoiseDiagnostics *diagnostics) {
     OperandList operands;
-    unsigned int rd, ra, rb;
+    unsigned int rd, ra, rb, rc;
     int32_t immediate;
     uint32_t unsigned_value;
     bool record = opcode_records(item->mnemonic);
@@ -585,30 +1035,52 @@ static bool emit_instruction(
             }
             return file_printf(output, "    /* %s: host-equivalent no state change. */\n", item->mnemonic);
         case OP_LI:
-        case OP_LIS:
+        case OP_LIS: {
+            RelocationKind relocation;
+            unsigned int allowed_relocations = spec->operation == OP_LIS
+                ? (1U << RELOCATION_HIGH) | (1U << RELOCATION_HIGH_ADJUSTED)
+                : (1U << RELOCATION_LOW) | (1U << RELOCATION_SDA21);
             if (operands.count != 2U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_signed(operands.values[1], &immediate) ||
+                !parse_signed_or_relocated(operands.values[1], item->word,
+                                           allowed_relocations, &immediate,
+                                           &relocation) ||
                 immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
             if (spec->operation == OP_LIS) {
                 return file_printf(output,
                     "    state->gpr[%u] = ((uint32_t)UINT16_C(0x%04lX)) << 16U;\n",
                     rd, (unsigned long)(uint16_t)immediate);
             }
+            if (relocation == RELOCATION_SDA21) {
+                ra = (item->word >> 16U) & 31U;
+                if (ra != 0U) {
+                    return file_printf(output,
+                        "    state->gpr[%u] = state->gpr[%u] + porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
+                        rd, ra, (unsigned long)(uint16_t)immediate);
+                }
+            }
             return file_printf(output,
-                "    state->gpr[%u] = (uint32_t)(int32_t)(int16_t)UINT16_C(0x%04lX);\n",
+                "    state->gpr[%u] = porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
                 rd, (unsigned long)(uint16_t)immediate);
+        }
         case OP_ADDI:
-        case OP_ADDIS:
+        case OP_ADDIS: {
+            RelocationKind relocation;
+            unsigned int allowed_relocations = spec->operation == OP_ADDIS
+                ? (1U << RELOCATION_HIGH) | (1U << RELOCATION_HIGH_ADJUSTED)
+                : (1U << RELOCATION_LOW) | (1U << RELOCATION_SDA21);
             if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
                 !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_signed(operands.values[2], &immediate) ||
+                !parse_signed_or_relocated(operands.values[2], item->word,
+                                           allowed_relocations, &immediate,
+                                           &relocation) ||
                 immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
+            if (relocation == RELOCATION_SDA21) ra = (item->word >> 16U) & 31U;
             if (ra == 0U) {
                 if (spec->operation == OP_ADDIS)
                     return file_printf(output, "    state->gpr[%u] = ((uint32_t)UINT16_C(0x%04lX)) << 16U;\n",
                                        rd, (unsigned long)(uint16_t)immediate);
                 return file_printf(output,
-                    "    state->gpr[%u] = (uint32_t)(int32_t)(int16_t)UINT16_C(0x%04lX);\n",
+                    "    state->gpr[%u] = porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
                     rd, (unsigned long)(uint16_t)immediate);
             }
             if (spec->operation == OP_ADDIS)
@@ -616,8 +1088,9 @@ static bool emit_instruction(
                     "    state->gpr[%u] = state->gpr[%u] + (((uint32_t)UINT16_C(0x%04lX)) << 16U);\n",
                     rd, ra, (unsigned long)(uint16_t)immediate);
             return file_printf(output,
-                "    state->gpr[%u] = state->gpr[%u] + (uint32_t)(int32_t)(int16_t)UINT16_C(0x%04lX);\n",
+                "    state->gpr[%u] = state->gpr[%u] + porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
                 rd, ra, (unsigned long)(uint16_t)immediate);
+        }
         case OP_SUB_IMMEDIATE: {
             int64_t negated;
             uint16_t encoded;
@@ -633,7 +1106,7 @@ static bool emit_instruction(
                         "    state->gpr[%u] = ((uint32_t)UINT16_C(0x%04lX)) << 16U;\n",
                         rd, (unsigned long)encoded);
                 return file_printf(output,
-                    "    state->gpr[%u] = (uint32_t)(int32_t)(int16_t)UINT16_C(0x%04lX);\n",
+                    "    state->gpr[%u] = porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
                     rd, (unsigned long)encoded);
             }
             if (spec->detail != 0)
@@ -641,7 +1114,7 @@ static bool emit_instruction(
                     "    state->gpr[%u] = state->gpr[%u] + (((uint32_t)UINT16_C(0x%04lX)) << 16U);\n",
                     rd, ra, (unsigned long)encoded);
             return file_printf(output,
-                "    state->gpr[%u] = state->gpr[%u] + (uint32_t)(int32_t)(int16_t)UINT16_C(0x%04lX);\n",
+                "    state->gpr[%u] = state->gpr[%u] + porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
                 rd, ra, (unsigned long)encoded);
         }
         case OP_ADD:
@@ -673,7 +1146,7 @@ static bool emit_instruction(
                 !parse_signed(operands.values[2], &immediate) ||
                 immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
             return file_printf(output,
-                "    state->gpr[%u] = state->gpr[%u] * (uint32_t)(int32_t)(int16_t)UINT16_C(0x%04lX);\n",
+                "    state->gpr[%u] = state->gpr[%u] * porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
                 rd, ra, (unsigned long)(uint16_t)immediate);
         case OP_MULLW:
             if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
@@ -683,27 +1156,65 @@ static bool emit_instruction(
                     "    state->gpr[%u] = state->gpr[%u] * state->gpr[%u];\n",
                     rd, ra, rb)) return false;
             return emit_record_update(output, record, rd);
+        case OP_DIVIDE_WORD:
+            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
+                !parse_register(operands.values[1], 'r', &ra) ||
+                !parse_register(operands.values[2], 'r', &rb)) return false;
+            if (spec->detail != 0) {
+                if (!file_printf(output,
+                    "    { uint32_t dividend = state->gpr[%u]; uint32_t divisor = state->gpr[%u]; "
+                    "int64_t signed_dividend = (dividend & UINT32_C(0x80000000)) != 0U ? (int64_t)dividend - INT64_C(4294967296) : (int64_t)dividend; "
+                    "int64_t signed_divisor = (divisor & UINT32_C(0x80000000)) != 0U ? (int64_t)divisor - INT64_C(4294967296) : (int64_t)divisor; "
+                    "if (divisor == 0U || (dividend == UINT32_C(0x80000000) && divisor == UINT32_MAX)) "
+                    "state->gpr[%u] = signed_dividend < 0 ? UINT32_MAX : 0U; "
+                    "else state->gpr[%u] = (uint32_t)(signed_dividend / signed_divisor); }\n",
+                    ra, rb, rd, rd)) return false;
+            } else if (!file_printf(output,
+                "    { uint32_t divisor = state->gpr[%u]; state->gpr[%u] = divisor == 0U ? 0U : state->gpr[%u] / divisor; }\n",
+                rb, rd, ra)) return false;
+            return emit_record_update(output, record, rd);
+        case OP_MULTIPLY_HIGH:
+            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
+                !parse_register(operands.values[1], 'r', &ra) ||
+                !parse_register(operands.values[2], 'r', &rb)) return false;
+            if (spec->detail != 0) {
+                if (!file_printf(output,
+                    "    { uint32_t left = state->gpr[%u]; uint32_t right = state->gpr[%u]; "
+                    "uint32_t high = (uint32_t)(((uint64_t)left * (uint64_t)right) >> 32U); "
+                    "if ((left & UINT32_C(0x80000000)) != 0U) high -= right; "
+                    "if ((right & UINT32_C(0x80000000)) != 0U) high -= left; state->gpr[%u] = high; }\n",
+                    ra, rb, rd)) return false;
+            } else if (!file_printf(output,
+                "    state->gpr[%u] = (uint32_t)(((uint64_t)state->gpr[%u] * (uint64_t)state->gpr[%u]) >> 32U);\n",
+                rd, ra, rb)) return false;
+            return emit_record_update(output, record, rd);
         case OP_CARRY_ARITHMETIC: {
             int kind = spec->detail < 0 ? -spec->detail : spec->detail;
             if (kind == CARRY_ADD_IMMEDIATE || kind == CARRY_SUBF_IMMEDIATE) {
                 uint16_t encoded;
+                RelocationKind relocation = RELOCATION_NONE;
                 if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                    !parse_register(operands.values[1], 'r', &ra) ||
-                    !parse_signed(operands.values[2], &immediate)) return false;
+                    !parse_register(operands.values[1], 'r', &ra)) return false;
                 if (spec->detail < 0) {
-                    int64_t negated = -(int64_t)immediate;
+                    int64_t negated;
+                    if (!parse_signed(operands.values[2], &immediate)) return false;
+                    negated = -(int64_t)immediate;
                     if (negated < INT16_MIN || negated > INT16_MAX) return false;
                     encoded = (uint16_t)(int16_t)negated;
                 } else {
+                    if (!parse_signed_or_relocated(
+                            operands.values[2], item->word,
+                            1U << RELOCATION_LOW, &immediate,
+                            &relocation)) return false;
                     if (immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
                     encoded = (uint16_t)immediate;
                 }
                 if (kind == CARRY_ADD_IMMEDIATE) {
                     if (!file_printf(output,
-                        "    state->gpr[%u] = porpoise_add_with_carry32(state, state->gpr[%u], (uint32_t)(int32_t)(int16_t)UINT16_C(0x%04lX), 0U);\n",
+                        "    state->gpr[%u] = porpoise_add_with_carry32(state, state->gpr[%u], porpoise_sign_extend16(UINT32_C(0x%04lX)), 0U);\n",
                         rd, ra, (unsigned long)encoded)) return false;
                 } else if (!file_printf(output,
-                    "    state->gpr[%u] = porpoise_add_with_carry32(state, ~state->gpr[%u], (uint32_t)(int32_t)(int16_t)UINT16_C(0x%04lX), 1U);\n",
+                    "    state->gpr[%u] = porpoise_add_with_carry32(state, ~state->gpr[%u], porpoise_sign_extend16(UINT32_C(0x%04lX)), 1U);\n",
                     rd, ra, (unsigned long)encoded)) return false;
             } else if (kind == CARRY_ADD_ZERO_EXTENDED) {
                 if (operands.count != 2U || !parse_register(operands.values[0], 'r', &rd) ||
@@ -725,6 +1236,13 @@ static bool emit_instruction(
             }
             return emit_record_update(output, record, rd);
         }
+        case OP_SUBFZE:
+            if (operands.count != 2U || !parse_register(operands.values[0], 'r', &rd) ||
+                !parse_register(operands.values[1], 'r', &ra) ||
+                !file_printf(output,
+                    "    state->gpr[%u] = porpoise_add_with_carry32(state, ~state->gpr[%u], 0U, (state->xer >> 29U) & 1U);\n",
+                    rd, ra)) return false;
+            return emit_record_update(output, record, rd);
         case OP_LOGICAL_COMPLEMENT:
             if (spec->detail == LOGICAL_NOT) {
                 if (operands.count != 2U || !parse_register(operands.values[0], 'r', &rd) ||
@@ -736,6 +1254,8 @@ static bool emit_instruction(
                     !parse_register(operands.values[2], 'r', &rb)) return false;
                 if (spec->detail == LOGICAL_AND_COMPLEMENT &&
                     !file_printf(output, "    state->gpr[%u] = state->gpr[%u] & ~state->gpr[%u];\n", rd, ra, rb)) return false;
+                if (spec->detail == LOGICAL_OR_COMPLEMENT &&
+                    !file_printf(output, "    state->gpr[%u] = state->gpr[%u] | ~state->gpr[%u];\n", rd, ra, rb)) return false;
                 if (spec->detail == LOGICAL_NOR &&
                     !file_printf(output, "    state->gpr[%u] = ~(state->gpr[%u] | state->gpr[%u]);\n", rd, ra, rb)) return false;
             }
@@ -751,7 +1271,10 @@ static bool emit_instruction(
             bool shifted = spec->operation == OP_ORIS || spec->operation == OP_XORIS || spec->operation == OP_ANDIS;
             if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
                 !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_unsigned(operands.values[2], &unsigned_value) || unsigned_value > UINT16_MAX) return false;
+                !parse_unsigned_or_relocated(
+                    operands.values[2], item->word,
+                    spec->operation == OP_ORI ? 1U << RELOCATION_LOW : 0U,
+                    &unsigned_value) || unsigned_value > UINT16_MAX) return false;
             if (!file_printf(output, "    state->gpr[%u] = state->gpr[%u] %s (UINT32_C(%lu)%s);\n",
                              rd, ra, operator_text, (unsigned long)unsigned_value, shifted ? " << 16" : "")) return false;
             if (spec->operation == OP_ANDI || spec->operation == OP_ANDIS)
@@ -800,6 +1323,19 @@ static bool emit_instruction(
                 if (!file_printf(output,
                     "    { uint32_t mask = porpoise_mask32(%luU, %luU); state->gpr[%u] = (state->gpr[%u] & ~mask) | (porpoise_rotate_left32(state->gpr[%u], %luU) & mask); }\n",
                     (unsigned long)mb, (unsigned long)me, rd, rd, ra, (unsigned long)unsigned_value)) return false;
+                return emit_record_update(output, record, rd);
+            }
+        case OP_RLWNM:
+            if (operands.count != 5U || !parse_register(operands.values[0], 'r', &rd) ||
+                !parse_register(operands.values[1], 'r', &ra) ||
+                !parse_register(operands.values[2], 'r', &rb)) return false;
+            {
+                uint32_t mb, me;
+                if (!parse_unsigned(operands.values[3], &mb) ||
+                    !parse_unsigned(operands.values[4], &me) || mb > 31U || me > 31U) return false;
+                if (!file_printf(output,
+                    "    state->gpr[%u] = porpoise_rotate_left32(state->gpr[%u], state->gpr[%u] & 31U) & porpoise_mask32(%luU, %luU);\n",
+                    rd, ra, rb, (unsigned long)mb, (unsigned long)me)) return false;
                 return emit_record_update(output, record, rd);
             }
         case OP_ROTATE_ALIAS: {
@@ -885,29 +1421,36 @@ static bool emit_instruction(
             bool update = spec->detail < 0;
             if (operands.count != 2U ||
                 !parse_register(operands.values[0], kind >= MEMORY_F32 ? 'f' : 'r', &rd) ||
-                !parse_memory_operand(operands.values[1], &immediate, &ra) || (update && ra == 0U) ||
+                !parse_memory_operand(operands.values[1], item->word, &immediate, &ra) ||
+                (update && ra == 0U) ||
                 (update && spec->operation == OP_LOAD && kind < MEMORY_F32 && rd == ra)) return false;
             if (immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
             if (ra == 0U) {
                 if (!file_printf(output,
-                    "    { uint32_t ea = (uint32_t)(int32_t)(int16_t)UINT16_C(0x%04lX); ",
+                    "    { uint32_t ea = porpoise_sign_extend16(UINT32_C(0x%04lX)); ",
                     (unsigned long)(uint16_t)immediate)) return false;
             } else if (!file_printf(output,
-                "    { uint32_t ea = state->gpr[%u] + (uint32_t)(int32_t)(int16_t)UINT16_C(0x%04lX); ",
+                "    { uint32_t ea = state->gpr[%u] + porpoise_sign_extend16(UINT32_C(0x%04lX)); ",
                 ra, (unsigned long)(uint16_t)immediate)) return false;
             if (spec->operation == OP_LOAD) {
                 if (kind == MEMORY_U8 && !file_printf(output, "uint32_t value = porpoise_load_u8(state, ea); ")) return false;
                 if ((kind == MEMORY_U16 || kind == MEMORY_S16) &&
                     !file_printf(output, "uint32_t value = porpoise_load_u16(state, ea); ")) return false;
                 if (kind == MEMORY_U32 && !file_printf(output, "uint32_t value = porpoise_load_u32(state, ea); ")) return false;
-                if (kind == MEMORY_F32 && !file_printf(output, "float value = porpoise_load_f32(state, ea); ")) return false;
-                if (kind == MEMORY_F64 && !file_printf(output, "double value = porpoise_load_f64(state, ea); ")) return false;
+                if (kind == MEMORY_F32 && !file_printf(output,
+                    "if (!porpoise_fpr_load_binary32(state, %uU, 0U, ea)) return; "
+                    "porpoise_fpr_set_bits(state, %uU, 1U, porpoise_fpr_get_bits(state, %uU, 0U)); ",
+                    rd, rd, rd)) return false;
+                if (kind == MEMORY_F64 && !file_printf(output,
+                    "if (!porpoise_fpr_load_binary64(state, %uU, 0U, ea)) return; ", rd)) return false;
             } else {
                 if (kind == MEMORY_U8 && !file_printf(output, "porpoise_store_u8(state, ea, (uint8_t)state->gpr[%u]); ", rd)) return false;
                 if ((kind == MEMORY_U16 || kind == MEMORY_S16) && !file_printf(output, "porpoise_store_u16(state, ea, (uint16_t)state->gpr[%u]); ", rd)) return false;
                 if (kind == MEMORY_U32 && !file_printf(output, "porpoise_store_u32(state, ea, state->gpr[%u]); ", rd)) return false;
-                if (kind == MEMORY_F32 && !file_printf(output, "porpoise_store_f32(state, ea, (float)state->fpr[%u].f64); ", rd)) return false;
-                if (kind == MEMORY_F64 && !file_printf(output, "porpoise_store_f64(state, ea, state->fpr[%u].f64); ", rd)) return false;
+                if (kind == MEMORY_F32 && !file_printf(output,
+                    "if (!porpoise_fpr_store_binary32(state, %uU, 0U, ea)) return; ", rd)) return false;
+                if (kind == MEMORY_F64 && !file_printf(output,
+                    "if (!porpoise_fpr_store_binary64(state, %uU, 0U, ea)) return; ", rd)) return false;
             }
             if (!file_printf(output, "if (porpoise_state_has_fault(state)) return; ")) return false;
             if (spec->operation == OP_LOAD) {
@@ -915,10 +1458,6 @@ static bool emit_instruction(
                     !file_printf(output, "state->gpr[%u] = value; ", rd)) return false;
                 if (kind == MEMORY_S16 &&
                     !file_printf(output, "state->gpr[%u] = porpoise_sign_extend16(value); ", rd)) return false;
-                if (kind == MEMORY_F32 &&
-                    !file_printf(output, "state->fpr[%u].f64 = (double)value; ", rd)) return false;
-                if (kind == MEMORY_F64 &&
-                    !file_printf(output, "state->fpr[%u].f64 = value; ", rd)) return false;
             }
             if (update && !file_printf(output, "state->gpr[%u] = ea; ", ra)) return false;
             return file_printf(output, "}\n");
@@ -943,14 +1482,20 @@ static bool emit_instruction(
                 if ((kind == MEMORY_U16 || kind == MEMORY_S16) &&
                     !file_printf(output, "uint32_t value = porpoise_load_u16(state, ea); ")) return false;
                 if (kind == MEMORY_U32 && !file_printf(output, "uint32_t value = porpoise_load_u32(state, ea); ")) return false;
-                if (kind == MEMORY_F32 && !file_printf(output, "float value = porpoise_load_f32(state, ea); ")) return false;
-                if (kind == MEMORY_F64 && !file_printf(output, "double value = porpoise_load_f64(state, ea); ")) return false;
+                if (kind == MEMORY_F32 && !file_printf(output,
+                    "if (!porpoise_fpr_load_binary32(state, %uU, 0U, ea)) return; "
+                    "porpoise_fpr_set_bits(state, %uU, 1U, porpoise_fpr_get_bits(state, %uU, 0U)); ",
+                    rd, rd, rd)) return false;
+                if (kind == MEMORY_F64 && !file_printf(output,
+                    "if (!porpoise_fpr_load_binary64(state, %uU, 0U, ea)) return; ", rd)) return false;
             } else {
                 if (kind == MEMORY_U8 && !file_printf(output, "porpoise_store_u8(state, ea, (uint8_t)state->gpr[%u]); ", rd)) return false;
                 if (kind == MEMORY_U16 && !file_printf(output, "porpoise_store_u16(state, ea, (uint16_t)state->gpr[%u]); ", rd)) return false;
                 if (kind == MEMORY_U32 && !file_printf(output, "porpoise_store_u32(state, ea, state->gpr[%u]); ", rd)) return false;
-                if (kind == MEMORY_F32 && !file_printf(output, "porpoise_store_f32(state, ea, (float)state->fpr[%u].f64); ", rd)) return false;
-                if (kind == MEMORY_F64 && !file_printf(output, "porpoise_store_f64(state, ea, state->fpr[%u].f64); ", rd)) return false;
+                if (kind == MEMORY_F32 && !file_printf(output,
+                    "if (!porpoise_fpr_store_binary32(state, %uU, 0U, ea)) return; ", rd)) return false;
+                if (kind == MEMORY_F64 && !file_printf(output,
+                    "if (!porpoise_fpr_store_binary64(state, %uU, 0U, ea)) return; ", rd)) return false;
             }
             if (!file_printf(output, "if (porpoise_state_has_fault(state)) return; ")) return false;
             if (spec->operation == OP_INDEXED_LOAD) {
@@ -958,27 +1503,99 @@ static bool emit_instruction(
                     !file_printf(output, "state->gpr[%u] = value; ", rd)) return false;
                 if (kind == MEMORY_S16 &&
                     !file_printf(output, "state->gpr[%u] = porpoise_sign_extend16(value); ", rd)) return false;
-                if (kind == MEMORY_F32 &&
-                    !file_printf(output, "state->fpr[%u].f64 = (double)value; ", rd)) return false;
-                if (kind == MEMORY_F64 &&
-                    !file_printf(output, "state->fpr[%u].f64 = value; ", rd)) return false;
             }
+            if (update && !file_printf(output, "state->gpr[%u] = ea; ", ra)) return false;
+            return file_printf(output, "}\n");
+        }
+        case OP_BYTE_REVERSE_STORE:
+            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
+                !parse_register(operands.values[1], 'r', &ra) ||
+                !parse_register(operands.values[2], 'r', &rb)) return false;
+            if (ra == 0U) {
+                if (!file_printf(output, "    { uint32_t ea = state->gpr[%u]; ", rb)) return false;
+            } else if (!file_printf(output,
+                "    { uint32_t ea = state->gpr[%u] + state->gpr[%u]; ", ra, rb)) return false;
+            return file_printf(output,
+                "uint32_t value = state->gpr[%u]; porpoise_store_u16(state, ea, (uint16_t)(((value & UINT32_C(0xFF)) << 8U) | ((value >> 8U) & UINT32_C(0xFF)))); if (porpoise_state_has_fault(state)) return; }\n",
+                rd);
+        case OP_PSQ_DFORM: {
+            bool store = (spec->detail & PSQ_STORE) != 0;
+            bool update = (spec->detail & PSQ_UPDATE) != 0;
+            unsigned int expected_opcode = 56U + (store ? 4U : 0U) + (update ? 1U : 0U);
+
+            if (operands.count != 4U ||
+                !parse_register(operands.values[0], 'f', &rd) ||
+                !parse_psq_memory_operand(operands.values[1], &immediate, &ra) ||
+                immediate < -2048 || immediate > 2047 ||
+                !parse_unsigned(operands.values[2], &unsigned_value) || unsigned_value > 1U ||
+                !parse_gqr_register(operands.values[3], &rc) ||
+                (update && ra == 0U)) {
+                return false;
+            }
+            rb = (unsigned int)unsigned_value;
+            if (!psq_dform_operands_match_word(
+                    item->word, expected_opcode, rd, ra, immediate, rb, rc)) {
+                return false;
+            }
+            if (ra == 0U) {
+                if (!file_printf(output,
+                    "    { uint32_t ea = UINT32_C(0x%08lX); ",
+                    (unsigned long)(uint32_t)immediate)) return false;
+            } else if (!file_printf(output,
+                "    { uint32_t ea = state->gpr[%u] + UINT32_C(0x%08lX); ",
+                ra, (unsigned long)(uint32_t)immediate)) return false;
+            if (!file_printf(output,
+                "if (!porpoise_psq_%s(state, %uU, ea, %uU, %uU, 1U)) return; ",
+                store ? "store" : "load", rd, rb, rc)) return false;
+            if (update && !file_printf(output, "state->gpr[%u] = ea; ", ra)) return false;
+            return file_printf(output, "}\n");
+        }
+        case OP_PSQ_INDEXED: {
+            bool store = (spec->detail & PSQ_STORE) != 0;
+            bool update = (spec->detail & PSQ_UPDATE) != 0;
+            unsigned int expected_xo = (store ? 7U : 6U) +
+                                       (update ? 32U : 0U);
+
+            if (operands.count != 5U ||
+                !parse_register(operands.values[0], 'f', &rd) ||
+                !parse_register(operands.values[1], 'r', &ra) ||
+                !parse_register(operands.values[2], 'r', &rb) ||
+                !parse_unsigned(operands.values[3], &unsigned_value) || unsigned_value > 1U ||
+                !parse_gqr_register(operands.values[4], &rc) ||
+                (update && ra == 0U)) {
+                return false;
+            }
+            if (!psq_indexed_operands_match_word(
+                    item->word, expected_xo, rd, ra, rb,
+                    (unsigned int)unsigned_value, rc)) {
+                return false;
+            }
+            if (ra == 0U) {
+                if (!file_printf(output,
+                    "    { uint32_t ea = state->gpr[%u]; ", rb)) return false;
+            } else if (!file_printf(output,
+                "    { uint32_t ea = state->gpr[%u] + state->gpr[%u]; ",
+                ra, rb)) return false;
+            if (!file_printf(output,
+                "if (!porpoise_psq_%s(state, %uU, ea, %luU, %uU, 0U)) return; ",
+                store ? "store" : "load", rd,
+                (unsigned long)unsigned_value, rc)) return false;
             if (update && !file_printf(output, "state->gpr[%u] = ea; ", ra)) return false;
             return file_printf(output, "}\n");
         }
         case OP_LOAD_MULTIPLE:
         case OP_STORE_MULTIPLE:
             if (operands.count != 2U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_memory_operand(operands.values[1], &immediate, &ra) ||
+                !parse_memory_operand(operands.values[1], item->word, &immediate, &ra) ||
                 immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX ||
                 (spec->operation == OP_LOAD_MULTIPLE &&
                  ((ra == 0U && rd == 0U) || (ra != 0U && ra >= rd)))) return false;
             if (ra == 0U) {
                 if (!file_printf(output,
-                    "    { uint32_t ea = (uint32_t)(int32_t)(int16_t)UINT16_C(0x%04lX); ",
+                    "    { uint32_t ea = porpoise_sign_extend16(UINT32_C(0x%04lX)); ",
                     (unsigned long)(uint16_t)immediate)) return false;
             } else if (!file_printf(output,
-                "    { uint32_t ea = state->gpr[%u] + (uint32_t)(int32_t)(int16_t)UINT16_C(0x%04lX); ",
+                "    { uint32_t ea = state->gpr[%u] + porpoise_sign_extend16(UINT32_C(0x%04lX)); ",
                 ra, (unsigned long)(uint16_t)immediate)) return false;
             if (spec->operation == OP_LOAD_MULTIPLE) {
                 if (!file_printf(output,
@@ -998,13 +1615,19 @@ static bool emit_instruction(
         case OP_BLR:
             if (operands.count != 0U) return false;
             return file_printf(output, "    return;\n");
+        case OP_BLRL:
+            if (operands.count != 0U) return false;
+            return file_printf(output,
+                "    { uint32_t target = state->lr; state->lr = UINT32_C(0x%08lX); "
+                "if (!porpoise_call_address(state, target)) return; if (porpoise_state_should_stop(state)) return; }\n",
+                (unsigned long)(item->address + 4U));
         case OP_BCTR:
         case OP_BCTRL:
             if (operands.count != 0U) return false;
             if (spec->operation == OP_BCTRL && !file_printf(output, "    state->lr = UINT32_C(0x%08lX);\n",
                                                             (unsigned long)(item->address + 4U))) return false;
             if (!file_printf(output, "    if (!porpoise_call_address(state, state->ctr)) return;\n")) return false;
-            if (!file_printf(output, "    if (porpoise_state_has_fault(state)) return;\n")) return false;
+            if (!file_printf(output, "    if (porpoise_state_should_stop(state)) return;\n")) return false;
             return spec->operation == OP_BCTRL || file_printf(output, "    return;\n");
         case OP_CONDITIONAL_BRANCH: {
             unsigned int field = 0U;
@@ -1025,6 +1648,19 @@ static bool emit_instruction(
                                  negate ? "!" : "", field * 4U + bit)) return false;
             return emit_conditional_target(output, program, function, abi, target, condition,
                                            diagnostics, source, item);
+        }
+        case OP_CONDITIONAL_RETURN: {
+            unsigned int field = 0U;
+            unsigned int bit;
+            bool negate = spec->detail < 0 || (spec->detail & 0x100) != 0;
+            if (operands.count == 1U) {
+                if (strncmp(operands.values[0], "cr", 2U) != 0 ||
+                    !parse_unsigned(operands.values[0] + 2, &unsigned_value) || unsigned_value > 7U) return false;
+                field = (unsigned int)unsigned_value;
+            } else if (operands.count != 0U) return false;
+            bit = (unsigned int)(spec->detail < 0 ? -spec->detail : (spec->detail & 0xff));
+            return file_printf(output, "    if (%sporpoise_cr_get_bit(state, %uU)) return;\n",
+                               negate ? "!" : "", field * 4U + bit);
         }
         case OP_BDNZ:
             if (operands.count != 1U) return false;
@@ -1074,7 +1710,7 @@ static bool emit_instruction(
                     if (!parse_signed(operands.values[base + 1U], &immediate) ||
                         immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
                     return file_printf(output,
-                        "    porpoise_compare_signed(state, %uU, state->gpr[%u], (uint32_t)(int32_t)(int16_t)UINT16_C(0x%04lX));\n",
+                        "    porpoise_compare_signed(state, %uU, state->gpr[%u], porpoise_sign_extend16(UINT32_C(0x%04lX)));\n",
                         field, ra, (unsigned long)(uint16_t)immediate);
                 }
                 if (!parse_unsigned(operands.values[base + 1U], &unsigned_value) || unsigned_value > UINT16_MAX) return false;
@@ -1094,30 +1730,228 @@ static bool emit_instruction(
                 !parse_register(operands.values[1], 'f', &ra) || !parse_register(operands.values[2], 'f', &rb)) return false;
             if (spec->operation == OP_FLOAT_BINARY) {
                 bool single = item->mnemonic[strlen(item->mnemonic) - 1U] == 's';
-                return file_printf(output, "    state->fpr[%u].f64 = %s(state->fpr[%u].f64 %s state->fpr[%u].f64);\n",
-                                   rd, single ? "(double)(float)" : "", ra, operator_text, rb);
+                if (single) {
+                    return file_printf(output,
+                        "    { double result = (double)(float)(porpoise_fpr_get_f64(state, %uU, 0U) %s porpoise_fpr_get_f64(state, %uU, 0U)); "
+                        "porpoise_fpr_set_f64(state, %uU, 0U, result); porpoise_fpr_set_f64(state, %uU, 1U, result); }\n",
+                        ra, operator_text, rb, rd, rd);
+                }
+                return file_printf(output,
+                    "    porpoise_fpr_set_f64(state, %uU, 0U, porpoise_fpr_get_f64(state, %uU, 0U) %s porpoise_fpr_get_f64(state, %uU, 0U));\n",
+                    rd, ra, operator_text, rb);
             }
             return file_printf(output,
-                "    state->fpr[%u].ps[0] = state->fpr[%u].ps[0] %s state->fpr[%u].ps[0];\n"
-                "    state->fpr[%u].ps[1] = state->fpr[%u].ps[1] %s state->fpr[%u].ps[1];\n",
+                "    porpoise_fpr_set_f64(state, %uU, 0U, (double)(float)(porpoise_fpr_get_f64(state, %uU, 0U) %s porpoise_fpr_get_f64(state, %uU, 0U)));\n"
+                "    porpoise_fpr_set_f64(state, %uU, 1U, (double)(float)(porpoise_fpr_get_f64(state, %uU, 1U) %s porpoise_fpr_get_f64(state, %uU, 1U)));\n",
                 rd, ra, operator_text, rb, rd, ra, operator_text, rb);
         }
+        case OP_PAIRED_TERNARY: {
+            const char *operator_text =
+                spec->detail == PAIRED_MSUB || spec->detail == PAIRED_NMSUB ? "-" : "+";
+            const char *negate_text =
+                spec->detail == PAIRED_NMADD || spec->detail == PAIRED_NMSUB
+                    ? "if (!isnan(result0)) result0 = -result0; if (!isnan(result1)) result1 = -result1; "
+                    : "";
+            if (operands.count != 4U || !parse_register(operands.values[0], 'f', &rd) ||
+                !parse_register(operands.values[1], 'f', &ra) ||
+                !parse_register(operands.values[2], 'f', &rc) ||
+                !parse_register(operands.values[3], 'f', &rb)) return false;
+            return file_printf(output,
+                "    { double a0 = porpoise_fpr_get_f64(state, %uU, 0U); double a1 = porpoise_fpr_get_f64(state, %uU, 1U); "
+                "double c0 = porpoise_fpr_get_f64(state, %uU, 0U); double c1 = porpoise_fpr_get_f64(state, %uU, 1U); "
+                "double b0 = porpoise_fpr_get_f64(state, %uU, 0U); double b1 = porpoise_fpr_get_f64(state, %uU, 1U); "
+                "double result0 = (double)(float)(a0 * c0 %s b0); double result1 = (double)(float)(a1 * c1 %s b1); "
+                "%sporpoise_fpr_set_f64(state, %uU, 0U, result0); porpoise_fpr_set_f64(state, %uU, 1U, result1); }\n",
+                ra, ra, rc, rc, rb, rb, operator_text, operator_text, negate_text, rd, rd);
+        }
+        case OP_PAIRED_SCALAR_MADD:
+            if (operands.count != 4U || !parse_register(operands.values[0], 'f', &rd) ||
+                !parse_register(operands.values[1], 'f', &ra) ||
+                !parse_register(operands.values[2], 'f', &rc) ||
+                !parse_register(operands.values[3], 'f', &rb)) return false;
+            return file_printf(output,
+                "    { double a0 = porpoise_fpr_get_f64(state, %uU, 0U); double a1 = porpoise_fpr_get_f64(state, %uU, 1U); "
+                "double scalar = porpoise_fpr_get_f64(state, %uU, %dU); "
+                "double b0 = porpoise_fpr_get_f64(state, %uU, 0U); double b1 = porpoise_fpr_get_f64(state, %uU, 1U); "
+                "double result0 = (double)(float)(a0 * scalar + b0); double result1 = (double)(float)(a1 * scalar + b1); "
+                "porpoise_fpr_set_f64(state, %uU, 0U, result0); porpoise_fpr_set_f64(state, %uU, 1U, result1); }\n",
+                ra, ra, rc, spec->detail, rb, rb, rd, rd);
+        case OP_PAIRED_SCALAR_MULTIPLY:
+            if (operands.count != 3U || !parse_register(operands.values[0], 'f', &rd) ||
+                !parse_register(operands.values[1], 'f', &ra) ||
+                !parse_register(operands.values[2], 'f', &rc)) return false;
+            return file_printf(output,
+                "    { double a0 = porpoise_fpr_get_f64(state, %uU, 0U); double a1 = porpoise_fpr_get_f64(state, %uU, 1U); "
+                "double scalar = porpoise_fpr_get_f64(state, %uU, %dU); "
+                "porpoise_fpr_set_f64(state, %uU, 0U, (double)(float)(a0 * scalar)); "
+                "porpoise_fpr_set_f64(state, %uU, 1U, (double)(float)(a1 * scalar)); }\n",
+                ra, ra, rc, spec->detail, rd, rd);
+        case OP_PAIRED_SUM:
+            if (operands.count != 4U || !parse_register(operands.values[0], 'f', &rd) ||
+                !parse_register(operands.values[1], 'f', &ra) ||
+                !parse_register(operands.values[2], 'f', &rc) ||
+                !parse_register(operands.values[3], 'f', &rb)) return false;
+            if (spec->detail == 0) {
+                return file_printf(output,
+                    "    { double sum = (double)(float)(porpoise_fpr_get_f64(state, %uU, 0U) + porpoise_fpr_get_f64(state, %uU, 1U)); "
+                    "double passthrough = (double)(float)porpoise_fpr_get_f64(state, %uU, 1U); "
+                    "porpoise_fpr_set_f64(state, %uU, 0U, sum); porpoise_fpr_set_f64(state, %uU, 1U, passthrough); }\n",
+                    ra, rb, rc, rd, rd);
+            }
+            return file_printf(output,
+                "    { double sum = (double)(float)(porpoise_fpr_get_f64(state, %uU, 0U) + porpoise_fpr_get_f64(state, %uU, 1U)); "
+                "double passthrough = (double)(float)porpoise_fpr_get_f64(state, %uU, 0U); "
+                "porpoise_fpr_set_f64(state, %uU, 0U, passthrough); porpoise_fpr_set_f64(state, %uU, 1U, sum); }\n",
+                ra, rb, rc, rd, rd);
+        case OP_PAIRED_MERGE: {
+            unsigned int left_lane =
+                spec->detail == PAIRED_MERGE_10 || spec->detail == PAIRED_MERGE_11 ? 1U : 0U;
+            unsigned int right_lane =
+                spec->detail == PAIRED_MERGE_01 || spec->detail == PAIRED_MERGE_11 ? 1U : 0U;
+            if (operands.count != 3U || !parse_register(operands.values[0], 'f', &rd) ||
+                !parse_register(operands.values[1], 'f', &ra) ||
+                !parse_register(operands.values[2], 'f', &rb)) return false;
+            return file_printf(output,
+                "    { uint64_t result0 = porpoise_fpr_get_bits(state, %uU, %uU); "
+                "uint64_t result1 = porpoise_fpr_get_bits(state, %uU, %uU); "
+                "porpoise_fpr_set_bits(state, %uU, 0U, result0); porpoise_fpr_set_bits(state, %uU, 1U, result1); }\n",
+                ra, left_lane, rb, right_lane, rd, rd);
+        }
+        case OP_PAIRED_UNARY:
+            if (operands.count != 2U || !parse_register(operands.values[0], 'f', &rd) ||
+                !parse_register(operands.values[1], 'f', &ra)) return false;
+            return file_printf(output,
+                "    { uint64_t lane0 = porpoise_fpr_get_bits(state, %uU, 0U)%s; "
+                "uint64_t lane1 = porpoise_fpr_get_bits(state, %uU, 1U)%s; "
+                "porpoise_fpr_set_bits(state, %uU, 0U, lane0); porpoise_fpr_set_bits(state, %uU, 1U, lane1); }\n",
+                ra, spec->detail == PAIRED_NEGATE ? " ^ UINT64_C(0x8000000000000000)" : "",
+                ra, spec->detail == PAIRED_NEGATE ? " ^ UINT64_C(0x8000000000000000)" : "",
+                rd, rd);
+        case OP_PAIRED_COMPARE: {
+            unsigned int field;
+            if (operands.count != 3U || strncmp(operands.values[0], "cr", 2U) != 0 ||
+                !parse_unsigned(operands.values[0] + 2, &unsigned_value) || unsigned_value > 7U ||
+                !parse_register(operands.values[1], 'f', &ra) ||
+                !parse_register(operands.values[2], 'f', &rb)) return false;
+            field = (unsigned int)unsigned_value;
+            return file_printf(output,
+                "    porpoise_fcmpo(state, %uU, porpoise_fpr_get_bits(state, %uU, 0U), porpoise_fpr_get_bits(state, %uU, 0U));\n"
+                "    if (porpoise_state_has_fault(state)) return;\n",
+                field, ra, rb);
+        }
+        case OP_PAIRED_SELECT:
+            if (operands.count != 4U || !parse_register(operands.values[0], 'f', &rd) ||
+                !parse_register(operands.values[1], 'f', &ra) ||
+                !parse_register(operands.values[2], 'f', &rc) ||
+                !parse_register(operands.values[3], 'f', &rb)) return false;
+            return file_printf(output,
+                "    { uint64_t result0 = porpoise_fsel_bits(porpoise_fpr_get_bits(state, %uU, 0U), porpoise_fpr_get_bits(state, %uU, 0U), porpoise_fpr_get_bits(state, %uU, 0U)); "
+                "uint64_t result1 = porpoise_fsel_bits(porpoise_fpr_get_bits(state, %uU, 1U), porpoise_fpr_get_bits(state, %uU, 1U), porpoise_fpr_get_bits(state, %uU, 1U)); "
+                "porpoise_fpr_set_bits(state, %uU, 0U, result0); porpoise_fpr_set_bits(state, %uU, 1U, result1); }\n",
+                ra, rc, rb, ra, rc, rb, rd, rd);
         case OP_FLOAT_UNARY:
             if (operands.count != 2U || !parse_register(operands.values[0], 'f', &rd) ||
                 !parse_register(operands.values[1], 'f', &ra)) return false;
-            if (spec->detail == FLOAT_MOVE)
-                return file_printf(output, "    state->fpr[%u].f64 = state->fpr[%u].f64;\n", rd, ra);
-            if (spec->detail == FLOAT_NEG)
-                return file_printf(output, "    state->fpr[%u].f64 = -state->fpr[%u].f64;\n", rd, ra);
-            if (spec->detail == FLOAT_ABS)
-                return file_printf(output, "    state->fpr[%u].f64 = fabs(state->fpr[%u].f64);\n", rd, ra);
-            return file_printf(output, "    state->fpr[%u].f64 = -fabs(state->fpr[%u].f64);\n", rd, ra);
+            if (spec->detail == FLOAT_MOVE) {
+                if (!file_printf(output,
+                    "    porpoise_fpr_set_bits(state, %uU, 0U, porpoise_fpr_get_bits(state, %uU, 0U));\n",
+                    rd, ra)) return false;
+            } else if (spec->detail == FLOAT_NEG) {
+                if (!file_printf(output,
+                    "    porpoise_fpr_set_bits(state, %uU, 0U, porpoise_fpr_get_bits(state, %uU, 0U) ^ UINT64_C(0x8000000000000000));\n",
+                    rd, ra)) return false;
+            } else if (spec->detail == FLOAT_ABS) {
+                if (!file_printf(output,
+                    "    porpoise_fpr_set_bits(state, %uU, 0U, porpoise_fpr_get_bits(state, %uU, 0U) & UINT64_C(0x7FFFFFFFFFFFFFFF));\n",
+                    rd, ra)) return false;
+            } else if (!file_printf(output,
+                       "    porpoise_fpr_set_bits(state, %uU, 0U, porpoise_fpr_get_bits(state, %uU, 0U) | UINT64_C(0x8000000000000000));\n",
+                       rd, ra)) {
+                return false;
+            }
+            return !record || file_printf(output, "    porpoise_fpscr_update_cr1(state);\n");
+        case OP_FLOAT_COMPARE: {
+            unsigned int field;
+            if (operands.count != 3U || strncmp(operands.values[0], "cr", 2U) != 0 ||
+                !parse_unsigned(operands.values[0] + 2, &unsigned_value) ||
+                unsigned_value > 7U ||
+                !parse_register(operands.values[1], 'f', &ra) ||
+                !parse_register(operands.values[2], 'f', &rb)) return false;
+            field = (unsigned int)unsigned_value;
+            return file_printf(
+                output,
+                "    porpoise_fcmp%c(state, %uU, porpoise_fpr_get_bits(state, %uU, 0U), porpoise_fpr_get_bits(state, %uU, 0U));\n"
+                "    if (porpoise_state_has_fault(state)) return;\n",
+                spec->detail != 0 ? 'o' : 'u', field, ra, rb);
+        }
+        case OP_FLOAT_SELECT:
+            if (operands.count != 4U ||
+                !parse_register(operands.values[0], 'f', &rd) ||
+                !parse_register(operands.values[1], 'f', &ra) ||
+                !parse_register(operands.values[2], 'f', &rc) ||
+                !parse_register(operands.values[3], 'f', &rb) ||
+                !file_printf(
+                    output,
+                    "    porpoise_fpr_set_bits(state, %uU, 0U, porpoise_fsel_bits(porpoise_fpr_get_bits(state, %uU, 0U), porpoise_fpr_get_bits(state, %uU, 0U), porpoise_fpr_get_bits(state, %uU, 0U)));\n",
+                    rd, ra, rc, rb)) return false;
+            return !record || file_printf(output, "    porpoise_fpscr_update_cr1(state);\n");
+        case OP_FRSP:
+            if (operands.count != 2U || !parse_register(operands.values[0], 'f', &rd) ||
+                !parse_register(operands.values[1], 'f', &ra)) return false;
+            return file_printf(output,
+                "    if (!porpoise_frsp(state, %uU, %uU, %d)) return;\n",
+                rd, ra, record ? 1 : 0);
+        case OP_FCTIWZ:
+            if (operands.count != 2U || !parse_register(operands.values[0], 'f', &rd) ||
+                !parse_register(operands.values[1], 'f', &ra)) return false;
+            return file_printf(output,
+                "    if (!porpoise_fctiwz(state, %uU, %uU, %d)) return;\n",
+                rd, ra, record ? 1 : 0);
+        case OP_MFFS:
+            if (operands.count != 1U || !parse_register(operands.values[0], 'f', &rd))
+                return false;
+            return file_printf(output,
+                "    if (!porpoise_mffs(state, %uU, %d)) return;\n",
+                rd, record ? 1 : 0);
+        case OP_MTFSF:
+            if (operands.count != 2U ||
+                !parse_unsigned(operands.values[0], &unsigned_value) || unsigned_value > UINT8_MAX ||
+                !parse_register(operands.values[1], 'f', &ra)) return false;
+            return file_printf(output,
+                "    if (!porpoise_mtfsf(state, %luU, %uU, %d)) return;\n",
+                (unsigned long)unsigned_value, ra, record ? 1 : 0);
+        case OP_MTFSB1:
+            if (operands.count != 1U || !parse_cr_bit(operands.values[0], &rd))
+                return false;
+            return file_printf(output,
+                "    if (!porpoise_mtfsb1(state, %uU, %d)) return;\n",
+                rd, record ? 1 : 0);
+        case OP_FLOAT_FMA: {
+            int operation = spec->detail & 0xff;
+            const char *operation_name = operation == SCALAR_FMA_MADD ? "MADD" :
+                                         operation == SCALAR_FMA_MSUB ? "MSUB" :
+                                         operation == SCALAR_FMA_NMADD ? "NMADD" : "NMSUB";
+            const char *precision_name = (spec->detail & SCALAR_FMA_SINGLE) != 0
+                ? "SINGLE" : "DOUBLE";
+            if (operands.count != 4U || !parse_register(operands.values[0], 'f', &rd) ||
+                !parse_register(operands.values[1], 'f', &ra) ||
+                !parse_register(operands.values[2], 'f', &rc) ||
+                !parse_register(operands.values[3], 'f', &rb)) return false;
+            return file_printf(output,
+                "    if (!porpoise_fp_fma(state, %uU, %uU, %uU, %uU, "
+                "PORPOISE_FP_FMA_%s, PORPOISE_FP_PRECISION_%s, %d)) return;\n",
+                rd, ra, rc, rb, operation_name, precision_name, record ? 1 : 0);
+        }
         case OP_RECIPROCAL_APPROX:
             if (operands.count != 2U || !parse_register(operands.values[0], 'f', &rd) ||
                 !parse_register(operands.values[1], 'f', &ra)) return false;
             if (spec->detail == 0)
-                return file_printf(output, "    state->fpr[%u].f64 = 1.0 / state->fpr[%u].f64; /* approximation */\n", rd, ra);
-            return file_printf(output, "    state->fpr[%u].f64 = 1.0 / sqrt(state->fpr[%u].f64); /* approximation */\n", rd, ra);
+                return file_printf(output,
+                    "    porpoise_fpr_set_f64(state, %uU, 0U, 1.0 / porpoise_fpr_get_f64(state, %uU, 0U)); /* approximation */\n",
+                    rd, ra);
+            return file_printf(output,
+                "    porpoise_fpr_set_f64(state, %uU, 0U, 1.0 / sqrt(porpoise_fpr_get_f64(state, %uU, 0U))); /* approximation */\n",
+                rd, ra);
     }
     return false;
 }
@@ -1134,34 +1968,176 @@ int porpoise_lower_function(
     size_t index;
     int result = PORPOISE_EXIT_OK;
     if (!file_printf(output, "void porpoise_lifted_%s(PorpoisePpcState *state)\n{\n", function->c_name) ||
-        !file_printf(output, "    if (state == NULL || porpoise_state_has_fault(state)) return;\n"))
+        !file_printf(output, "    if (porpoise_state_should_stop(state)) return;\n"))
         return PORPOISE_EXIT_IO;
+    if (!emit_function_entry_dispatch(output, function)) return PORPOISE_EXIT_IO;
     for (index = 0U; index < function->item_count; index++) {
         const PorpoiseAsmItem *item = &function->items[index];
         if (item->kind == PORPOISE_ASM_LABEL) {
-            char label[PORPOISE_NAME_CAPACITY];
-            porpoise_sanitize_identifier(item->label, label, sizeof(label));
-            if (!file_printf(output, "porpoise_label_%s:\n    ;\n", label)) return PORPOISE_EXIT_IO;
+            continue;
         } else {
             const OpcodeSpec *spec = find_opcode(item->mnemonic);
             const char *detail = NULL;
             bool emitted;
+            if (function_item_needs_entry_label(function, index) &&
+                !file_printf(output, "porpoise_entry_item_%lu:\n    ;\n", (unsigned long)index))
+                return PORPOISE_EXIT_IO;
             if (spec == NULL) {
-                if (!porpoise_report_add(report, source->relative_path, item->source_line, item->address,
-                                         item->mnemonic, PORPOISE_UNSUPPORTED, false,
-                                         "opcode is not in the lowering registry")) return PORPOISE_EXIT_INTERNAL;
-                if (!porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR,
-                                              source->relative_path, item->source_line,
-                                              item->address, "unsupported instruction %s",
-                                              item->mnemonic)) return PORPOISE_EXIT_INTERNAL;
-                result = PORPOISE_EXIT_TRANSLATION;
+                PorpoiseSystemInstruction system_instruction;
+                PorpoiseSystemResolveResult system_result =
+                    porpoise_system_resolve(
+                        item->mnemonic,
+                        item->operands,
+                        item->word,
+                        &system_instruction);
+
+                if (system_result == PORPOISE_SYSTEM_NOT_RECOGNIZED) {
+                    if (!porpoise_report_add(
+                            report,
+                            source->relative_path,
+                            item->source_line,
+                            item->address,
+                            item->mnemonic,
+                            PORPOISE_UNSUPPORTED,
+                            false,
+                            "opcode is not in the lowering registry")) {
+                        return PORPOISE_EXIT_INTERNAL;
+                    }
+                    if (!porpoise_diagnostics_add(
+                            diagnostics,
+                            PORPOISE_SEVERITY_ERROR,
+                            source->relative_path,
+                            item->source_line,
+                            item->address,
+                            "unsupported instruction %s",
+                            item->mnemonic)) {
+                        return PORPOISE_EXIT_INTERNAL;
+                    }
+                    result = PORPOISE_EXIT_TRANSLATION;
+                    continue;
+                }
+                if (system_result == PORPOISE_SYSTEM_INVALID) {
+                    if (!porpoise_report_add(
+                            report,
+                            source->relative_path,
+                            item->source_line,
+                            item->address,
+                            item->mnemonic,
+                            PORPOISE_UNSUPPORTED,
+                            false,
+                            system_instruction.detail)) {
+                        return PORPOISE_EXIT_INTERNAL;
+                    }
+                    if (!porpoise_diagnostics_add(
+                            diagnostics,
+                            PORPOISE_SEVERITY_ERROR,
+                            source->relative_path,
+                            item->source_line,
+                            item->address,
+                            "invalid operands or annotated word for %s: %s",
+                            item->mnemonic,
+                            item->operands)) {
+                        return PORPOISE_EXIT_INTERNAL;
+                    }
+                    result = PORPOISE_EXIT_TRANSLATION;
+                    continue;
+                }
+                if (!porpoise_report_add(
+                        report,
+                        source->relative_path,
+                        item->source_line,
+                        item->address,
+                        item->mnemonic,
+                        system_instruction.status,
+                        system_instruction.semantic_test,
+                        system_instruction.detail)) {
+                    return PORPOISE_EXIT_INTERNAL;
+                }
+                if (system_instruction.status == PORPOISE_UNSUPPORTED) {
+                    if (!porpoise_diagnostics_add(
+                            diagnostics,
+                            PORPOISE_SEVERITY_ERROR,
+                            source->relative_path,
+                            item->source_line,
+                            item->address,
+                            "unsupported instruction %s: %s",
+                            item->mnemonic,
+                            system_instruction.detail)) {
+                        return PORPOISE_EXIT_INTERNAL;
+                    }
+                    result = PORPOISE_EXIT_TRANSLATION;
+                    continue;
+                }
+                if (system_instruction.status == PORPOISE_APPROXIMATE) {
+                    if (!porpoise_diagnostics_add(
+                            diagnostics,
+                            options->strict
+                                ? PORPOISE_SEVERITY_ERROR
+                                : PORPOISE_SEVERITY_WARNING,
+                            source->relative_path,
+                            item->source_line,
+                            item->address,
+                            "%s instruction uses approximate host semantics",
+                            item->mnemonic)) {
+                        return PORPOISE_EXIT_INTERNAL;
+                    }
+                    if (options->strict) {
+                        result = PORPOISE_EXIT_TRANSLATION;
+                        continue;
+                    }
+                }
+                if (!file_printf(
+                        output,
+                        "    state->pc = UINT32_C(0x%08lX);\n",
+                        (unsigned long)item->address)) {
+                    return PORPOISE_EXIT_IO;
+                }
+                if (!porpoise_system_emit(
+                        output,
+                        &system_instruction,
+                        item->address)) {
+                    if (ferror(output) != 0) return PORPOISE_EXIT_IO;
+                    if (!porpoise_diagnostics_add(
+                            diagnostics,
+                            PORPOISE_SEVERITY_ERROR,
+                            source->relative_path,
+                            item->source_line,
+                            item->address,
+                            "internal system-lowering failure for %s",
+                            item->mnemonic)) {
+                        return PORPOISE_EXIT_INTERNAL;
+                    }
+                    return PORPOISE_EXIT_INTERNAL;
+                }
                 continue;
             }
             if (spec->status == PORPOISE_HOST_NOOP) detail = "documented host-equivalent no-op";
             if (spec->status == PORPOISE_APPROXIMATE) {
-                detail = spec->operation == OP_BLR
-                    ? "C call-stack return does not dispatch an arbitrary guest LR target"
-                    : "host arithmetic does not reproduce hardware estimate semantics";
+                if (spec->operation == OP_BLR) {
+                    detail = "C call-stack return does not dispatch an arbitrary guest LR target";
+                } else if (spec->operation == OP_CONDITIONAL_RETURN) {
+                    detail = "taken LR branch returns through the C call stack instead of dispatching the arbitrary guest LR target";
+                } else if (spec->operation == OP_FRSP) {
+                    detail = "runtime duplicates lane 0 into architecturally undefined destination lane 1 for deterministic compatibility";
+                } else if (spec->operation == OP_FLOAT_FMA) {
+                    detail = "finite arithmetic uses host C99 fma and does not reproduce all PPC rounding and exception semantics";
+                } else if (spec->operation == OP_PSQ_DFORM ||
+                           spec->operation == OP_PSQ_INDEXED) {
+                    detail = "runtime models GQR quantization deterministically but does not reproduce all Gekko NI behavior or FPSCR and floating-point exception side effects";
+                } else if (spec->operation == OP_FLOAT_BINARY) {
+                    detail = "host arithmetic does not reproduce all PPC floating-point rounding, exception, and status semantics";
+                } else if (spec->operation == OP_PAIRED_TERNARY ||
+                           spec->operation == OP_PAIRED_SCALAR_MADD) {
+                    detail = "host arithmetic does not reproduce PPC paired-single Force25, fused rounding, exception, and FPSCR semantics";
+                } else if ((spec->operation == OP_PAIRED_BINARY && spec->detail == FLOAT_MUL) ||
+                           spec->operation == OP_PAIRED_SCALAR_MULTIPLY) {
+                    detail = "host arithmetic does not reproduce PPC paired-single Force25, rounding, exception, and FPSCR semantics";
+                } else if (spec->operation == OP_PAIRED_BINARY ||
+                           spec->operation == OP_PAIRED_SUM) {
+                    detail = "host arithmetic does not reproduce PPC paired-single rounding, exception, and FPSCR semantics";
+                } else {
+                    detail = "host arithmetic does not reproduce hardware estimate semantics";
+                }
             }
             if (!porpoise_report_add(report, source->relative_path, item->source_line, item->address,
                                      item->mnemonic, spec->status, spec->semantic_test, detail))

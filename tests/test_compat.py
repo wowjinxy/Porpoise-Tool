@@ -12,7 +12,15 @@ libporpoise = Path(sys.argv[3]).resolve()
 
 with tempfile.TemporaryDirectory(prefix="porpoise-compat-") as temporary:
     output = Path(temporary) / "generated"
-    subprocess.run([str(tool), str(root / "tests/fixtures/inputs/with_main"), "--output", str(output)], check=True)
+    subprocess.run(
+        [
+            str(tool),
+            str(root / "tests/fixtures/inputs/basic/no_entry.s"),
+            "--output",
+            str(output),
+        ],
+        check=True,
+    )
     subproject = output / "subprojects" / "libPorpoise"
     subproject.parent.mkdir(parents=True)
     try:

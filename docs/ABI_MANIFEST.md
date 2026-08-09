@@ -168,7 +168,7 @@ Guest pointers remain 32-bit values in GPRs. Direct import arguments call `porpo
 
 Guest pointer value zero maps to native `NULL`, and native `NULL` maps back to zero without a fault.
 
-Some evolving `libPorpoise` versions encode non-console native pointers as finite address tokens. The current ABI has no generic lifetime signal for an import result retained by guest code, so integrations that return transient native pointers must define ownership in a dedicated adapter and arrange token release using that `libPorpoise` version's API.
+Some evolving `libPorpoise` versions encode non-console native pointers as finite address tokens. The generated generic adapter treats those values as opaque handles: they may round-trip through pointer conversion, but memory helpers and handle arithmetic reject them. It owns every token it creates until `porpoise_libporpoise_adapter_shutdown`, which generated entry code calls before returning. Integrations that need shorter-lived handles or ownership beyond one entry invocation must express that policy in a dedicated adapter using that `libPorpoise` version's API.
 
 Never model a pointer by casting a `uint32_t` directly to a native pointer, and do not use an integer type in the manifest to bypass pointer conversion. On a 64-bit host that loses both safety and the `libPorpoise` address-token policy.
 

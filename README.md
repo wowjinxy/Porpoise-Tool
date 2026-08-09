@@ -125,6 +125,16 @@ dependency('libPorpoise', fallback: ['libPorpoise', 'libporpoise_dep'])
 
 Provide either an installed `libPorpoise` dependency or a checkout at `generated/title/subprojects/libPorpoise` that exports `libporpoise_dep`. Porpoise Tool deliberately creates no wrap file and chooses no library revision.
 
+The reusable static library needs no startup-register provider. The optional executable additionally requires `dependency('porpoise-title-host', fallback: ['porpoise-title-host', 'porpoise_title_host_dep'])`, supplied by the consumer as an installed dependency or subproject without a generated wrap or pin. That dependency implements the versioned primitive-C contract from `porpoise_title_host.h`:
+
+```c
+int PorpoiseHostPrepareTitleEntryV1(
+    uint32_t entry_address,
+    uint32_t gpr_out[32]);
+```
+
+It runs after `OSInit`, receives a caller-zeroed GPR image, and returns zero only after providing a valid guest stack plus the title-specific TOC/SDA bases. A missing provider fails Meson configuration/linking rather than allowing `DolphinMain` to run with guessed zero registers.
+
 The currently evolving checkout also defaults its own `build_target` option to `gc`. When using that version as a host subproject, select the host explicitly during setup, for example `-DlibPorpoise:build_target=linux` or `-DlibPorpoise:build_target=win64`. Treat that option as version-sensitive integration surface; an installed dependency may expose a different contract.
 
 Then build the generated project:
@@ -139,7 +149,7 @@ Every successful generation provides the `porpoise_lifted` static library and th
 - `--entry` names a translated, unskipped input function; or
 - exactly one unskipped function is declared as `.fn main, global`.
 
-The executable exports `DolphinMain`, initializes the `libPorpoise` adapter once, and invokes the lifted entry. It never runs a transpiled console `__start`. Without an entry, the generated static library remains usable by another host target.
+The executable exports `DolphinMain`, initializes the `libPorpoise` adapter once, requests the explicit title-entry register state above, and invokes the lifted entry. It never runs a transpiled console `__start`. Without an entry, the generated static library remains usable by another host target.
 
 Generation happens in a sibling staging directory. Failed parsing, lowering, or writing leaves the requested destination untouched. With `--force`, the previous destination is moved to a backup only during publication and restored if publication fails.
 

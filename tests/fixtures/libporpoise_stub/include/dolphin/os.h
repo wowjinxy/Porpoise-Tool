@@ -3,6 +3,7 @@
 
 #include <dolphin/os/OSHostAddress.h>
 #include <dolphin/os/OSHostMemory.h>
+#include <dolphin/os/OSTime.h>
 #include <dolphin/types.h>
 
 #ifdef __cplusplus

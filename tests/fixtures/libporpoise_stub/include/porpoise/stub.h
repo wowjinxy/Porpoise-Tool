@@ -8,6 +8,14 @@ extern "C" {
 #endif
 
 unsigned int PorpoiseStubOSInitCount(void);
+void *PorpoiseStubNativePointer(void);
+uint32_t PorpoiseStubTokenAddress(void);
+unsigned int PorpoiseStubTokenReleaseCount(void);
+unsigned int PorpoiseStubBootstrapCount(void);
+int PorpoiseStubTitleSentinelsValid(void);
+int PorpoiseHostPrepareTitleEntryV1(
+    uint32_t entry_address,
+    uint32_t gpr_out[32]);
 uint32_t PorpoiseStubAdd(uint32_t left, uint32_t right);
 void *PorpoiseStubIdentity(void *pointer);
 double PorpoiseStubFloatMix(float left, double right);

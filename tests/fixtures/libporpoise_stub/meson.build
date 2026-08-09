@@ -27,3 +27,10 @@ libporpoise_dep = declare_dependency(
 )
 
 meson.override_dependency('libPorpoise', libporpoise_dep)
+
+porpoise_title_host_dep = declare_dependency(
+  include_directories: libporpoise_stub_inc,
+  link_with: libporpoise_stub_lib,
+)
+
+meson.override_dependency('porpoise-title-host', porpoise_title_host_dep)

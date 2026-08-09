@@ -6,5 +6,9 @@ extern void DolphinMain(void);
 
 int main(void) {
     DolphinMain();
-    return PorpoiseStubOSInitCount() == 1U ? 0 : 2;
+    return PorpoiseStubOSInitCount() == 1U &&
+                   PorpoiseStubBootstrapCount() == 1U &&
+                   PorpoiseStubTitleSentinelsValid()
+               ? 0
+               : 2;
 }

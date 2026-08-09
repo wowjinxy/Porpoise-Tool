@@ -75,6 +75,7 @@ jobs:
           cppcheck
           --enable=warning,style,performance,portability
           --error-exitcode=1
+          --inline-suppr
           --suppress=missingIncludeSystem
           --std=c11
           -Iinclude

@@ -44,27 +44,31 @@ Arguments, return values, and control state live in `PorpoisePpcState`. There ar
 The state contains:
 
 - 32 `uint32_t` GPRs;
-- 32 FPR unions, each viewable as a scalar `double`, two paired-single `float` lanes, or 64 raw bits;
-- CR, XER, LR, CTR, PC, and eight GQR values;
+- 32 FPRs with two authoritative raw 64-bit lane encodings, accessed through explicit binary32/binary64 conversion helpers;
+- CR, FPSCR, XER, LR, CTR, PC, MSR, eight GQR values, and named supervisor/system registers;
+- state-owned time-base bias and decrementer anchors, while the monotonic raw clock remains host-owned;
 - an explicit ready/running/returned/faulted execution status;
 - a sticky fault code, guest fault address, and message;
 - a pointer to the active `PorpoiseHostAdapter`.
 
-State initialization zeroes the register file and attaches the host adapter. The first fault is retained; generated memory and pointer operations return early once a fault exists.
+State initialization zeroes the register file and attaches the host adapter. It deliberately leaves startup registers, MSR, and HID2 neutral. After host initialization, generated `DolphinMain` asks the separate, versioned `porpoise-title-host` provider for the complete initial GPR image. `porpoise_state_prepare_title_entry` then requires aligned guest `r1` (stack) plus nonzero `r2` (TOC/SDA2) and `r13` (SDA) before enabling MSR[FP], HID2[PSE], and HID2[LSQE]. Missing or invalid bootstrap state fails explicitly—Porpoise Tool does not guess it or execute a lifted `__start`. The first fault is retained, and generated code also stops when a callback marks execution returned or faulted.
 
-Direct calls to another translated function pass the same state pointer. `bctr` and `bctrl` use a generated `uint32_t` address switch whose targets all have the same lifted signature. An address absent from that registry produces an unsupported-operation fault instead of calling through a cast.
+Direct calls to another translated function pass the same state pointer. Function starts, address aliases, and labeled instruction entry points share a generated `uint32_t` address switch whose targets all have the same lifted signature. Indirect branches and modeled interrupt return use that registry. An address absent from it produces an unsupported-operation fault instead of calling through a cast.
 
 ## Guest memory and pointer model
 
 Guest addresses remain `uint32_t` throughout generated code. The lifted runtime never adds a fake 256 MiB allocation or converts an address with a native pointer cast.
 
-`PorpoiseHostAdapter` provides four operations:
+`PorpoiseHostAdapter` provides four memory/pointer operations and three optional system-event operations:
 
 ```c
 read_bytes(context, guest_address, destination, size)
 write_bytes(context, guest_address, source, size)
 decode_pointer(context, guest_address, pointer_out)
 encode_pointer(context, pointer, guest_address_out)
+read_time_base(context, ticks_out)
+trap(context, state, instruction_address, trap_options, left, right)
+system_call(context, state, instruction_address)
 ```
 
 Integer and floating loads/stores assemble or disassemble big-endian byte arrays explicitly. This avoids host-endian assumptions and unaligned native dereferences. Access spans are checked for 32-bit overflow before they reach the host.
@@ -74,14 +78,18 @@ Annotated four-byte data records are emitted as a deterministic `porpoise_initia
 The current `libPorpoise` adapter is the only generated source that includes unstable host-address interfaces. It:
 
 - calls `OSInit()` once before a lifted entry;
-- uses `__OSHostDecodeAddress`, `__OSHostEncodePointerWord`, and the address-token query supplied by `libPorpoise`;
+- uses `__OSHostDecodeAddress`, `__OSHostEncodeAddress`, the address-token query, and matching release operation supplied by `libPorpoise`;
+- obtains monotonic target ticks through `OSGetTime` for lifted time-base and decrementer instructions;
+- treats host-address tokens as opaque handles that pointer conversion may use but guest memory reads, writes, and handle arithmetic may not;
 - checks that multi-byte non-token mappings are contiguous;
 - rejects null, unmapped, overflowing, and currently unsupported MMIO/EFB spans with explicit host results;
 - returns those failures as sticky PPC execution faults.
 
 This containment is deliberate: when the evolving `libPorpoise` address API changes, the adapter should change without rewriting lifted sources or introducing another memory owner.
 
-Native-pointer tokens are version-sensitive too. The generic state adapter can encode and decode them, but it cannot infer when guest code has finished retaining an imported pointer. Dedicated adapters must document ownership and release transient tokens through the matching `libPorpoise` API.
+Trap and system-call callbacks are deliberately explicit. The default adapter does not invent guest exception handling or SDK behavior when the consumer has supplied no matching host service; execution faults at that boundary instead. A callback may leave execution unchanged to continue, set `PORPOISE_EXECUTION_RETURNED` for a normal terminal return, or set a concrete fault. Any other unaccompanied terminal/status transition is converted to an invalid-state fault, including across nested lifted calls. Privileged raw state transfers remain in `PorpoisePpcState`, while MMU, cache, interrupt, and device side effects are reported as approximate or unsupported.
+
+Native-pointer tokens are version-sensitive too. The generic adapter records each distinct token it created, accepts only those tokens on decode, and releases them all during `porpoise_libporpoise_adapter_shutdown`. It permits exactly one live adapter instance, avoiding ambiguous ownership if a host interns token values. Generated entry code performs shutdown on every post-initialization exit. Dedicated adapters that need concurrent instances, a shorter lifetime, or ownership beyond one entry invocation must define it explicitly with the matching `libPorpoise` API.
 
 ## ABI boundary
 
@@ -100,6 +108,8 @@ generated/
 ├── include/
 │   ├── porpoise_lifted.h
 │   ├── porpoise_libporpoise_adapter.h
+│   ├── porpoise_title_host.h
+│   ├── porpoise_dispatch.h
 │   ├── porpoise_generated.h
 │   ├── porpoise_data.h
 │   ├── porpoise_imports.h
@@ -116,9 +126,14 @@ generated/
     └── porpoise_entry.c              # only when an entry is selected
 ```
 
-Meson always builds `porpoise_lifted`, a static library, and exposes it as the dependency override `porpoise-generated`. If `--entry` is valid or exactly one unskipped `.fn main, global` exists, Meson also builds `porpoise_title` from a `DolphinMain` adapter. The adapter does not invoke a translated `__start`; host startup remains a `libPorpoise` responsibility.
+Meson always builds `porpoise_lifted`, a static library, and exposes it as the dependency override `porpoise-generated`. If `--entry` is valid or exactly one unskipped `.fn main, global` exists, Meson also builds `porpoise_title` from a `DolphinMain` adapter and requires the consumer-supplied `porpoise-title-host` dependency. The adapter does not invoke a translated `__start`; host startup remains a `libPorpoise` responsibility, while title-specific initial GPR values remain the title-host provider's responsibility.
 
 No entry is a valid library-only result. REL/native-module targets are not generated.
+
+Each lifted translation unit includes only its per-input declaration header and
+the small dispatch contract. The aggregate `porpoise_generated.h` remains a
+consumer convenience header; it is not included by every generated source, so
+large input trees do not repeatedly parse every lifted declaration.
 
 ## Status and reporting model
 
@@ -135,7 +150,7 @@ Unsupported instructions are recorded while lowering the temporary stage, but fa
 
 ## Testing and supported hosts
 
-The repository test suite covers runtime endian/address/fault behavior, CLI/config and atomic-output contracts, malformed and nested inputs, strict approximations, deterministic generation, and generated static-library/executable builds against a stable `libPorpoise` contract stub.
+The repository test suite covers runtime endian/address/fault behavior, raw scalar and paired floating-point state, quantized paired loads/stores, system-event callbacks, CLI/config and atomic-output contracts, malformed and nested inputs, strict approximations, deterministic generation, and generated static-library/executable builds against a stable `libPorpoise` contract stub.
 
 CI targets:
 

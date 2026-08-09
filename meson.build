@@ -10,6 +10,7 @@ project(
 )
 
 cc = meson.get_compiler('c')
+math_dep = cc.find_library('m', required: false)
 python = import('python').find_installation()
 
 porpoise_inc = include_directories('include', 'third_party/jsmn')
@@ -29,6 +30,7 @@ porpoise_core_sources = files(
   'src/program.c',
   'src/project.c',
   'src/report.c',
+  'src/system_lower.c',
   'src/util.c',
   'third_party/jsmn/jsmn.c',
 )
@@ -68,14 +70,101 @@ runtime_test = executable(
     'runtime/src/porpoise_lifted.c',
   ],
   include_directories: include_directories('runtime/include'),
+  dependencies: math_dep,
 )
 test('lifted-runtime', runtime_test)
+
+scalar_fp_runtime_test = executable(
+  'test_scalar_fp_runtime',
+  [
+    'tests/test_scalar_fp_runtime.c',
+    'runtime/src/porpoise_lifted.c',
+  ],
+  include_directories: include_directories('runtime/include'),
+  dependencies: math_dep,
+)
+test('scalar-fp-runtime', scalar_fp_runtime_test)
+
+psq_runtime_test = executable(
+  'test_psq_runtime',
+  [
+    'tests/test_psq_runtime.c',
+    'runtime/src/porpoise_lifted.c',
+  ],
+  include_directories: include_directories('runtime/include'),
+  dependencies: math_dep,
+)
+test('psq-runtime', psq_runtime_test)
+
+system_runtime_test = executable(
+  'test_system_runtime',
+  [
+    'tests/test_system_runtime.c',
+    'runtime/src/porpoise_lifted.c',
+  ],
+  include_directories: include_directories('runtime/include'),
+  dependencies: math_dep,
+  c_args: ['-Werror'],
+)
+test('system-runtime', system_runtime_test)
+
+libporpoise_adapter_test = executable(
+  'test_libporpoise_adapter',
+  [
+    'tests/test_libporpoise_adapter.c',
+    'runtime/src/porpoise_lifted.c',
+    'runtime/src/porpoise_libporpoise_adapter.c',
+    'tests/fixtures/libporpoise_stub/src/os_stub.c',
+  ],
+  include_directories: include_directories(
+    'runtime/include',
+    'tests/fixtures/libporpoise_stub/include',
+  ),
+  dependencies: math_dep,
+  c_args: ['-Werror', '-DLIBPORPOISE_PORT'],
+)
+test('libporpoise-adapter', libporpoise_adapter_test)
+
+system_lower_test = executable(
+  'test_system_lower',
+  [
+    'tests/test_system_lower.c',
+    'src/system_lower.c',
+  ],
+  include_directories: porpoise_inc,
+  c_args: ['-Werror'],
+)
+test('system-lowering', system_lower_test)
+
+program_test = executable(
+  'test_program',
+  'tests/test_program.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test(
+  'program-parser',
+  program_test,
+  args: [meson.project_source_root()],
+)
 
 test(
   'cli-contract',
   python,
   args: [
     files('tests/test_cli.py'),
+    porpoise,
+    meson.project_source_root(),
+  ],
+  timeout: 180,
+)
+
+test(
+  'system-cli-contract',
+  python,
+  args: [
+    files('tests/test_system_cli.py'),
     porpoise,
     meson.project_source_root(),
   ],
