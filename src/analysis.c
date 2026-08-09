@@ -1,6 +1,7 @@
 #include "porpoise/analysis.h"
 #include "porpoise/util.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 enum {
@@ -108,6 +109,11 @@ static int validate_abi_namespace(const PorpoiseProgram *program,
 
         if (function->kind == PORPOISE_ABI_IMPORT) {
             char bridge[PORPOISE_GENERATED_SYMBOL_CAPACITY];
+            const PorpoiseAddressAlias *declared_alias =
+                porpoise_program_find_declared_alias(
+                    program,
+                    function->symbol,
+                    NULL);
 
             if (porpoise_program_find_function(
                     program,
@@ -119,6 +125,18 @@ static int validate_abi_namespace(const PorpoiseProgram *program,
                     0U,
                     0U,
                     "ABI import %s conflicts with a translated function",
+                    function->symbol);
+                valid = false;
+            }
+            if (declared_alias != NULL &&
+                !declared_alias->is_function_name) {
+                porpoise_diagnostics_add(
+                    diagnostics,
+                    PORPOISE_SEVERITY_ERROR,
+                    declared_alias->source_path,
+                    declared_alias->source_line,
+                    declared_alias->address,
+                    "ABI import %s conflicts with an ordinary input address alias",
                     function->symbol);
                 valid = false;
             }
@@ -326,19 +344,146 @@ static bool function_has_global_input_name(
     return false;
 }
 
+void porpoise_analysis_init(PorpoiseAnalysis *analysis) {
+    if (analysis != NULL) memset(analysis, 0, sizeof(*analysis));
+}
+
+void porpoise_analysis_free(PorpoiseAnalysis *analysis) {
+    if (analysis == NULL) return;
+    free(analysis->import_bindings);
+    memset(analysis, 0, sizeof(*analysis));
+}
+
+static int build_import_bindings(
+    const PorpoiseProgram *program,
+    const PorpoiseAbiManifest *abi,
+    PorpoiseAnalysis *analysis,
+    PorpoiseDiagnostics *diagnostics) {
+    size_t function_index;
+    size_t binding_count = 0U;
+    size_t binding_index = 0U;
+    bool valid = true;
+
+    for (function_index = 0U;
+         function_index < abi->function_count;
+         function_index++) {
+        const PorpoiseAbiFunction *function = &abi->functions[function_index];
+        const PorpoiseFunction *owner = NULL;
+
+        if (function->kind != PORPOISE_ABI_IMPORT) continue;
+        if (!porpoise_program_resolve_declared_function(
+                program, function->symbol, &owner, NULL, NULL)) {
+            continue;
+        }
+        if (owner == NULL || !owner->skipped) {
+            porpoise_diagnostics_add(
+                diagnostics,
+                PORPOISE_SEVERITY_ERROR,
+                NULL,
+                0U,
+                owner == NULL ? 0U : owner->start_address,
+                "ABI import %s conflicts with a translated function",
+                function->symbol);
+            valid = false;
+            continue;
+        }
+        binding_count++;
+    }
+
+    if (!valid) return PORPOISE_EXIT_USAGE;
+    if (binding_count == 0U) return PORPOISE_EXIT_OK;
+    if (binding_count > SIZE_MAX / sizeof(*analysis->import_bindings)) {
+        porpoise_diagnostics_add(
+            diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            NULL,
+            0U,
+            0U,
+            "too many skipped ABI import bindings");
+        return PORPOISE_EXIT_INTERNAL;
+    }
+    analysis->import_bindings = (PorpoiseImportBinding *)calloc(
+        binding_count, sizeof(*analysis->import_bindings));
+    if (analysis->import_bindings == NULL) {
+        porpoise_diagnostics_add(
+            diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            NULL,
+            0U,
+            0U,
+            "out of memory while binding skipped ABI imports");
+        return PORPOISE_EXIT_INTERNAL;
+    }
+
+    for (function_index = 0U;
+         function_index < abi->function_count;
+         function_index++) {
+        const PorpoiseAbiFunction *function = &abi->functions[function_index];
+        const PorpoiseFunction *owner = NULL;
+        const PorpoiseAddressAlias *alias = NULL;
+        uint32_t guest_address = 0U;
+        size_t previous;
+
+        if (function->kind != PORPOISE_ABI_IMPORT) continue;
+        if (!porpoise_program_resolve_declared_function(
+                program,
+                function->symbol,
+                &owner,
+                &alias,
+                &guest_address) ||
+            owner == NULL || !owner->skipped) {
+            continue;
+        }
+
+        for (previous = 0U; previous < binding_index; previous++) {
+            const PorpoiseImportBinding *candidate =
+                &analysis->import_bindings[previous];
+            if (candidate->guest_address != guest_address) continue;
+            porpoise_diagnostics_add(
+                diagnostics,
+                PORPOISE_SEVERITY_ERROR,
+                NULL,
+                0U,
+                guest_address,
+                "ABI imports %s and %s bind to the same skipped guest address",
+                candidate->import->symbol,
+                function->symbol);
+            valid = false;
+            break;
+        }
+        if (!valid) continue;
+
+        analysis->import_bindings[binding_index].import = function;
+        analysis->import_bindings[binding_index].owner = owner;
+        analysis->import_bindings[binding_index].alias = alias;
+        analysis->import_bindings[binding_index].guest_address = guest_address;
+        binding_index++;
+    }
+
+    if (!valid) {
+        free(analysis->import_bindings);
+        analysis->import_bindings = NULL;
+        return PORPOISE_EXIT_USAGE;
+    }
+    analysis->import_binding_count = binding_index;
+    return PORPOISE_EXIT_OK;
+}
+
 int porpoise_analyze_program(
     const PorpoiseProgram *program,
     const PorpoiseAbiManifest *abi,
     const char *requested_entry,
     PorpoiseAnalysis *analysis,
     PorpoiseDiagnostics *diagnostics) {
+    PorpoiseAnalysis candidate;
     size_t file_index;
     size_t function_index;
     int namespace_result;
+    int binding_result;
     bool valid = true;
     if (program == NULL || abi == NULL || analysis == NULL || diagnostics == NULL)
         return PORPOISE_EXIT_INTERNAL;
-    memset(analysis, 0, sizeof(*analysis));
+    porpoise_analysis_init(&candidate);
     namespace_result = validate_abi_namespace(program, abi, diagnostics);
     if (namespace_result != PORPOISE_EXIT_OK) {
         return namespace_result;
@@ -348,10 +493,10 @@ int porpoise_analyze_program(
         for (function_index = 0U; function_index < file->function_count; function_index++) {
             const PorpoiseFunction *function = &file->functions[function_index];
             if (function->skipped) continue;
-            analysis->translated_function_count++;
+            candidate.translated_function_count++;
         }
     }
-    if (analysis->translated_function_count == 0U) {
+    if (candidate.translated_function_count == 0U) {
         porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, NULL, 0U, 0U,
                                  "no functions remain to translate");
         valid = false;
@@ -372,8 +517,8 @@ int porpoise_analyze_program(
                                      "console __start cannot be used as the host entry; select a title function");
             return PORPOISE_EXIT_USAGE;
         }
-        analysis->entry = porpoise_program_find_function(program, requested_entry);
-        if (analysis->entry == NULL) {
+        candidate.entry = porpoise_program_find_function(program, requested_entry);
+        if (candidate.entry == NULL) {
             porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, requested_entry, 0U, 0U,
                                      "entry symbol is not a translated input function");
             return PORPOISE_EXIT_USAGE;
@@ -386,12 +531,22 @@ int porpoise_analyze_program(
                 const PorpoiseFunction *function = &file->functions[function_index];
                 if (!function->skipped &&
                     function_has_global_input_name(function, "main")) {
-                    analysis->entry = function;
+                    candidate.entry = function;
                     main_count++;
                 }
             }
         }
-        if (main_count != 1U) analysis->entry = NULL;
+        if (main_count != 1U) candidate.entry = NULL;
     }
+
+    binding_result = build_import_bindings(
+        program, abi, &candidate, diagnostics);
+    if (binding_result != PORPOISE_EXIT_OK) {
+        porpoise_analysis_free(&candidate);
+        return binding_result;
+    }
+
+    porpoise_analysis_free(analysis);
+    *analysis = candidate;
     return PORPOISE_EXIT_OK;
 }

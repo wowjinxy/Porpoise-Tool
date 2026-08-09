@@ -110,6 +110,23 @@ const PorpoiseAddressAlias *porpoise_program_find_alias(
     const PorpoiseProgram *program,
     const char *name,
     const PorpoiseFunction **function_out);
+/* Exact input spelling, including aliases owned by skipped functions. */
+const PorpoiseAddressAlias *porpoise_program_find_declared_alias(
+    const PorpoiseProgram *program,
+    const char *name,
+    const PorpoiseFunction **function_out);
+/*
+ * Resolve an exact function name declared by the input, including a declared
+ * function-name alias and including functions excluded by a skip list. This
+ * intentionally does not resolve generated C-name spellings, ordinary symbol
+ * aliases, or instruction labels.
+ */
+bool porpoise_program_resolve_declared_function(
+    const PorpoiseProgram *program,
+    const char *name,
+    const PorpoiseFunction **function_out,
+    const PorpoiseAddressAlias **alias_out,
+    uint32_t *address_out);
 size_t porpoise_program_count_aliases(const PorpoiseProgram *program);
 const PorpoiseAddressAlias *porpoise_program_alias_at(
     const PorpoiseProgram *program,

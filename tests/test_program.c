@@ -265,6 +265,176 @@ static void test_atomic_skip_list(const char *source_root) {
     porpoise_program_free(&program);
 }
 
+static void test_skipped_import_bindings(const char *source_root) {
+    char path[PORPOISE_PATH_CAPACITY];
+    PorpoiseProgram program;
+    PorpoiseDiagnostics diagnostics;
+    PorpoiseAnalysis analysis;
+    PorpoiseAbiFunction imports[2] = {{0}};
+    PorpoiseAbiManifest abi = {0};
+    PorpoiseAbiFunction replacement_import = {0};
+    PorpoiseAbiManifest replacement_abi = {0};
+    PorpoiseAbiFunction duplicate_imports[2] = {{0}};
+    PorpoiseAbiManifest duplicate_abi = {0};
+    PorpoiseAbiFunction conflict_import = {0};
+    PorpoiseAbiManifest conflict_abi = {0};
+    PorpoiseAbiFunction ordinary_alias_import = {0};
+    PorpoiseAbiManifest ordinary_alias_abi = {0};
+    PorpoiseFunction *primary;
+    PorpoiseFunction *secondary;
+    const PorpoiseFunction *owner = NULL;
+    const PorpoiseAddressAlias *alias = NULL;
+    PorpoiseImportBinding *successful_bindings;
+    uint32_t address = 0U;
+    int result;
+
+    CHECK(make_fixture_path(path, sizeof(path), source_root,
+                            "symbol_aliases_valid.s"));
+    porpoise_program_init(&program);
+    porpoise_diagnostics_init(&diagnostics);
+    porpoise_analysis_init(&analysis);
+    result = porpoise_program_load(&program, path, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    CHECK(program.file_count == 1U);
+    CHECK(program.files[0].function_count == 2U);
+    primary = &program.files[0].functions[0];
+    secondary = &program.files[0].functions[1];
+    CHECK(!secondary->skipped);
+
+    CHECK(porpoise_program_resolve_declared_function(
+        &program, "primary", &owner, &alias, &address));
+    CHECK(owner == primary);
+    CHECK(alias == NULL);
+    CHECK(address == UINT32_C(0x80001000));
+
+    owner = primary;
+    alias = &primary->aliases[2];
+    address = UINT32_MAX;
+    CHECK(!porpoise_program_resolve_declared_function(
+        &program, "resume_alias", &owner, &alias, &address));
+    CHECK(owner == NULL);
+    CHECK(alias == NULL);
+    CHECK(address == 0U);
+
+    ordinary_alias_import.kind = PORPOISE_ABI_IMPORT;
+    ordinary_alias_import.symbol = (char *)"resume_alias";
+    ordinary_alias_import.wrapper = (char *)"host_resume_alias";
+    ordinary_alias_abi.functions = &ordinary_alias_import;
+    ordinary_alias_abi.function_count = 1U;
+    result = porpoise_analyze_program(
+        &program, &ordinary_alias_abi, NULL, &analysis, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_USAGE);
+    CHECK(diagnostics_contain(
+        &diagnostics, "conflicts with an ordinary input address alias"));
+    CHECK(analysis.import_bindings == NULL);
+    CHECK(analysis.import_binding_count == 0U);
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_diagnostics_init(&diagnostics);
+
+    primary->aliases[0].is_function_name = true;
+    primary->skipped = true;
+    CHECK(porpoise_program_find_function(&program, "primary") == NULL);
+    CHECK(porpoise_program_resolve_declared_function(
+        &program, "entry.alias", &owner, &alias, &address));
+    CHECK(owner == primary);
+    CHECK(alias == &primary->aliases[0]);
+    CHECK(address == UINT32_C(0x80001000));
+    CHECK(!porpoise_program_resolve_declared_function(
+        &program, "entry_alias", &owner, &alias, &address));
+    CHECK(owner == NULL);
+    CHECK(alias == NULL);
+    CHECK(address == 0U);
+
+    result = porpoise_analyze_program(
+        &program, &ordinary_alias_abi, NULL, &analysis, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_USAGE);
+    CHECK(diagnostics_contain(
+        &diagnostics, "conflicts with an ordinary input address alias"));
+    CHECK(analysis.import_bindings == NULL);
+    CHECK(analysis.import_binding_count == 0U);
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_diagnostics_init(&diagnostics);
+
+    imports[0].kind = PORPOISE_ABI_IMPORT;
+    imports[0].symbol = (char *)"external_only";
+    imports[0].wrapper = (char *)"host_external_only";
+    imports[1].kind = PORPOISE_ABI_IMPORT;
+    imports[1].symbol = (char *)"entry.alias";
+    imports[1].wrapper = (char *)"host_entry_alias_bound";
+    abi.functions = imports;
+    abi.function_count = 2U;
+
+    result = porpoise_analyze_program(
+        &program, &abi, NULL, &analysis, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    CHECK(analysis.translated_function_count == 1U);
+    CHECK(analysis.import_binding_count == 1U);
+    CHECK(analysis.import_bindings != NULL);
+    CHECK(analysis.import_bindings[0].import == &imports[1]);
+    CHECK(analysis.import_bindings[0].owner == primary);
+    CHECK(analysis.import_bindings[0].alias == &primary->aliases[0]);
+    CHECK(analysis.import_bindings[0].guest_address ==
+          UINT32_C(0x80001000));
+
+    replacement_import.kind = PORPOISE_ABI_IMPORT;
+    replacement_import.symbol = (char *)"primary";
+    replacement_import.wrapper = (char *)"host_primary_replacement";
+    replacement_abi.functions = &replacement_import;
+    replacement_abi.function_count = 1U;
+    result = porpoise_analyze_program(
+        &program, &replacement_abi, NULL, &analysis, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    CHECK(analysis.import_binding_count == 1U);
+    CHECK(analysis.import_bindings != NULL);
+    CHECK(analysis.import_bindings[0].import == &replacement_import);
+    CHECK(analysis.import_bindings[0].owner == primary);
+    CHECK(analysis.import_bindings[0].alias == NULL);
+    CHECK(analysis.import_bindings[0].guest_address ==
+          UINT32_C(0x80001000));
+    successful_bindings = analysis.import_bindings;
+
+    duplicate_imports[0].kind = PORPOISE_ABI_IMPORT;
+    duplicate_imports[0].symbol = (char *)"primary";
+    duplicate_imports[0].wrapper = (char *)"host_primary_duplicate_test";
+    duplicate_imports[1].kind = PORPOISE_ABI_IMPORT;
+    duplicate_imports[1].symbol = (char *)"entry.alias";
+    duplicate_imports[1].wrapper = (char *)"host_entry_alias";
+    duplicate_abi.functions = duplicate_imports;
+    duplicate_abi.function_count = 2U;
+    result = porpoise_analyze_program(
+        &program, &duplicate_abi, NULL, &analysis, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_USAGE);
+    CHECK(diagnostics_contain(
+        &diagnostics, "bind to the same skipped guest address"));
+    CHECK(analysis.import_bindings == successful_bindings);
+    CHECK(analysis.import_binding_count == 1U);
+    porpoise_analysis_free(&analysis);
+    CHECK(analysis.entry == NULL);
+    CHECK(analysis.translated_function_count == 0U);
+    CHECK(analysis.import_bindings == NULL);
+    CHECK(analysis.import_binding_count == 0U);
+
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_diagnostics_init(&diagnostics);
+    porpoise_analysis_init(&analysis);
+    conflict_import.kind = PORPOISE_ABI_IMPORT;
+    conflict_import.symbol = (char *)"secondary";
+    conflict_import.wrapper = (char *)"host_secondary";
+    conflict_abi.functions = &conflict_import;
+    conflict_abi.function_count = 1U;
+    result = porpoise_analyze_program(
+        &program, &conflict_abi, NULL, &analysis, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_USAGE);
+    CHECK(diagnostics_contain(
+        &diagnostics, "conflicts with a translated function"));
+    CHECK(analysis.import_bindings == NULL);
+    CHECK(analysis.import_binding_count == 0U);
+
+    porpoise_analysis_free(&analysis);
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_program_free(&program);
+}
+
 static void test_invalid_program(
     const char *source_root,
     const char *fixture,
@@ -415,6 +585,7 @@ static void test_exact_duplicate_functions(const char *source_root) {
         "function_exact_duplicates/skip_alternate.txt"));
     porpoise_program_init(&program);
     porpoise_diagnostics_init(&diagnostics);
+    porpoise_analysis_init(&analysis);
     result = porpoise_program_load(&program, path, &diagnostics);
     CHECK(result == PORPOISE_EXIT_OK);
     CHECK(!porpoise_diagnostics_have_errors(&diagnostics));
@@ -492,7 +663,14 @@ static void test_exact_duplicate_functions(const char *source_root) {
     CHECK(porpoise_program_find_function(
               &program, "alternate_entry") == NULL);
     CHECK(porpoise_program_find_function(&program, "canonical_body") == NULL);
+    CHECK(porpoise_program_resolve_declared_function(
+        &program, "alternate_entry", &owner, &alias, &address));
+    CHECK(owner == function);
+    CHECK(alias != NULL && alias->is_function_name);
+    CHECK(alias != NULL && strcmp(alias->name, "alternate_entry") == 0);
+    CHECK(address == UINT32_C(0x80004000));
 
+    porpoise_analysis_free(&analysis);
     porpoise_diagnostics_free(&diagnostics);
     porpoise_program_free(&program);
 }
@@ -580,6 +758,7 @@ int main(int argc, char **argv) {
     test_gap_duplicate_precedence(argv[1]);
     test_double_load_rejected(argv[1]);
     test_atomic_skip_list(argv[1]);
+    test_skipped_import_bindings(argv[1]);
     test_invalid_program(argv[1], "symbol_aliases_malformed.s",
                        "malformed .sym directive");
     test_invalid_program(argv[1], "symbol_aliases_duplicate.s",

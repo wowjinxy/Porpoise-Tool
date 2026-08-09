@@ -2340,6 +2340,69 @@ const PorpoiseAddressAlias *porpoise_program_find_alias(
     return NULL;
 }
 
+const PorpoiseAddressAlias *porpoise_program_find_declared_alias(
+    const PorpoiseProgram *program,
+    const char *name,
+    const PorpoiseFunction **function_out) {
+    size_t index;
+
+    if (function_out != NULL) *function_out = NULL;
+    if (program == NULL || name == NULL) return NULL;
+    index = program_symbol_lower_bound(program, name);
+    while (index < program->symbol_index_count &&
+           strcmp(program->symbol_index[index].name, name) == 0) {
+        const PorpoiseProgramSymbolIndexEntry *entry =
+            &program->symbol_index[index++];
+
+        if (entry->alias == NULL ||
+            strcmp(entry->alias->name, name) != 0) {
+            continue;
+        }
+        if (function_out != NULL) *function_out = entry->function;
+        return entry->alias;
+    }
+    return NULL;
+}
+
+bool porpoise_program_resolve_declared_function(
+    const PorpoiseProgram *program,
+    const char *name,
+    const PorpoiseFunction **function_out,
+    const PorpoiseAddressAlias **alias_out,
+    uint32_t *address_out) {
+    size_t index;
+
+    if (function_out != NULL) *function_out = NULL;
+    if (alias_out != NULL) *alias_out = NULL;
+    if (address_out != NULL) *address_out = 0U;
+    if (program == NULL || name == NULL) return false;
+
+    index = program_symbol_lower_bound(program, name);
+    while (index < program->symbol_index_count &&
+           strcmp(program->symbol_index[index].name, name) == 0) {
+        const PorpoiseProgramSymbolIndexEntry *entry =
+            &program->symbol_index[index++];
+        const PorpoiseAddressAlias *alias = entry->alias;
+
+        if (alias == NULL) {
+            if (strcmp(entry->function->name, name) != 0) continue;
+            if (function_out != NULL) *function_out = entry->function;
+            if (address_out != NULL) {
+                *address_out = entry->function->start_address;
+            }
+            return true;
+        }
+        if (!alias->is_function_name || strcmp(alias->name, name) != 0) {
+            continue;
+        }
+        if (function_out != NULL) *function_out = entry->function;
+        if (alias_out != NULL) *alias_out = alias;
+        if (address_out != NULL) *address_out = alias->address;
+        return true;
+    }
+    return false;
+}
+
 size_t porpoise_program_count_aliases(const PorpoiseProgram *program) {
     size_t file_index;
     size_t count = 0U;

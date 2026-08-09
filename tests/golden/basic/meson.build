@@ -9,6 +9,7 @@ lifted_sources = files(
   'src/porpoise_lifted.c',
   'src/porpoise_libporpoise_adapter.c',
   'src/porpoise_function_registry.c',
+  'src/porpoise_function_registry_8000.c',
   'src/porpoise_data.c',
   'src/porpoise_imports.c',
   'src/porpoise_exports.c',

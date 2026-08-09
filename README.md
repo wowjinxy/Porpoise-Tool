@@ -62,7 +62,7 @@ porpoise INPUT --output DIR [--config FILE] [--abi FILE]
 | `--output DIR` | Required destination. An existing nonempty directory is protected unless `--force` is present. |
 | `--config FILE` | Load only this explicit schema-version 1 config. Nothing is auto-loaded beside the executable or input. |
 | `--abi FILE` | Load the typed import/export manifest described in [ABI_MANIFEST.md](docs/ABI_MANIFEST.md). |
-| `--skip-list FILE` | Skip exact input function symbols listed one per line. `#` begins a comment. Unknown symbols are errors. |
+| `--skip-list FILE` | Skip exact input function symbols listed one per line. `#` begins a comment. Unknown symbols are errors. A matching ABI import replaces the skipped guest address with its typed host bridge. |
 | `--entry SYMBOL` | Select a translated function for the generated `DolphinMain`. |
 | `--force` | Atomically replace an existing nonempty destination after generation succeeds. This is CLI-only. |
 | `--strict` | Reject approximate instruction lowerings instead of recording a warning. |

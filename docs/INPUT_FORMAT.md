@@ -163,7 +163,9 @@ title_specific_stub
 unused_debug_path
 ```
 
-Whitespace is trimmed and `#` starts an inline comment. Every nonempty symbol must exist in the parsed input; a typo is an error rather than a silent skip. Skipped functions are excluded from lowering, entry selection, the generated static library, and indirect function dispatch, but remain listed as `skipped` in `porpoise-report.json`. Skipping every function is a translation error.
+Whitespace is trimmed and `#` starts an inline comment. Every nonempty symbol must exist in the parsed input; a typo is an error rather than a silent skip. Ordinarily, skipped functions are excluded from lowering, entry selection, the generated static library, and indirect function dispatch, and remain listed as `skipped` in `porpoise-report.json`.
+
+If a schema-validated ABI import names the exact skipped function (or a coalesced duplicate function name at the same entry), its guest entry address is instead bound to that typed import bridge. Named branches, numeric-address calls, and indirect `bctr`/`bctrl` dispatch then use the host implementation, and the function is reported as `imported`. An ABI import that names an ordinary `.sym` alternate entry is rejected because it cannot replace the whole owning function consistently. The binding must be explicit: skip lists do not guess SDK families or ABIs, and an ABI import may not shadow an unskipped function. Skipping every function remains a translation error because a generated project must retain lifted title code.
 
 ## Failure behavior
 

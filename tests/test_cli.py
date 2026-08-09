@@ -140,12 +140,77 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     assert (no_entry / "meson.build").read_bytes() == (
         ROOT / "tests" / "golden" / "basic" / "meson.build"
     ).read_bytes()
+    registry_source = (
+        no_entry / "src" / "porpoise_function_registry.c"
+    ).read_text(encoding="utf-8")
+    registry_shards = sorted(
+        path.name
+        for path in (no_entry / "src").glob("porpoise_function_registry_*.c")
+    )
+    assert registry_shards == ["porpoise_function_registry_8000.c"]
+    assert "switch (address >> 16U)" in registry_source
+    assert (
+        "case UINT32_C(0x8000): return "
+        "porpoise_resolve_address_8000(address);"
+    ) in registry_source
+    assert "porpoise_lifted_add_one" not in registry_source
+    registry_shard_source = (
+        no_entry / "src" / registry_shards[0]
+    ).read_text(encoding="utf-8")
+    assert (
+        "void porpoise_lifted_add_one(PorpoisePpcState *state);"
+        in registry_shard_source
+    )
+    assert (
+        "case UINT32_C(0x80001000): return porpoise_lifted_add_one;"
+    ) in registry_shard_source
     add_stub(no_entry)
     assert "fallback: ['libPorpoise', 'libporpoise_dep']" in (no_entry / "meson.build").read_text(encoding="utf-8")
     assert "porpoise-title-host" not in (no_entry / "meson.build").read_text(encoding="utf-8")
     assert not any(no_entry.glob("subprojects/*.wrap"))
     run("meson", "setup", "build", "--wrap-mode=forcefallback", *CHILD_MESON_ARGS, cwd=no_entry)
     run("meson", "compile", "-C", "build", cwd=no_entry)
+
+    sharded_input = temporary / "registry-shards-input"
+    sharded_input.mkdir()
+    (sharded_input / "registry.s").write_text(
+        ".include \"macros.inc\"\n\n"
+        ".text\n"
+        ".global registry_low\n"
+        ".fn registry_low, global\n"
+        "/* 80001000 00000000  38 63 00 01 */ addi r3, r3, 1\n"
+        "/* 80001004 00000004  4E 80 00 20 */ blr\n"
+        ".endfn registry_low\n\n"
+        ".global registry_high\n"
+        ".fn registry_high, global\n"
+        "/* 80101000 00100000  38 63 00 02 */ addi r3, r3, 2\n"
+        "/* 80101004 00100004  4E 80 00 20 */ blr\n"
+        ".endfn registry_high\n",
+        encoding="utf-8",
+    )
+    sharded_output = temporary / "registry-shards-output"
+    run(TOOL, sharded_input, "--output", sharded_output)
+    assert sorted(
+        path.name
+        for path in (sharded_output / "src").glob(
+            "porpoise_function_registry_*.c"
+        )
+    ) == [
+        "porpoise_function_registry_8000.c",
+        "porpoise_function_registry_8010.c",
+    ]
+    sharded_master = (
+        sharded_output / "src" / "porpoise_function_registry.c"
+    ).read_text(encoding="utf-8")
+    assert sharded_master.index("porpoise_resolve_address_8000") < (
+        sharded_master.index("porpoise_resolve_address_8010")
+    )
+    sharded_meson = (sharded_output / "meson.build").read_text(
+        encoding="utf-8"
+    )
+    assert sharded_meson.index("porpoise_function_registry_8000.c") < (
+        sharded_meson.index("porpoise_function_registry_8010.c")
+    )
 
     opcodes = temporary / "opcodes"
     run(TOOL, FIXTURES / "inputs" / "opcodes", "--output", opcodes)
@@ -1107,6 +1172,127 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     run("meson", "compile", "-C", "build", cwd=imported)
     abi_executable = imported / "build" / ("abi_harness.exe" if os.name == "nt" else "abi_harness")
     run(abi_executable, cwd=imported)
+
+    skipped_import_input = temporary / "skipped-import.s"
+    skipped_import_input.write_text(
+        ".text\n.global HostAdd\n"
+        ".fn HostAdd, global\n"
+        "/* 80007000 00000000  38 63 00 63 */ addi r3, r3, 99\n"
+        "/* 80007004 00000004  4E 80 00 20 */ blr\n"
+        ".endfn HostAdd\n\n"
+        ".global call_host_by_name\n.fn call_host_by_name, global\n"
+        "/* 80007100 00000100  38 60 00 04 */ li r3, 4\n"
+        "/* 80007104 00000104  38 80 00 05 */ li r4, 5\n"
+        "/* 80007108 00000108  4B FF FE F9 */ bl HostAdd\n"
+        "/* 8000710C 0000010C  4E 80 00 20 */ blr\n"
+        ".endfn call_host_by_name\n\n"
+        ".global call_host_by_numeric\n.fn call_host_by_numeric, global\n"
+        "/* 80007200 00000200  38 60 00 06 */ li r3, 6\n"
+        "/* 80007204 00000204  38 80 00 07 */ li r4, 7\n"
+        "/* 80007208 00000208  4B FF FD F9 */ bl 0x80007000\n"
+        "/* 8000720C 0000020C  4E 80 00 20 */ blr\n"
+        ".endfn call_host_by_numeric\n\n"
+        ".global call_host_by_ctr\n.fn call_host_by_ctr, global\n"
+        "/* 80007300 00000300  38 60 00 08 */ li r3, 8\n"
+        "/* 80007304 00000304  38 80 00 09 */ li r4, 9\n"
+        "/* 80007308 00000308  3D 80 80 00 */ lis r12, -32768\n"
+        "/* 8000730C 0000030C  61 8C 70 00 */ ori r12, r12, 0x7000\n"
+        "/* 80007310 00000310  7D 89 03 A6 */ mtctr r12\n"
+        "/* 80007314 00000314  4E 80 04 21 */ bctrl\n"
+        "/* 80007318 00000318  4E 80 00 20 */ blr\n"
+        ".endfn call_host_by_ctr\n",
+        encoding="utf-8",
+    )
+    skipped_import_abi = temporary / "skipped-import.json"
+    skipped_import_abi.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "functions": [
+                    {
+                        "kind": "import",
+                        "symbol": "HostAdd",
+                        "wrapper": "PorpoiseStubAdd",
+                        "header": "porpoise/stub.h",
+                        "return": {"type": "u32", "register": "r3"},
+                        "arguments": [
+                            {"name": "left", "type": "u32", "register": "r3"},
+                            {"name": "right", "type": "u32", "register": "r4"},
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    skipped_import_list = temporary / "skipped-import.txt"
+    skipped_import_list.write_text("HostAdd\n", encoding="utf-8")
+    skipped_imported = temporary / "skipped-imported"
+    run(
+        TOOL,
+        skipped_import_input,
+        "--output",
+        skipped_imported,
+        "--abi",
+        skipped_import_abi,
+        "--skip-list",
+        skipped_import_list,
+    )
+    skipped_registry = (
+        skipped_imported / "src" / "porpoise_function_registry_8000.c"
+    ).read_text(encoding="utf-8")
+    assert (
+        "case UINT32_C(0x80007000): return porpoise_import_HostAdd;"
+        in skipped_registry
+    )
+    assert "porpoise_lifted_HostAdd" not in skipped_registry
+    skipped_report = json.loads(
+        (skipped_imported / "porpoise-report.json").read_text(encoding="utf-8")
+    )
+    assert next(
+        function["status"]
+        for function in skipped_report["functions"]
+        if function["symbol"] == "HostAdd"
+    ) == "imported"
+    skipped_harness = skipped_imported / "tests" / "skipped_import_harness.c"
+    skipped_harness.parent.mkdir(parents=True)
+    skipped_harness.write_text(
+        "#include <stdlib.h>\n"
+        "#include \"porpoise_generated.h\"\n"
+        "#include \"porpoise_libporpoise_adapter.h\"\n"
+        "#define CHECK(condition) do { if (!(condition)) abort(); } while (0)\n"
+        "int main(void) {\n"
+        "  PorpoiseHostAdapter host; PorpoisePpcState state;\n"
+        "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
+        "  porpoise_state_init(&state, &host);\n"
+        "  porpoise_lifted_call_host_by_name(&state); CHECK(state.gpr[3] == 9U);\n"
+        "  porpoise_lifted_call_host_by_numeric(&state); CHECK(state.gpr[3] == 13U);\n"
+        "  porpoise_lifted_call_host_by_ctr(&state); CHECK(state.gpr[3] == 17U);\n"
+        "  CHECK(!porpoise_state_has_fault(&state));\n"
+        "  porpoise_libporpoise_adapter_shutdown(&host);\n"
+        "  return 0;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    with (skipped_imported / "meson.build").open("a", encoding="utf-8") as meson_file:
+        meson_file.write(
+            "\nskipped_import_harness = executable('skipped_import_harness', "
+            "'tests/skipped_import_harness.c', dependencies: porpoise_lifted_dep)\n"
+        )
+    add_stub(skipped_imported)
+    run(
+        "meson",
+        "setup",
+        "build",
+        "--wrap-mode=forcefallback",
+        *CHILD_MESON_ARGS,
+        cwd=skipped_imported,
+    )
+    run("meson", "compile", "-C", "build", cwd=skipped_imported)
+    skipped_executable = skipped_imported / "build" / (
+        "skipped_import_harness.exe" if os.name == "nt" else "skipped_import_harness"
+    )
+    run(skipped_executable, cwd=skipped_imported)
 
     terminal_import_input = temporary / "terminal-import.s"
     terminal_import_input.write_text(

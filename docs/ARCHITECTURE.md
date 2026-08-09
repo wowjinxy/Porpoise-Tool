@@ -22,7 +22,7 @@ One explicit context flows through the translation pipeline; there is no cross-i
 
 1. **Options** parse one input, the required output, and optional config/ABI/skip/entry settings. An explicit config is validated before CLI overrides are applied.
 2. **Program loading** recursively discovers `.s`/`.S` inputs, sorts their relative paths, parses `.fn` blocks into an in-memory IR, and rejects symbol/output-name collisions.
-3. **Selection and ABI loading** mark exact skip-list symbols and validate the complete schema-version 1 ABI manifest.
+3. **Selection and ABI loading** mark exact skip-list symbols, validate the complete schema-version 1 ABI manifest, and bind explicitly declared imports to matching skipped guest addresses.
 4. **Lowering** looks up each mnemonic in one opcode registry, validates its operand form, emits state-based C, and records a status plus semantic-test flag.
 5. **Project generation** writes runtime support, lifted sources, registries, ABI bridges, Meson metadata, and the JSON report into a sibling staging directory.
 6. **Publication** moves the completed stage into place. When replacing output, the old directory is temporarily backed up and restored if the new stage cannot be published.
@@ -54,6 +54,8 @@ The state contains:
 State initialization zeroes the register file and attaches the host adapter. It deliberately leaves startup registers, MSR, and HID2 neutral. After host initialization, generated `DolphinMain` asks the separate, versioned `porpoise-title-host` provider for the complete initial GPR image. `porpoise_state_prepare_title_entry` then requires aligned guest `r1` (stack) plus nonzero `r2` (TOC/SDA2) and `r13` (SDA) before enabling MSR[FP], HID2[PSE], and HID2[LSQE]. Missing or invalid bootstrap state fails explicitly—Porpoise Tool does not guess it or execute a lifted `__start`. The first fault is retained, and generated code also stops when a callback marks execution returned or faulted.
 
 Direct calls to another translated function pass the same state pointer. Function starts, address aliases, and labeled instruction entry points share a generated `uint32_t` address switch whose targets all have the same lifted signature. Indirect branches and modeled interrupt return use that registry. An address absent from it produces an unsupported-operation fault instead of calling through a cast.
+
+The registry is emitted as a small deterministic router plus high-16-bit address shards. This keeps very large titles from forcing the C compiler to optimize one enormous switch translation unit. A skipped function that has an exact ABI-import binding appears in the appropriate shard as the corresponding `void import(PorpoisePpcState *)` bridge; a plain skipped function has no dispatch entry.
 
 ## Guest memory and pointer model
 
@@ -95,6 +97,8 @@ Native-pointer tokens are version-sensitive too. The generic adapter records eac
 
 Named calls outside the translated program must be declared as imports. A direct import converts declared GPR/FPR arguments to a typed C call and maps its result back to PPC state. Pointer values always pass through the host adapter. ABI shapes that cannot be represented safely, particularly varargs, require a dedicated `void adapter(PorpoisePpcState *)` implementation.
 
+An explicitly skipped input function may be replaced by an import with the same exact symbol or a coalesced duplicate function name at the same entry. Analysis records that guest-address binding so symbolic and indirect calls share the typed bridge. ABI imports that collide with ordinary `.sym` alternate entries are rejected because they are not whole-function replacements. This supports reviewed delegation of bundled SDK code to `libPorpoise` without SDK-prefix guessing or lifting a competing implementation.
+
 Exports perform the inverse mapping and expose selected lifted functions as typed C wrappers. They use an explicitly bound PPC state rather than creating a competing runtime. See [ABI_MANIFEST.md](ABI_MANIFEST.md) for the schema and current single-state/re-entrancy constraint.
 
 ## Generated project
@@ -119,7 +123,8 @@ generated/
     ├── lifted/...                    # nested input structure preserved
     ├── porpoise_lifted.c
     ├── porpoise_libporpoise_adapter.c
-    ├── porpoise_function_registry.c
+    ├── porpoise_function_registry.c       # high-address router
+    ├── porpoise_function_registry_XXXX.c  # deterministic shards
     ├── porpoise_data.c
     ├── porpoise_imports.c
     ├── porpoise_exports.c

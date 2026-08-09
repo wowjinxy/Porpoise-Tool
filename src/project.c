@@ -25,11 +25,25 @@ typedef struct ProjectContext {
     const PorpoiseProjectOptions *options;
     PorpoiseReport *report;
     PorpoiseDiagnostics *diagnostics;
+    const PorpoiseAnalysis *analysis;
     const PorpoiseFunction *entry;
     int failure_code;
     char stage[PORPOISE_PATH_CAPACITY];
     char project_name[PORPOISE_NAME_CAPACITY];
+    uint16_t *registry_shards;
+    size_t registry_shard_count;
 } ProjectContext;
+
+enum {
+    PORPOISE_REGISTRY_SHARD_SHIFT = 16,
+    PORPOISE_REGISTRY_SHARD_COUNT = 1 << PORPOISE_REGISTRY_SHARD_SHIFT
+};
+
+typedef struct PorpoiseRegistryEntry {
+    uint32_t address;
+    const PorpoiseFunction *function;
+    const PorpoiseAbiFunction *import;
+} PorpoiseRegistryEntry;
 
 static void record_failure(ProjectContext *context, int failure_code) {
     if (failure_code == PORPOISE_EXIT_OK) return;
@@ -226,55 +240,337 @@ static bool instruction_has_preceding_label(
            function->items[item_index - 1U].kind == PORPOISE_ASM_LABEL;
 }
 
-static bool write_function_registry(ProjectContext *context) {
-    char full[PORPOISE_PATH_CAPACITY];
-    FILE *output = open_generated_file(context, "src/porpoise_function_registry.c", full);
+static bool append_registry_entry(
+    PorpoiseRegistryEntry **entries,
+    size_t *entry_count,
+    size_t *entry_capacity,
+    uint32_t address,
+    const PorpoiseFunction *function,
+    const PorpoiseAbiFunction *import)
+{
+    PorpoiseRegistryEntry *entry;
+
+    if (*entry_count == SIZE_MAX ||
+        !porpoise_grow_array(
+            (void **)entries,
+            entry_capacity,
+            sizeof(**entries),
+            *entry_count + 1U)) {
+        return false;
+    }
+    entry = &(*entries)[(*entry_count)++];
+    entry->address = address;
+    entry->function = function;
+    entry->import = import;
+    return true;
+}
+
+static bool collect_registry_entries(
+    const PorpoiseProgram *program,
+    PorpoiseRegistryEntry **entries,
+    size_t *entry_count,
+    size_t *entry_capacity)
+{
     size_t file_index;
     size_t function_index;
-    if (output == NULL) return false;
-    fputs("#include <stdint.h>\n#include \"porpoise_generated.h\"\n\n", output);
-    fputs("static PorpoiseLiftedFunction porpoise_resolve_address(uint32_t address)\n{\n    switch (address) {\n", output);
-    for (file_index = 0U; file_index < context->program->file_count; file_index++) {
-        const PorpoiseSourceFile *file = &context->program->files[file_index];
-        for (function_index = 0U; function_index < file->function_count; function_index++) {
+
+    for (file_index = 0U; file_index < program->file_count; file_index++) {
+        const PorpoiseSourceFile *file = &program->files[file_index];
+        for (function_index = 0U;
+             function_index < file->function_count;
+             function_index++) {
             const PorpoiseFunction *function = &file->functions[function_index];
             size_t item_index;
             size_t alias_index;
+
             if (function->skipped) continue;
-            fprintf(output,
-                    "    case UINT32_C(0x%08lX): return porpoise_lifted_%s;\n",
-                    (unsigned long)function->start_address,
-                    function->c_name);
-            for (alias_index = 0U; alias_index < function->alias_count; alias_index++) {
-                const PorpoiseAddressAlias *alias = &function->aliases[alias_index];
+            if (!append_registry_entry(
+                    entries,
+                    entry_count,
+                    entry_capacity,
+                    function->start_address,
+                    function,
+                    NULL)) {
+                return false;
+            }
+            for (alias_index = 0U;
+                 alias_index < function->alias_count;
+                 alias_index++) {
+                const PorpoiseAddressAlias *alias =
+                    &function->aliases[alias_index];
                 size_t earlier;
-                bool duplicate_address = alias->address == function->start_address;
-                for (earlier = 0U; !duplicate_address && earlier < alias_index; earlier++) {
-                    if (function->aliases[earlier].address == alias->address)
+                bool duplicate_address =
+                    alias->address == function->start_address;
+
+                for (earlier = 0U;
+                     !duplicate_address && earlier < alias_index;
+                     earlier++) {
+                    if (function->aliases[earlier].address == alias->address) {
                         duplicate_address = true;
+                    }
                 }
                 if (duplicate_address) continue;
-                fprintf(output,
-                        "    case UINT32_C(0x%08lX): return porpoise_lifted_%s;\n",
-                        (unsigned long)alias->address,
-                        function->c_name);
+                if (!append_registry_entry(
+                        entries,
+                        entry_count,
+                        entry_capacity,
+                        alias->address,
+                        function,
+                        NULL)) {
+                    return false;
+                }
             }
             for (item_index = 0U;
                  item_index < function->item_count;
                  item_index++) {
                 const PorpoiseAsmItem *item = &function->items[item_index];
+
                 if (item->kind != PORPOISE_ASM_INSTRUCTION ||
                     !instruction_has_preceding_label(function, item_index) ||
                     item->address == function->start_address ||
                     function_has_alias_address(function, item->address)) {
                     continue;
                 }
-                fprintf(output,
-                        "    case UINT32_C(0x%08lX): return porpoise_lifted_%s;\n",
-                        (unsigned long)item->address,
-                        function->c_name);
+                if (!append_registry_entry(
+                        entries,
+                        entry_count,
+                        entry_capacity,
+                        item->address,
+                        function,
+                        NULL)) {
+                    return false;
+                }
             }
         }
+    }
+    return true;
+}
+
+static bool collect_import_registry_entries(
+    const PorpoiseAnalysis *analysis,
+    PorpoiseRegistryEntry **entries,
+    size_t *entry_count,
+    size_t *entry_capacity)
+{
+    size_t binding_index;
+
+    for (binding_index = 0U;
+         binding_index < analysis->import_binding_count;
+         binding_index++) {
+        const PorpoiseImportBinding *binding =
+            &analysis->import_bindings[binding_index];
+
+        if (!append_registry_entry(
+                entries,
+                entry_count,
+                entry_capacity,
+                binding->guest_address,
+                NULL,
+                binding->import)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool write_function_registry_shard(
+    ProjectContext *context,
+    const PorpoiseRegistryEntry *entries,
+    size_t entry_count,
+    uint16_t shard)
+{
+    char relative[PORPOISE_PATH_CAPACITY];
+    char full[PORPOISE_PATH_CAPACITY];
+    FILE *output;
+    const PorpoiseFunction *last_declared = NULL;
+    size_t entry_index;
+
+    if (!porpoise_format(
+            relative,
+            sizeof(relative),
+            "src/porpoise_function_registry_%04lX.c",
+            (unsigned long)shard)) {
+        return false;
+    }
+    output = open_generated_file(context, relative, full);
+    if (output == NULL) return false;
+    fputs(
+        "#include <stdint.h>\n"
+        "#include \"porpoise_imports.h\"\n"
+        "#include \"porpoise_lifted.h\"\n\n",
+        output);
+    for (entry_index = 0U; entry_index < entry_count; entry_index++) {
+        const PorpoiseRegistryEntry *entry = &entries[entry_index];
+
+        if (entry->function == NULL ||
+            (entry->address >> PORPOISE_REGISTRY_SHARD_SHIFT) != shard ||
+            entry->function == last_declared) {
+            continue;
+        }
+        fprintf(
+            output,
+            "void porpoise_lifted_%s(PorpoisePpcState *state);\n",
+            entry->function->c_name);
+        last_declared = entry->function;
+    }
+    fprintf(
+        output,
+        "\nPorpoiseLiftedFunction porpoise_resolve_address_%04lX(uint32_t address)\n"
+        "{\n"
+        "    switch (address) {\n",
+        (unsigned long)shard);
+    for (entry_index = 0U; entry_index < entry_count; entry_index++) {
+        const PorpoiseRegistryEntry *entry = &entries[entry_index];
+
+        if ((entry->address >> PORPOISE_REGISTRY_SHARD_SHIFT) != shard) {
+            continue;
+        }
+        if (entry->function != NULL) {
+            fprintf(
+                output,
+                "    case UINT32_C(0x%08lX): return porpoise_lifted_%s;\n",
+                (unsigned long)entry->address,
+                entry->function->c_name);
+        } else {
+            char c_name[PORPOISE_NAME_CAPACITY];
+
+            porpoise_sanitize_identifier(
+                entry->import->symbol,
+                c_name,
+                sizeof(c_name));
+            fprintf(
+                output,
+                "    case UINT32_C(0x%08lX): return porpoise_import_%s;\n",
+                (unsigned long)entry->address,
+                c_name);
+        }
+    }
+    fputs(
+        "    default: return (PorpoiseLiftedFunction)0;\n"
+        "    }\n"
+        "}\n",
+        output);
+    return checked_close(output, full, context->diagnostics);
+}
+
+static bool write_function_registry(ProjectContext *context) {
+    char full[PORPOISE_PATH_CAPACITY];
+    FILE *output;
+    PorpoiseRegistryEntry *entries = NULL;
+    bool *shard_used = NULL;
+    size_t entry_count = 0U;
+    size_t entry_capacity = 0U;
+    size_t entry_index;
+    size_t shard_index;
+
+    if (!collect_registry_entries(
+            context->program,
+            &entries,
+            &entry_count,
+            &entry_capacity) ||
+        !collect_import_registry_entries(
+            context->analysis,
+            &entries,
+            &entry_count,
+            &entry_capacity)) {
+        porpoise_diagnostics_add(
+            context->diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            context->stage,
+            0U,
+            0U,
+            "cannot allocate generated function registry");
+        record_failure(context, PORPOISE_EXIT_INTERNAL);
+        free(entries);
+        return false;
+    }
+    shard_used = (bool *)calloc(
+        PORPOISE_REGISTRY_SHARD_COUNT,
+        sizeof(*shard_used));
+    if (shard_used == NULL) {
+        porpoise_diagnostics_add(
+            context->diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            context->stage,
+            0U,
+            0U,
+            "cannot allocate generated function registry shards");
+        record_failure(context, PORPOISE_EXIT_INTERNAL);
+        free(entries);
+        return false;
+    }
+    for (entry_index = 0U; entry_index < entry_count; entry_index++) {
+        shard_used[entries[entry_index].address >>
+                   PORPOISE_REGISTRY_SHARD_SHIFT] = true;
+    }
+    for (shard_index = 0U;
+         shard_index < PORPOISE_REGISTRY_SHARD_COUNT;
+         shard_index++) {
+        if (shard_used[shard_index]) context->registry_shard_count++;
+    }
+    if (context->registry_shard_count != 0U) {
+        size_t shard_cursor = 0U;
+
+        context->registry_shards = (uint16_t *)malloc(
+            context->registry_shard_count *
+            sizeof(*context->registry_shards));
+        if (context->registry_shards == NULL) {
+            porpoise_diagnostics_add(
+                context->diagnostics,
+                PORPOISE_SEVERITY_ERROR,
+                context->stage,
+                0U,
+                0U,
+                "cannot allocate generated function registry shard list");
+            record_failure(context, PORPOISE_EXIT_INTERNAL);
+            free(shard_used);
+            free(entries);
+            return false;
+        }
+        for (shard_index = 0U;
+             shard_index < PORPOISE_REGISTRY_SHARD_COUNT;
+             shard_index++) {
+            if (shard_used[shard_index]) {
+                context->registry_shards[shard_cursor++] =
+                    (uint16_t)shard_index;
+            }
+        }
+    }
+
+    output = open_generated_file(
+        context,
+        "src/porpoise_function_registry.c",
+        full);
+    if (output == NULL) {
+        free(shard_used);
+        free(entries);
+        return false;
+    }
+    fputs("#include <stdint.h>\n#include \"porpoise_dispatch.h\"\n\n", output);
+    for (shard_index = 0U;
+         shard_index < context->registry_shard_count;
+         shard_index++) {
+        fprintf(
+            output,
+            "PorpoiseLiftedFunction porpoise_resolve_address_%04lX(uint32_t address);\n",
+            (unsigned long)context->registry_shards[shard_index]);
+    }
+    fputs(
+        "\nstatic PorpoiseLiftedFunction porpoise_resolve_address(uint32_t address)\n"
+        "{\n"
+        "    switch (address >> 16U) {\n",
+        output);
+    for (shard_index = 0U;
+         shard_index < context->registry_shard_count;
+         shard_index++) {
+        unsigned long shard =
+            (unsigned long)context->registry_shards[shard_index];
+
+        fprintf(
+            output,
+            "    case UINT32_C(0x%04lX): return porpoise_resolve_address_%04lX(address);\n",
+            shard,
+            shard);
     }
     fputs(
         "    default: return (PorpoiseLiftedFunction)0;\n"
@@ -298,7 +594,27 @@ static bool write_function_registry(ProjectContext *context) {
         "    return !porpoise_state_should_stop(state);\n"
         "}\n",
         output);
-    return checked_close(output, full, context->diagnostics);
+    if (!checked_close(output, full, context->diagnostics)) {
+        free(shard_used);
+        free(entries);
+        return false;
+    }
+    for (shard_index = 0U;
+         shard_index < context->registry_shard_count;
+         shard_index++) {
+        if (!write_function_registry_shard(
+                context,
+                entries,
+                entry_count,
+                context->registry_shards[shard_index])) {
+            free(shard_used);
+            free(entries);
+            return false;
+        }
+    }
+    free(shard_used);
+    free(entries);
+    return true;
 }
 
 static bool write_data_initializer(ProjectContext *context) {
@@ -624,7 +940,16 @@ static bool write_meson(ProjectContext *context) {
     fputs("libporpoise_dep = dependency('libPorpoise', fallback: ['libPorpoise', 'libporpoise_dep'])\n", output);
     fputs("cc = meson.get_compiler('c')\nmath_dep = cc.find_library('m', required: false)\n", output);
     fputs("generated_inc = include_directories('include')\n\nlifted_sources = files(\n", output);
-    fputs("  'src/porpoise_lifted.c',\n  'src/porpoise_libporpoise_adapter.c',\n  'src/porpoise_function_registry.c',\n  'src/porpoise_data.c',\n  'src/porpoise_imports.c',\n  'src/porpoise_exports.c'", output);
+    fputs("  'src/porpoise_lifted.c',\n  'src/porpoise_libporpoise_adapter.c',\n  'src/porpoise_function_registry.c'", output);
+    for (file_index = 0U;
+         file_index < context->registry_shard_count;
+         file_index++) {
+        fprintf(
+            output,
+            ",\n  'src/porpoise_function_registry_%04lX.c'",
+            (unsigned long)context->registry_shards[file_index]);
+    }
+    fputs(",\n  'src/porpoise_data.c',\n  'src/porpoise_imports.c',\n  'src/porpoise_exports.c'", output);
     for (file_index = 0U; file_index < context->program->file_count; file_index++) {
         const PorpoiseSourceFile *file = &context->program->files[file_index];
         size_t function_index;
@@ -676,15 +1001,31 @@ static bool write_report(ProjectContext *context) {
         const PorpoiseSourceFile *file = &context->program->files[file_index];
         for (function_index = 0U; function_index < file->function_count; function_index++) {
             const PorpoiseFunction *function = &file->functions[function_index];
+            const char *status;
+            size_t binding_index;
+            bool imported = false;
+
+            for (binding_index = 0U;
+                 binding_index < context->analysis->import_binding_count;
+                 binding_index++) {
+                if (context->analysis->import_bindings[binding_index].owner ==
+                    function) {
+                    imported = true;
+                    break;
+                }
+            }
+            status = function->data_region
+                         ? "data"
+                         : (function->skipped
+                                ? (imported ? "imported" : "skipped")
+                                : "lifted");
             fputs(first ? "    {\"symbol\": " : ",\n    {\"symbol\": ", output); first = false;
             porpoise_json_write_string(output, function->name);
             fputs(", \"c_symbol\": ", output); porpoise_json_write_string(output, function->c_name);
             fputs(", \"file\": ", output); porpoise_json_write_string(output, file->relative_path);
             fprintf(output, ", \"address\": %lu, \"size\": %lu, \"status\": \"%s\"}",
                     (unsigned long)function->start_address, (unsigned long)function->size,
-                    function->data_region
-                        ? "data"
-                        : (function->skipped ? "skipped" : "lifted"));
+                    status);
         }
     }
     fputs("\n  ],\n  \"data\": [\n", output);
@@ -835,6 +1176,7 @@ int porpoise_project_generate(
     int analysis_result;
     if (program == NULL || abi == NULL || options == NULL || options->output_path == NULL ||
         options->runtime_directory == NULL || report == NULL || diagnostics == NULL) return PORPOISE_EXIT_INTERNAL;
+    porpoise_analysis_init(&analysis);
     memset(&context, 0, sizeof(context));
     context.program = program;
     context.abi = abi;
@@ -857,17 +1199,32 @@ int porpoise_project_generate(
     porpoise_sanitize_identifier(base, context.project_name, sizeof(context.project_name));
     analysis_result = porpoise_analyze_program(program, abi, options->entry_symbol,
                                                &analysis, diagnostics);
-    if (analysis_result != PORPOISE_EXIT_OK) return analysis_result;
+    if (analysis_result != PORPOISE_EXIT_OK) {
+        porpoise_analysis_free(&analysis);
+        return analysis_result;
+    }
+    context.analysis = &analysis;
     context.entry = analysis.entry;
-    if (!make_unique_sibling(options->output_path, "stage", context.stage, diagnostics)) return PORPOISE_EXIT_IO;
+    if (!make_unique_sibling(options->output_path, "stage", context.stage, diagnostics)) {
+        porpoise_analysis_free(&analysis);
+        return PORPOISE_EXIT_IO;
+    }
     generated = generate_stage(&context);
     if (!generated) {
+        free(context.registry_shards);
+        porpoise_analysis_free(&analysis);
         if (!porpoise_remove_tree(context.stage, diagnostics)) return PORPOISE_EXIT_IO;
-        return context.failure_code != PORPOISE_EXIT_OK ? context.failure_code : PORPOISE_EXIT_IO;
+        return context.failure_code != PORPOISE_EXIT_OK
+                   ? context.failure_code
+                   : PORPOISE_EXIT_IO;
     }
     if (!publish_stage(&context)) {
+        free(context.registry_shards);
+        porpoise_analysis_free(&analysis);
         if (porpoise_path_exists(context.stage)) (void)porpoise_remove_tree(context.stage, diagnostics);
         return PORPOISE_EXIT_IO;
     }
+    free(context.registry_shards);
+    porpoise_analysis_free(&analysis);
     return PORPOISE_EXIT_OK;
 }

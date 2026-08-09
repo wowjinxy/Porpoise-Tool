@@ -76,6 +76,10 @@ Direct imports require `kind`, `symbol`, `header`, `return`, and `arguments`.
 
 When lifted code branches to the symbol, the generated bridge reads arguments from `PorpoisePpcState`, calls `wrapper`, and writes the result back to the declared return register. A named target that is neither a translated function nor a declared import fails translation; no signature is guessed.
 
+An import may deliberately name a function that is also present in the assembly input when that exact function (or a coalesced duplicate function name at the same entry) is selected by `--skip-list`. In that case Porpoise Tool does not emit the lifted body. It binds the skipped guest entry address to the typed import bridge instead, so direct symbolic calls, raw-address calls, and `bctr`/`bctrl` dispatch all reach the same host implementation. The function is reported as `imported`. An import that collides with an unskipped input function, two imports bound to the same guest address, or a guessed prefix-wide SDK replacement is an error. An import that names an ordinary `.sym` alternate-entry alias is rejected rather than inconsistently replacing only one entry into its owning function.
+
+This is the intended way to delegate annotated SDK bodies to `libPorpoise`: enumerate reviewed symbols in both the ABI manifest and exact skip list. Porpoise Tool never derives a host signature from the assembly or from a symbol prefix.
+
 ## Dedicated import adapters
 
 Functions whose ABI cannot be represented as a fixed typed call—especially varargs such as `OSReport`—must use an adapter:
