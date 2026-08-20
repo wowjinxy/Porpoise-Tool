@@ -1,5 +1,6 @@
 #include "porpoise/lower.h"
 #include "porpoise/raw_word.h"
+#include "porpoise/relocation.h"
 #include "porpoise/system_lower.h"
 #include "porpoise/util.h"
 
@@ -118,14 +119,6 @@ enum {
     PSQ_STORE = 1,
     PSQ_UPDATE = 2
 };
-
-typedef enum RelocationKind {
-    RELOCATION_NONE = 0,
-    RELOCATION_LOW,
-    RELOCATION_HIGH,
-    RELOCATION_HIGH_ADJUSTED,
-    RELOCATION_SDA21
-} RelocationKind;
 
 enum {
     CARRY_ADD_IMMEDIATE = 1,
@@ -614,25 +607,6 @@ static bool parse_signed(const char *text, int32_t *value) {
     return true;
 }
 
-static bool parse_relocation(const char *text, RelocationKind *kind) {
-    const char *at;
-    const char *cursor;
-    if (text == NULL || kind == NULL) return false;
-    at = strrchr(text, '@');
-    if (at == NULL || at == text) return false;
-    if (strcmp(at, "@l") == 0) *kind = RELOCATION_LOW;
-    else if (strcmp(at, "@h") == 0) *kind = RELOCATION_HIGH;
-    else if (strcmp(at, "@ha") == 0) *kind = RELOCATION_HIGH_ADJUSTED;
-    else if (strcmp(at, "@sda21") == 0) *kind = RELOCATION_SDA21;
-    else return false;
-    for (cursor = text; cursor < at; cursor++) {
-        unsigned char character = (unsigned char)*cursor;
-        if (iscntrl(character) || isspace(character) || *cursor == '(' ||
-            *cursor == ')' || *cursor == ',') return false;
-    }
-    return true;
-}
-
 static int32_t decode_signed_immediate(uint32_t word) {
     uint32_t bits = word & UINT32_C(0xFFFF);
     return bits <= (uint32_t)INT16_MAX
@@ -652,16 +626,17 @@ static bool parse_signed_or_relocated(
     uint32_t word,
     unsigned int allowed_relocations,
     int32_t *value,
-    RelocationKind *relocation) {
-    RelocationKind parsed = RELOCATION_NONE;
+    PorpoiseRelocationKind *relocation) {
+    PorpoiseRelocation parsed;
     if (parse_signed(text, value)) {
-        *relocation = RELOCATION_NONE;
+        *relocation = PORPOISE_RELOCATION_NONE;
         return true;
     }
-    if (!parse_relocation(text, &parsed) ||
-        (allowed_relocations & (1U << (unsigned int)parsed)) == 0U) return false;
+    if (!porpoise_relocation_parse(text, &parsed) ||
+        (allowed_relocations & PORPOISE_RELOCATION_MASK(parsed.kind)) == 0U)
+        return false;
     *value = decode_signed_immediate(word);
-    *relocation = parsed;
+    *relocation = parsed.kind;
     return true;
 }
 
@@ -670,10 +645,11 @@ static bool parse_unsigned_or_relocated(
     uint32_t word,
     unsigned int allowed_relocations,
     uint32_t *value) {
-    RelocationKind relocation = RELOCATION_NONE;
+    PorpoiseRelocation relocation;
     if (parse_unsigned(text, value)) return true;
-    if (!parse_relocation(text, &relocation) ||
-        (allowed_relocations & (1U << (unsigned int)relocation)) == 0U) return false;
+    if (!porpoise_relocation_parse(text, &relocation) ||
+        (allowed_relocations & PORPOISE_RELOCATION_MASK(relocation.kind)) == 0U)
+        return false;
     *value = word & UINT32_C(0xFFFF);
     return true;
 }
@@ -687,7 +663,7 @@ static bool parse_memory_operand(
     char *open;
     char *close;
     unsigned int encoded_base;
-    RelocationKind relocation = RELOCATION_NONE;
+    PorpoiseRelocationKind relocation = PORPOISE_RELOCATION_NONE;
     if (!porpoise_copy_string(copy, sizeof(copy), text)) return false;
     open = strchr(copy, '(');
     close = strrchr(copy, ')');
@@ -699,16 +675,18 @@ static bool parse_memory_operand(
     } else if (!parse_signed_or_relocated(
                    copy,
                    word,
-                   (1U << RELOCATION_LOW) | (1U << RELOCATION_SDA21),
+                   PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_LOW) |
+                       PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_SDA21),
                    offset,
                    &relocation)) {
         return false;
     }
     if (!parse_register(open + 1, 'r', base)) return false;
     encoded_base = (unsigned int)((word >> 16U) & 31U);
-    if (relocation == RELOCATION_SDA21) {
+    if (relocation == PORPOISE_RELOCATION_SDA21) {
         *base = encoded_base;
-    } else if (relocation == RELOCATION_LOW && *base != encoded_base) {
+    } else if (relocation == PORPOISE_RELOCATION_LOW &&
+               *base != encoded_base) {
         return false;
     }
     return true;
@@ -1069,10 +1047,13 @@ static bool emit_instruction(
             return file_printf(output, "    /* %s: host-equivalent no state change. */\n", item->mnemonic);
         case OP_LI:
         case OP_LIS: {
-            RelocationKind relocation;
+            PorpoiseRelocationKind relocation;
             unsigned int allowed_relocations = spec->operation == OP_LIS
-                ? (1U << RELOCATION_HIGH) | (1U << RELOCATION_HIGH_ADJUSTED)
-                : (1U << RELOCATION_LOW) | (1U << RELOCATION_SDA21);
+                ? PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_HIGH) |
+                      PORPOISE_RELOCATION_MASK(
+                          PORPOISE_RELOCATION_HIGH_ADJUSTED)
+                : PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_LOW) |
+                      PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_SDA21);
             if (operands.count != 2U || !parse_register(operands.values[0], 'r', &rd) ||
                 !parse_signed_or_relocated(operands.values[1], item->word,
                                            allowed_relocations, &immediate,
@@ -1083,7 +1064,7 @@ static bool emit_instruction(
                     "    state->gpr[%u] = ((uint32_t)UINT16_C(0x%04lX)) << 16U;\n",
                     rd, (unsigned long)(uint16_t)immediate);
             }
-            if (relocation == RELOCATION_SDA21) {
+            if (relocation == PORPOISE_RELOCATION_SDA21) {
                 ra = (item->word >> 16U) & 31U;
                 if (ra != 0U) {
                     return file_printf(output,
@@ -1097,17 +1078,21 @@ static bool emit_instruction(
         }
         case OP_ADDI:
         case OP_ADDIS: {
-            RelocationKind relocation;
+            PorpoiseRelocationKind relocation;
             unsigned int allowed_relocations = spec->operation == OP_ADDIS
-                ? (1U << RELOCATION_HIGH) | (1U << RELOCATION_HIGH_ADJUSTED)
-                : (1U << RELOCATION_LOW) | (1U << RELOCATION_SDA21);
+                ? PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_HIGH) |
+                      PORPOISE_RELOCATION_MASK(
+                          PORPOISE_RELOCATION_HIGH_ADJUSTED)
+                : PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_LOW) |
+                      PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_SDA21);
             if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
                 !parse_register(operands.values[1], 'r', &ra) ||
                 !parse_signed_or_relocated(operands.values[2], item->word,
                                            allowed_relocations, &immediate,
                                            &relocation) ||
                 immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
-            if (relocation == RELOCATION_SDA21) ra = (item->word >> 16U) & 31U;
+            if (relocation == PORPOISE_RELOCATION_SDA21)
+                ra = (item->word >> 16U) & 31U;
             if (ra == 0U) {
                 if (spec->operation == OP_ADDIS)
                     return file_printf(output, "    state->gpr[%u] = ((uint32_t)UINT16_C(0x%04lX)) << 16U;\n",
@@ -1225,7 +1210,8 @@ static bool emit_instruction(
             int kind = spec->detail < 0 ? -spec->detail : spec->detail;
             if (kind == CARRY_ADD_IMMEDIATE || kind == CARRY_SUBF_IMMEDIATE) {
                 uint16_t encoded;
-                RelocationKind relocation = RELOCATION_NONE;
+                PorpoiseRelocationKind relocation =
+                    PORPOISE_RELOCATION_NONE;
                 if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
                     !parse_register(operands.values[1], 'r', &ra)) return false;
                 if (spec->detail < 0) {
@@ -1237,7 +1223,9 @@ static bool emit_instruction(
                 } else {
                     if (!parse_signed_or_relocated(
                             operands.values[2], item->word,
-                            1U << RELOCATION_LOW, &immediate,
+                            PORPOISE_RELOCATION_MASK(
+                                PORPOISE_RELOCATION_LOW),
+                            &immediate,
                             &relocation)) return false;
                     if (immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
                     encoded = (uint16_t)immediate;
@@ -1308,7 +1296,9 @@ static bool emit_instruction(
                 !parse_register(operands.values[1], 'r', &ra) ||
                 !parse_unsigned_or_relocated(
                     operands.values[2], item->word,
-                    spec->operation == OP_ORI ? 1U << RELOCATION_LOW : 0U,
+                    spec->operation == OP_ORI
+                        ? PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_LOW)
+                        : 0U,
                     &unsigned_value) || unsigned_value > UINT16_MAX) return false;
             if (!file_printf(output, "    state->gpr[%u] = state->gpr[%u] %s (UINT32_C(%lu)%s);\n",
                              rd, ra, operator_text, (unsigned long)unsigned_value, shifted ? " << 16" : "")) return false;

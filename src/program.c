@@ -1,4 +1,5 @@
 #include "porpoise/program.h"
+#include "porpoise/relocation.h"
 #include "porpoise/util.h"
 
 #include "asm_data_internal.h"
@@ -1544,165 +1545,6 @@ static bool allocate_validation_array(
     return *items != NULL;
 }
 
-static bool operand_token_delimiter(char character) {
-    return isspace((unsigned char)character) || character == ',' ||
-           character == '(' || character == ')';
-}
-
-enum {
-    PORPOISE_DUPLICATE_RELOCATION_LOW = 1U << 0U,
-    PORPOISE_DUPLICATE_RELOCATION_HIGH = 1U << 1U,
-    PORPOISE_DUPLICATE_RELOCATION_HIGH_ADJUSTED = 1U << 2U,
-    PORPOISE_DUPLICATE_RELOCATION_SDA21 = 1U << 3U
-};
-
-static unsigned int duplicate_relocation_suffix_mask(
-    const char *suffix,
-    size_t length) {
-    if (length == 2U && memcmp(suffix, "@l", 2U) == 0)
-        return PORPOISE_DUPLICATE_RELOCATION_LOW;
-    if (length == 2U && memcmp(suffix, "@h", 2U) == 0)
-        return PORPOISE_DUPLICATE_RELOCATION_HIGH;
-    if (length == 3U && memcmp(suffix, "@ha", 3U) == 0)
-        return PORPOISE_DUPLICATE_RELOCATION_HIGH_ADJUSTED;
-    if (length == 6U && memcmp(suffix, "@sda21", 6U) == 0)
-        return PORPOISE_DUPLICATE_RELOCATION_SDA21;
-    return 0U;
-}
-
-static bool duplicate_memory_relocation_mnemonic(const char *mnemonic) {
-    static const char *const mnemonics[] = {
-        "lbz", "lbzu", "lhz", "lhzu", "lha", "lhau",
-        "lwz", "lwzu", "lfs", "lfsu", "lfd", "lfdu",
-        "stb", "stbu", "sth", "sthu", "stw", "stwu",
-        "stfs", "stfsu", "stfd", "stfdu", "lmw", "stmw"
-    };
-    size_t index;
-    for (index = 0U;
-         index < sizeof(mnemonics) / sizeof(mnemonics[0]);
-         index++) {
-        if (strcmp(mnemonic, mnemonics[index]) == 0) return true;
-    }
-    return false;
-}
-
-static bool duplicate_relocation_context_supported(
-    const char *mnemonic,
-    size_t operand_index,
-    bool memory_offset,
-    unsigned int suffix_mask) {
-    unsigned int allowed = 0U;
-
-    if (memory_offset) {
-        if (operand_index == 1U &&
-            duplicate_memory_relocation_mnemonic(mnemonic)) {
-            allowed = PORPOISE_DUPLICATE_RELOCATION_LOW |
-                      PORPOISE_DUPLICATE_RELOCATION_SDA21;
-        }
-    } else if (strcmp(mnemonic, "li") == 0 && operand_index == 1U) {
-        allowed = PORPOISE_DUPLICATE_RELOCATION_LOW |
-                  PORPOISE_DUPLICATE_RELOCATION_SDA21;
-    } else if (strcmp(mnemonic, "lis") == 0 && operand_index == 1U) {
-        allowed = PORPOISE_DUPLICATE_RELOCATION_HIGH |
-                  PORPOISE_DUPLICATE_RELOCATION_HIGH_ADJUSTED;
-    } else if (strcmp(mnemonic, "addi") == 0 && operand_index == 2U) {
-        allowed = PORPOISE_DUPLICATE_RELOCATION_LOW |
-                  PORPOISE_DUPLICATE_RELOCATION_SDA21;
-    } else if (strcmp(mnemonic, "addis") == 0 && operand_index == 2U) {
-        allowed = PORPOISE_DUPLICATE_RELOCATION_HIGH |
-                  PORPOISE_DUPLICATE_RELOCATION_HIGH_ADJUSTED;
-    } else if ((strcmp(mnemonic, "addic") == 0 ||
-                strcmp(mnemonic, "addic.") == 0 ||
-                strcmp(mnemonic, "ori") == 0) &&
-               operand_index == 2U) {
-        allowed = PORPOISE_DUPLICATE_RELOCATION_LOW;
-    }
-    return (allowed & suffix_mask) != 0U;
-}
-
-static bool relocated_operand_tokens_equal(
-    const char *mnemonic,
-    size_t operand_index,
-    const char *left,
-    size_t left_length,
-    const char *right,
-    size_t right_length,
-    bool memory_offset) {
-    const char *left_at = NULL;
-    const char *right_at = NULL;
-    size_t index;
-    size_t left_suffix_length;
-    size_t right_suffix_length;
-    unsigned int suffix_mask;
-
-    if (left_length == right_length &&
-        memcmp(left, right, left_length) == 0) {
-        return true;
-    }
-    for (index = 0U; index < left_length; index++) {
-        if (left[index] == '@') left_at = left + index;
-    }
-    for (index = 0U; index < right_length; index++) {
-        if (right[index] == '@') right_at = right + index;
-    }
-    if (left_at == NULL || right_at == NULL ||
-        left_at == left || right_at == right) {
-        return false;
-    }
-    left_suffix_length = left_length - (size_t)(left_at - left);
-    right_suffix_length = right_length - (size_t)(right_at - right);
-    if (left_suffix_length != right_suffix_length ||
-        memcmp(left_at, right_at, left_suffix_length) != 0) {
-        return false;
-    }
-    suffix_mask = duplicate_relocation_suffix_mask(
-        left_at, left_suffix_length);
-    return suffix_mask != 0U &&
-           duplicate_relocation_context_supported(
-               mnemonic, operand_index, memory_offset, suffix_mask);
-}
-
-static bool duplicate_operands_equal(
-    const char *mnemonic,
-    const char *left,
-    const char *right) {
-    size_t operand_index = 0U;
-    if (left == NULL || right == NULL) return left == right;
-    if (strcmp(left, right) == 0) return true;
-
-    while (*left != '\0' && *right != '\0') {
-        bool left_delimiter = operand_token_delimiter(*left);
-        bool right_delimiter = operand_token_delimiter(*right);
-        const char *left_end;
-        const char *right_end;
-
-        if (left_delimiter || right_delimiter) {
-            if (!left_delimiter || !right_delimiter || *left != *right)
-                return false;
-            if (*left == ',') operand_index++;
-            left++;
-            right++;
-            continue;
-        }
-        left_end = left;
-        while (*left_end != '\0' && !operand_token_delimiter(*left_end))
-            left_end++;
-        right_end = right;
-        while (*right_end != '\0' && !operand_token_delimiter(*right_end))
-            right_end++;
-        if (!relocated_operand_tokens_equal(
-                mnemonic, operand_index,
-                left, (size_t)(left_end - left),
-                right, (size_t)(right_end - right),
-                *left_end == '(' && *right_end == '(')) {
-            return false;
-        }
-        left = left_end;
-        right = right_end;
-    }
-    return *left == *right;
-}
-
 static bool duplicate_function_items_equal(
     const PorpoiseFunction *left,
     const PorpoiseFunction *right) {
@@ -1730,7 +1572,7 @@ static bool duplicate_function_items_equal(
             left_item->word != right_item->word ||
             left_item->mnemonic == NULL || right_item->mnemonic == NULL ||
             strcmp(left_item->mnemonic, right_item->mnemonic) != 0 ||
-            !duplicate_operands_equal(
+            !porpoise_relocation_operands_equal(
                 left_item->mnemonic,
                 left_item->operands, right_item->operands)) {
             return false;

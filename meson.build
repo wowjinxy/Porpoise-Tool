@@ -32,6 +32,7 @@ porpoise_core_sources = files(
   'src/program.c',
   'src/project.c',
   'src/raw_word.c',
+  'src/relocation.c',
   'src/report.c',
   'src/system_lower.c',
   'src/util.c',
@@ -740,6 +741,17 @@ raw_word_test = executable(
   c_args: ['-Werror'],
 )
 test('raw-word-lowering', raw_word_test)
+
+relocation_test = executable(
+  'test_relocation',
+  [
+    'tests/test_relocation.c',
+    'src/relocation.c',
+  ],
+  include_directories: porpoise_inc,
+  c_args: ['-Werror'],
+)
+test('relocation', relocation_test)
 
 program_test = executable(
   'test_program',
