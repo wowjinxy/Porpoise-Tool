@@ -3,6 +3,7 @@
 #include "porpoise/analysis.h"
 #include "porpoise/lower.h"
 #include "porpoise/util.h"
+#include "plan_internal.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -32,6 +33,7 @@ typedef struct ProjectContext {
     const PorpoiseProjectOptions *options;
     PorpoiseReport *report;
     PorpoiseDiagnostics *diagnostics;
+    const PorpoiseTranslationPlan *plan;
     const PorpoiseAnalysis *analysis;
     const PorpoiseFunction *entry;
     int failure_code;
@@ -89,13 +91,58 @@ static FILE *open_generated_file(ProjectContext *context, const char *relative_p
     return file;
 }
 
-static size_t translated_function_count(const PorpoiseProgram *program) {
+static const PorpoiseFunctionPlanView *find_function_plan(
+    const ProjectContext *context,
+    const PorpoiseFunction *function) {
+    size_t index;
+    if (context->plan == NULL) return NULL;
+    for (index = 0U;
+         index < porpoise_plan_function_count(context->plan);
+         index++) {
+        const PorpoiseFunctionPlanView *view =
+            porpoise_plan_function_at(context->plan, index);
+        if (view != NULL && view->function == function) return view;
+    }
+    return NULL;
+}
+
+static PorpoisePlanAction function_action(
+    const ProjectContext *context,
+    const PorpoiseFunction *function) {
+    const PorpoiseFunctionPlanView *view =
+        find_function_plan(context, function);
+    size_t binding_index;
+    if (view != NULL) return view->action;
+    if (function->data_region) return PORPOISE_PLAN_ACTION_DATA;
+    if (!function->skipped) return PORPOISE_PLAN_ACTION_LIFT;
+    for (binding_index = 0U;
+         context->analysis != NULL &&
+         binding_index < context->analysis->import_binding_count;
+         binding_index++) {
+        if (context->analysis->import_bindings[binding_index].owner ==
+            function) {
+            return PORPOISE_PLAN_ACTION_IMPORT;
+        }
+    }
+    return PORPOISE_PLAN_ACTION_OMIT;
+}
+
+static size_t translated_function_count(const ProjectContext *context) {
     size_t count = 0U;
     size_t file_index;
     size_t function_index;
-    for (file_index = 0U; file_index < program->file_count; file_index++) {
-        for (function_index = 0U; function_index < program->files[file_index].function_count; function_index++) {
-            if (!program->files[file_index].functions[function_index].skipped) count++;
+    for (file_index = 0U;
+         file_index < context->program->file_count;
+         file_index++) {
+        const PorpoiseSourceFile *source =
+            &context->program->files[file_index];
+        for (function_index = 0U;
+             function_index < source->function_count;
+             function_index++) {
+            if (function_action(context, &source->functions[function_index]) ==
+                PORPOISE_PLAN_ACTION_LIFT) {
+                count++;
+            }
         }
     }
     return count;
@@ -153,7 +200,7 @@ static bool write_generated_header(ProjectContext *context, const PorpoiseSource
     fputs("#include \"porpoise_lifted.h\"\n\n", output);
     for (index = 0U; index < source->function_count; index++) {
         const PorpoiseFunction *function = &source->functions[index];
-        if (!function->skipped)
+        if (function_action(context, function) == PORPOISE_PLAN_ACTION_LIFT)
             fprintf(output, "void porpoise_lifted_%s(PorpoisePpcState *state);\n", function->c_name);
     }
     fputs("\n#endif\n", output);
@@ -177,7 +224,7 @@ static int write_generated_source(ProjectContext *context, const PorpoiseSourceF
     lowering_options.strict = context->options->strict;
     for (index = 0U; index < source->function_count; index++) {
         const PorpoiseFunction *function = &source->functions[index];
-        if (!function->skipped) {
+        if (function_action(context, function) == PORPOISE_PLAN_ACTION_LIFT) {
             int lowering_result = porpoise_lower_function(
                 output, context->program, source, function, context->abi,
                 &lowering_options, context->report, context->diagnostics);
@@ -321,11 +368,12 @@ static bool append_registry_entry(
 }
 
 static bool collect_registry_entries(
-    const PorpoiseProgram *program,
+    const ProjectContext *context,
     PorpoiseRegistryEntry **entries,
     size_t *entry_count,
     size_t *entry_capacity)
 {
+    const PorpoiseProgram *program = context->program;
     size_t file_index;
     size_t function_index;
 
@@ -338,7 +386,10 @@ static bool collect_registry_entries(
             size_t item_index;
             size_t alias_index;
 
-            if (function->skipped) continue;
+            if (function_action(context, function) !=
+                PORPOISE_PLAN_ACTION_LIFT) {
+                continue;
+            }
             if (!append_registry_entry(
                     entries,
                     entry_count,
@@ -402,19 +453,26 @@ static bool collect_registry_entries(
 }
 
 static bool collect_import_registry_entries(
-    const PorpoiseAnalysis *analysis,
+    const ProjectContext *context,
     PorpoiseRegistryEntry **entries,
     size_t *entry_count,
     size_t *entry_capacity)
 {
+    const PorpoiseAnalysis *analysis = context->analysis;
     size_t binding_index;
 
+    if (analysis == NULL) return false;
     for (binding_index = 0U;
          binding_index < analysis->import_binding_count;
          binding_index++) {
         const PorpoiseImportBinding *binding =
             &analysis->import_bindings[binding_index];
 
+        if (context->plan != NULL &&
+            function_action(context, binding->owner) !=
+                PORPOISE_PLAN_ACTION_IMPORT) {
+            continue;
+        }
         if (!append_registry_entry(
                 entries,
                 entry_count,
@@ -526,12 +584,12 @@ static bool write_function_registry(ProjectContext *context) {
     size_t shard_index;
 
     if (!collect_registry_entries(
-            context->program,
+            context,
             &entries,
             &entry_count,
             &entry_capacity) ||
         !collect_import_registry_entries(
-            context->analysis,
+            context,
             &entries,
             &entry_count,
             &entry_capacity)) {
@@ -1387,8 +1445,14 @@ static bool write_meson(ProjectContext *context) {
         const PorpoiseSourceFile *file = &context->program->files[file_index];
         size_t function_index;
         bool has_function = false;
-        for (function_index = 0U; function_index < file->function_count; function_index++)
-            if (!file->functions[function_index].skipped) has_function = true;
+        for (function_index = 0U;
+             function_index < file->function_count;
+             function_index++) {
+            if (function_action(context, &file->functions[function_index]) ==
+                PORPOISE_PLAN_ACTION_LIFT) {
+                has_function = true;
+            }
+        }
         if (has_function) {
             char path[PORPOISE_PATH_CAPACITY];
             porpoise_format(path, sizeof(path), "src/lifted/%s.c", file->output_stem);
@@ -1529,24 +1593,15 @@ static bool write_report(ProjectContext *context) {
         const PorpoiseSourceFile *file = &context->program->files[file_index];
         for (function_index = 0U; function_index < file->function_count; function_index++) {
             const PorpoiseFunction *function = &file->functions[function_index];
+            PorpoisePlanAction action = function_action(context, function);
             const char *status;
-            size_t binding_index;
-            bool imported = false;
-
-            for (binding_index = 0U;
-                 binding_index < context->analysis->import_binding_count;
-                 binding_index++) {
-                if (context->analysis->import_bindings[binding_index].owner ==
-                    function) {
-                    imported = true;
-                    break;
-                }
+            switch (action) {
+                case PORPOISE_PLAN_ACTION_LIFT: status = "lifted"; break;
+                case PORPOISE_PLAN_ACTION_DATA: status = "data"; break;
+                case PORPOISE_PLAN_ACTION_IMPORT: status = "imported"; break;
+                case PORPOISE_PLAN_ACTION_OMIT: status = "skipped"; break;
+                default: status = "unknown"; break;
             }
-            status = function->data_region
-                         ? "data"
-                         : (function->skipped
-                                ? (imported ? "imported" : "skipped")
-                                : "lifted");
             fputs(first ? "    {\"symbol\": " : ",\n    {\"symbol\": ", output); first = false;
             porpoise_json_write_string(output, function->name);
             fputs(", \"c_symbol\": ", output); porpoise_json_write_string(output, function->c_name);
@@ -1720,7 +1775,7 @@ static bool write_report(ProjectContext *context) {
     fputs("  ],\n  \"summary\": {", output);
     fprintf(output, "\"files\": %lu, \"functions\": %lu, \"data_words\": %lu, \"data_objects\": %lu, \"anonymous_contributions\": %lu, \"anonymous_explicit_bytes\": %llu, \"data_fixups\": %lu, \"data_spans\": %lu, \"initialized_data_bytes\": %llu, \"zero_fill_data_bytes\": %llu, \"data_chunks\": %lu, \"lowered\": %lu, \"host_equivalent_noop\": %lu, \"approximate\": %lu, \"unsupported\": %lu}",
             (unsigned long)context->program->file_count,
-            (unsigned long)translated_function_count(context->program),
+            (unsigned long)translated_function_count(context),
             (unsigned long)data_word_count(context->program),
             (unsigned long)data_object_count,
             (unsigned long)anonymous_data_count,
@@ -1755,7 +1810,7 @@ static bool generate_stage(ProjectContext *context) {
     size_t file_index;
     bool ok = true;
     context->report->source_count = context->program->file_count;
-    context->report->function_count = translated_function_count(context->program);
+    context->report->function_count = translated_function_count(context);
     if (!porpoise_make_directories(context->stage, context->diagnostics) ||
         !copy_runtime(context) || !write_dispatch_declaration(context) ||
         !write_generated_facade(context) ||
@@ -1810,26 +1865,11 @@ static bool publish_stage(ProjectContext *context) {
     return true;
 }
 
-int porpoise_project_generate(
-    const PorpoiseProgram *program,
-    const PorpoiseAbiManifest *abi,
-    const PorpoiseProjectOptions *options,
-    PorpoiseReport *report,
-    PorpoiseDiagnostics *diagnostics) {
-    ProjectContext context;
-    PorpoiseAnalysis analysis;
+static int prepare_project_output(ProjectContext *context) {
     char base[PORPOISE_PATH_CAPACITY];
-    bool generated;
-    int analysis_result;
-    if (program == NULL || abi == NULL || options == NULL || options->output_path == NULL ||
-        options->runtime_directory == NULL || report == NULL || diagnostics == NULL) return PORPOISE_EXIT_INTERNAL;
-    porpoise_analysis_init(&analysis);
-    memset(&context, 0, sizeof(context));
-    context.program = program;
-    context.abi = abi;
-    context.options = options;
-    context.report = report;
-    context.diagnostics = diagnostics;
+    const PorpoiseProjectOptions *options = context->options;
+    PorpoiseDiagnostics *diagnostics = context->diagnostics;
+
     if (porpoise_path_exists(options->output_path)) {
         if (!porpoise_path_is_directory(options->output_path)) {
             porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, options->output_path, 0U, 0U,
@@ -1842,48 +1882,130 @@ int porpoise_project_generate(
             return PORPOISE_EXIT_USAGE;
         }
     }
-    if (!porpoise_path_basename(base, sizeof(base), options->output_path)) return PORPOISE_EXIT_INTERNAL;
-    porpoise_sanitize_identifier(base, context.project_name, sizeof(context.project_name));
-    analysis_result = porpoise_analyze_program(program, abi, options->entry_symbol,
-                                               &analysis, diagnostics);
-    if (analysis_result != PORPOISE_EXIT_OK) {
-        porpoise_analysis_free(&analysis);
-        return analysis_result;
+    if (!porpoise_path_basename(base, sizeof(base), options->output_path)) {
+        return PORPOISE_EXIT_INTERNAL;
     }
-    context.analysis = &analysis;
-    context.entry = analysis.entry;
-    if (!prepare_data_chunks(&context)) {
-        int result = context.failure_code != PORPOISE_EXIT_OK
-                         ? context.failure_code
+    porpoise_sanitize_identifier(
+        base, context->project_name, sizeof(context->project_name));
+    return PORPOISE_EXIT_OK;
+}
+
+static int generate_project_context(ProjectContext *context) {
+    bool generated;
+    if (!prepare_data_chunks(context)) {
+        int result = context->failure_code != PORPOISE_EXIT_OK
+                         ? context->failure_code
                          : PORPOISE_EXIT_INTERNAL;
-        free_data_chunks(&context);
+        free_data_chunks(context);
+        return result;
+    }
+    if (!make_unique_sibling(
+            context->options->output_path,
+            "stage",
+            context->stage,
+            context->diagnostics)) {
+        free_data_chunks(context);
+        return PORPOISE_EXIT_IO;
+    }
+    generated = generate_stage(context);
+    if (!generated) {
+        free(context->registry_shards);
+        free_data_chunks(context);
+        if (!porpoise_remove_tree(context->stage, context->diagnostics)) {
+            return PORPOISE_EXIT_IO;
+        }
+        return context->failure_code != PORPOISE_EXIT_OK
+                   ? context->failure_code
+                   : PORPOISE_EXIT_IO;
+    }
+    if (!publish_stage(context)) {
+        free(context->registry_shards);
+        free_data_chunks(context);
+        if (porpoise_path_exists(context->stage)) {
+            (void)porpoise_remove_tree(
+                context->stage, context->diagnostics);
+        }
+        return PORPOISE_EXIT_IO;
+    }
+    free(context->registry_shards);
+    free_data_chunks(context);
+    return PORPOISE_EXIT_OK;
+}
+
+int porpoise_project_generate_plan(
+    const PorpoiseTranslationPlan *plan,
+    const PorpoiseProjectOptions *options,
+    PorpoiseReport *report,
+    PorpoiseDiagnostics *diagnostics) {
+    ProjectContext context;
+    const PorpoiseSession *session;
+    const PorpoiseFunctionPlanView *entry;
+    int result;
+
+    if (plan == NULL || options == NULL || options->output_path == NULL ||
+        options->runtime_directory == NULL || report == NULL ||
+        diagnostics == NULL) {
+        return PORPOISE_EXIT_INTERNAL;
+    }
+    result = porpoise_plan_validate(plan, diagnostics);
+    if (result != PORPOISE_EXIT_OK) return result;
+    session = porpoise_plan_session(plan);
+    if (session == NULL || porpoise_session_program(session) == NULL ||
+        porpoise_session_abi(session) == NULL ||
+        porpoise_plan_analysis_snapshot(plan) == NULL) {
+        return PORPOISE_EXIT_INTERNAL;
+    }
+
+    memset(&context, 0, sizeof(context));
+    context.program = porpoise_session_program(session);
+    context.abi = porpoise_session_abi(session);
+    context.options = options;
+    context.report = report;
+    context.diagnostics = diagnostics;
+    context.plan = plan;
+    context.analysis = porpoise_plan_analysis_snapshot(plan);
+    entry = porpoise_plan_entry(plan);
+    context.entry = entry == NULL ? NULL : entry->function;
+
+    result = prepare_project_output(&context);
+    if (result != PORPOISE_EXIT_OK) return result;
+    return generate_project_context(&context);
+}
+
+int porpoise_project_generate(
+    const PorpoiseProgram *program,
+    const PorpoiseAbiManifest *abi,
+    const PorpoiseProjectOptions *options,
+    PorpoiseReport *report,
+    PorpoiseDiagnostics *diagnostics) {
+    ProjectContext context;
+    PorpoiseAnalysis analysis;
+    int result;
+
+    if (program == NULL || abi == NULL || options == NULL ||
+        options->output_path == NULL || options->runtime_directory == NULL ||
+        report == NULL || diagnostics == NULL) {
+        return PORPOISE_EXIT_INTERNAL;
+    }
+    memset(&context, 0, sizeof(context));
+    context.program = program;
+    context.abi = abi;
+    context.options = options;
+    context.report = report;
+    context.diagnostics = diagnostics;
+    result = prepare_project_output(&context);
+    if (result != PORPOISE_EXIT_OK) return result;
+
+    porpoise_analysis_init(&analysis);
+    result = porpoise_analyze_program(
+        program, abi, options->entry_symbol, &analysis, diagnostics);
+    if (result != PORPOISE_EXIT_OK) {
         porpoise_analysis_free(&analysis);
         return result;
     }
-    if (!make_unique_sibling(options->output_path, "stage", context.stage, diagnostics)) {
-        free_data_chunks(&context);
-        porpoise_analysis_free(&analysis);
-        return PORPOISE_EXIT_IO;
-    }
-    generated = generate_stage(&context);
-    if (!generated) {
-        free(context.registry_shards);
-        free_data_chunks(&context);
-        porpoise_analysis_free(&analysis);
-        if (!porpoise_remove_tree(context.stage, diagnostics)) return PORPOISE_EXIT_IO;
-        return context.failure_code != PORPOISE_EXIT_OK
-                   ? context.failure_code
-                   : PORPOISE_EXIT_IO;
-    }
-    if (!publish_stage(&context)) {
-        free(context.registry_shards);
-        free_data_chunks(&context);
-        porpoise_analysis_free(&analysis);
-        if (porpoise_path_exists(context.stage)) (void)porpoise_remove_tree(context.stage, diagnostics);
-        return PORPOISE_EXIT_IO;
-    }
-    free(context.registry_shards);
-    free_data_chunks(&context);
+    context.analysis = &analysis;
+    context.entry = analysis.entry;
+    result = generate_project_context(&context);
     porpoise_analysis_free(&analysis);
-    return PORPOISE_EXIT_OK;
+    return result;
 }

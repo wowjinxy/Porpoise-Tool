@@ -1,8 +1,8 @@
-#include "porpoise/abi.h"
 #include "porpoise/options.h"
-#include "porpoise/program.h"
+#include "porpoise/plan.h"
 #include "porpoise/project.h"
 #include "porpoise/report.h"
+#include "porpoise/session.h"
 #include "porpoise/util.h"
 
 #include <stdio.h>
@@ -48,8 +48,10 @@ static void print_diagnostics(
 
 int main(int argc, char **argv) {
     PorpoiseOptions options;
-    PorpoiseProgram program;
-    PorpoiseAbiManifest abi;
+    PorpoiseSessionOpenOptions session_options;
+    PorpoisePlanOptions plan_options;
+    PorpoiseSession *session = NULL;
+    PorpoiseTranslationPlan *plan = NULL;
     PorpoiseReport report;
     PorpoiseDiagnostics diagnostics;
     PorpoiseProjectOptions project_options;
@@ -70,8 +72,6 @@ int main(int argc, char **argv) {
         return PORPOISE_EXIT_OK;
     }
 
-    porpoise_program_init(&program);
-    porpoise_abi_init(&abi);
     porpoise_report_init(&report);
     porpoise_diagnostics_init(&diagnostics);
 
@@ -100,16 +100,30 @@ int main(int argc, char **argv) {
                                  "input and output directory trees must not overlap");
         result = PORPOISE_EXIT_USAGE;
     } else {
-        if (options.verbosity == PORPOISE_VERBOSITY_VERBOSE)
+        if (options.verbosity == PORPOISE_VERBOSITY_VERBOSE) {
             fprintf(stderr, "porpoise: scanning %s\n", options.input_path);
-        result = porpoise_program_load(&program, options.input_path, &diagnostics);
+            if (options.abi_path[0] != '\0') {
+                fprintf(
+                    stderr,
+                    "porpoise: loading ABI manifest %s\n",
+                    options.abi_path);
+            }
+        }
+        porpoise_session_open_options_init(&session_options);
+        session_options.input_path = options.input_path;
+        session_options.abi_path = options.abi_path;
+        session_options.skip_list_path = options.skip_list_path;
+        result = porpoise_session_open(
+            &session_options, &session, &diagnostics);
     }
-    if (result == PORPOISE_EXIT_OK && options.skip_list_path[0] != '\0')
-        result = porpoise_program_apply_skip_list(&program, options.skip_list_path, &diagnostics);
-    if (result == PORPOISE_EXIT_OK && options.abi_path[0] != '\0') {
-        if (options.verbosity == PORPOISE_VERBOSITY_VERBOSE)
-            fprintf(stderr, "porpoise: loading ABI manifest %s\n", options.abi_path);
-        result = porpoise_abi_load(&abi, options.abi_path, &diagnostics);
+    if (result == PORPOISE_EXIT_OK) {
+        porpoise_plan_options_init(&plan_options);
+        plan_options.entry_symbol = options.entry_symbol;
+        result = porpoise_plan_build(
+            session, &plan_options, &plan, &diagnostics);
+    }
+    if (result == PORPOISE_EXIT_OK) {
+        result = porpoise_plan_validate(plan, &diagnostics);
     }
     if (result == PORPOISE_EXIT_OK) {
         project_options.output_path = options.output_path;
@@ -119,7 +133,8 @@ int main(int argc, char **argv) {
         project_options.strict = options.strict;
         if (options.verbosity == PORPOISE_VERBOSITY_VERBOSE)
             fprintf(stderr, "porpoise: generating %s\n", options.output_path);
-        result = porpoise_project_generate(&program, &abi, &project_options, &report, &diagnostics);
+        result = porpoise_project_generate_plan(
+            plan, &project_options, &report, &diagnostics);
     }
 
     print_diagnostics(&diagnostics, options.verbosity);
@@ -130,7 +145,7 @@ int main(int argc, char **argv) {
 
     porpoise_diagnostics_free(&diagnostics);
     porpoise_report_free(&report);
-    porpoise_abi_free(&abi);
-    porpoise_program_free(&program);
+    porpoise_plan_free(plan);
+    porpoise_session_close(session);
     return result;
 }
