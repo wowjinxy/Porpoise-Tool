@@ -35,6 +35,8 @@ porpoise_core_sources = files(
   'src/relocation.c',
   'src/report.c',
   'src/session.c',
+  'src/sha256.c',
+  'src/signature.c',
   'src/plan.c',
   'src/system_lower.c',
   'src/util.c',
@@ -754,6 +756,30 @@ relocation_test = executable(
   c_args: ['-Werror'],
 )
 test('relocation', relocation_test)
+
+sha256_test = executable(
+  'test_sha256',
+  [
+    'tests/test_sha256.c',
+    'src/sha256.c',
+  ],
+  include_directories: porpoise_inc,
+  c_args: ['-Werror'],
+)
+test('sha256', sha256_test)
+
+signature_test = executable(
+  'test_signature',
+  [
+    'tests/test_signature.c',
+    'src/signature.c',
+    'src/sha256.c',
+    'src/relocation.c',
+  ],
+  include_directories: porpoise_inc,
+  c_args: ['-Werror'],
+)
+test('function-signature', signature_test)
 
 session_plan_test = executable(
   'test_session_plan',
