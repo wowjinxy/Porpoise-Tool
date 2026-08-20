@@ -37,6 +37,7 @@ porpoise_core_sources = files(
   'src/session.c',
   'src/sha256.c',
   'src/signature.c',
+  'src/symbol_map.c',
   'src/plan.c',
   'src/system_lower.c',
   'src/util.c',
@@ -780,6 +781,19 @@ signature_test = executable(
   c_args: ['-Werror'],
 )
 test('function-signature', signature_test)
+
+symbol_map_test = executable(
+  'test_symbol_map',
+  'tests/test_symbol_map.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test(
+  'symbol-map',
+  symbol_map_test,
+  args: [meson.project_source_root()],
+)
 
 session_plan_test = executable(
   'test_session_plan',
