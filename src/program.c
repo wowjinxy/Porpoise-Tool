@@ -22,6 +22,7 @@ typedef struct PorpoisePathList {
 typedef struct PorpoisePendingAlias {
     char *name;
     char *c_name;
+    char *section;
     bool is_global;
     size_t source_line;
 } PorpoisePendingAlias;
@@ -148,6 +149,7 @@ static void free_function(PorpoiseFunction *function) {
     size_t index;
     free(function->name);
     free(function->c_name);
+    free(function->section);
     for (index = 0U; index < function->item_count; index++) {
         free_item(&function->items[index]);
     }
@@ -155,6 +157,7 @@ static void free_function(PorpoiseFunction *function) {
     for (index = 0U; index < function->alias_count; index++) {
         free(function->aliases[index].name);
         free(function->aliases[index].c_name);
+        free(function->aliases[index].section);
     }
     free(function->aliases);
 }
@@ -267,15 +270,18 @@ static PorpoiseSourceFile *program_add_file(
 static PorpoiseFunction *file_add_function(
     PorpoiseSourceFile *file,
     const char *name,
-    bool is_global) {
+    bool is_global,
+    const char *section) {
     PorpoiseFunction candidate = {0};
     PorpoiseFunction *function;
     char c_name[PORPOISE_NAME_CAPACITY];
     porpoise_sanitize_identifier(name, c_name, sizeof(c_name));
     candidate.name = porpoise_strdup(name);
     candidate.c_name = porpoise_strdup(c_name);
+    candidate.section = porpoise_strdup(section);
     candidate.is_global = is_global;
     if (candidate.name == NULL || candidate.c_name == NULL ||
+        candidate.section == NULL ||
         file->function_count == SIZE_MAX ||
         !porpoise_grow_array((void **)&file->functions, &file->function_capacity,
                              sizeof(*file->functions), file->function_count + 1U)) {
@@ -316,6 +322,7 @@ static void pending_alias_list_clear(PorpoisePendingAliasList *aliases) {
     for (index = 0U; index < aliases->count; index++) {
         free(aliases->items[index].name);
         free(aliases->items[index].c_name);
+        free(aliases->items[index].section);
     }
     aliases->count = 0U;
 }
@@ -330,17 +337,21 @@ static bool pending_alias_list_add(
     PorpoisePendingAliasList *aliases,
     const char *name,
     bool is_global,
-    size_t source_line) {
+    size_t source_line,
+    const char *section) {
     PorpoisePendingAlias *alias;
     char c_name[PORPOISE_NAME_CAPACITY];
     char *name_copy;
     char *c_name_copy;
+    char *section_copy;
     porpoise_sanitize_identifier(name, c_name, sizeof(c_name));
     name_copy = porpoise_strdup(name);
     c_name_copy = porpoise_strdup(c_name);
-    if (name_copy == NULL || c_name_copy == NULL) {
+    section_copy = porpoise_strdup(section);
+    if (name_copy == NULL || c_name_copy == NULL || section_copy == NULL) {
         free(name_copy);
         free(c_name_copy);
+        free(section_copy);
         return false;
     }
     if (aliases->count == SIZE_MAX ||
@@ -348,11 +359,13 @@ static bool pending_alias_list_add(
                              sizeof(*aliases->items), aliases->count + 1U)) {
         free(name_copy);
         free(c_name_copy);
+        free(section_copy);
         return false;
     }
     alias = &aliases->items[aliases->count++];
     alias->name = name_copy;
     alias->c_name = c_name_copy;
+    alias->section = section_copy;
     alias->is_global = is_global;
     alias->source_line = source_line;
     return true;
@@ -362,7 +375,8 @@ static bool function_bind_pending_aliases(
     PorpoiseFunction *function,
     PorpoisePendingAliasList *pending,
     uint32_t address,
-    size_t instruction_item_index) {
+    size_t instruction_item_index,
+    const char *source_path) {
     size_t index;
     if (pending->count == 0U) return true;
     if (function->alias_count > SIZE_MAX - pending->count ||
@@ -376,14 +390,16 @@ static bool function_bind_pending_aliases(
         PorpoiseAddressAlias *destination = &function->aliases[function->alias_count++];
         destination->name = source->name;
         destination->c_name = source->c_name;
+        destination->section = source->section;
         destination->is_global = source->is_global;
         destination->is_function_name = false;
         destination->source_line = source->source_line;
-        destination->source_path = NULL;
+        destination->source_path = source_path;
         destination->address = address;
         destination->instruction_item_index = instruction_item_index;
         source->name = NULL;
         source->c_name = NULL;
+        source->section = NULL;
     }
     pending->count = 0U;
     return true;
@@ -488,26 +504,92 @@ static bool materialize_gap_data_regions(PorpoiseProgram *program) {
     return true;
 }
 
-static bool directive_selects_data(const char *line, bool *is_data) {
+static bool section_is_data(const char *section) {
+    return strstr(section, ".data") != NULL ||
+           strstr(section, ".rodata") != NULL ||
+           strstr(section, ".sdata") != NULL ||
+           strstr(section, ".bss") != NULL ||
+           strstr(section, ".sbss") != NULL;
+}
+
+static bool parse_section_directive(
+    const char *line,
+    char *section,
+    size_t section_capacity,
+    bool *is_data) {
     const char *cursor = line;
+    const char *start;
+    const char *end;
+    size_t length;
+    static const char *const selectors[] = {
+        ".text", ".init", ".data", ".rodata", ".sdata", ".sdata2",
+        ".bss", ".sbss", ".sbss2", ".ctors", ".dtors", ".extab",
+        ".extabindex"
+    };
+    size_t selector_index;
     while (isspace((unsigned char)*cursor)) cursor++;
-    if (strcmp(cursor, ".data") == 0 || strcmp(cursor, ".rodata") == 0 ||
-        strcmp(cursor, ".sdata") == 0 || strcmp(cursor, ".sdata2") == 0 ||
-        strcmp(cursor, ".bss") == 0 || strcmp(cursor, ".sbss") == 0 ||
-        strcmp(cursor, ".sbss2") == 0) {
-        *is_data = true;
-        return true;
-    }
-    if (strcmp(cursor, ".text") == 0) {
-        *is_data = false;
-        return true;
+    for (selector_index = 0U;
+         selector_index < sizeof(selectors) / sizeof(selectors[0]);
+         selector_index++) {
+        if (strcmp(cursor, selectors[selector_index]) == 0) {
+            if (!porpoise_copy_string(
+                    section, section_capacity, selectors[selector_index])) {
+                return false;
+            }
+            *is_data = strcmp(section, ".text") != 0 &&
+                       strcmp(section, ".init") != 0;
+            return true;
+        }
     }
     if (strncmp(cursor, ".section", 8U) == 0 && isspace((unsigned char)cursor[8])) {
         cursor += 8;
         while (isspace((unsigned char)*cursor)) cursor++;
-        *is_data = strstr(cursor, ".data") != NULL || strstr(cursor, ".rodata") != NULL ||
-                   strstr(cursor, ".sdata") != NULL || strstr(cursor, ".bss") != NULL ||
-                   strstr(cursor, ".sbss") != NULL;
+        if (*cursor == '"') {
+            start = ++cursor;
+            end = strchr(cursor, '"');
+            if (end == NULL) return false;
+            cursor = end + 1U;
+        } else {
+            start = cursor;
+            while (*cursor != '\0' && *cursor != ',' &&
+                   !isspace((unsigned char)*cursor)) {
+                cursor++;
+            }
+            end = cursor;
+        }
+        length = (size_t)(end - start);
+        if (length == 0U ||
+            length + (start[0] == '.' ? 0U : 1U) >= section_capacity) {
+            return false;
+        }
+        if (start[0] != '.') {
+            section[0] = '.';
+            memcpy(section + 1U, start, length);
+            length++;
+        } else {
+            memcpy(section, start, length);
+        }
+        section[length] = '\0';
+        while (isspace((unsigned char)*cursor)) cursor++;
+        if (*cursor == ',') {
+            const char *flags_end;
+            const char *flag;
+            cursor++;
+            while (isspace((unsigned char)*cursor)) cursor++;
+            flags_end = *cursor == '"' ? strchr(cursor + 1U, '"') : NULL;
+            if (flags_end != NULL) {
+                *is_data = true;
+                for (flag = cursor + 1U; flag < flags_end; flag++) {
+                    if (*flag == 'x') *is_data = false;
+                }
+                return true;
+            }
+        }
+        *is_data = section_is_data(section) ||
+                   strcmp(section, ".ctors") == 0 ||
+                   strcmp(section, ".dtors") == 0 ||
+                   strcmp(section, ".extab") == 0 ||
+                   strcmp(section, ".extabindex") == 0;
         return true;
     }
     return false;
@@ -774,6 +856,7 @@ static bool parse_file(
     bool have_previous_instruction = false;
     uint32_t previous_instruction_address = 0U;
     bool in_data_section = false;
+    char current_section[PORPOISE_PATH_CAPACITY] = ".text";
     bool ok = true;
     bool in_block_comment = false;
     size_t block_comment_start_line = 0U;
@@ -872,7 +955,9 @@ static bool parse_file(
             if (data_result == PORPOISE_ASM_DATA_HANDLED) continue;
         }
         if (parse_symbol_alias(line, alias_name, sizeof(alias_name), &is_global)) {
-            if (!pending_alias_list_add(&pending_aliases, alias_name, is_global, line_number)) {
+            if (!pending_alias_list_add(
+                    &pending_aliases, alias_name, is_global, line_number,
+                    current_section)) {
                 ok = false;
                 break;
             }
@@ -884,7 +969,40 @@ static bool parse_file(
             ok = false;
             continue;
         }
-        if (directive_selects_data(line, &in_data_section)) continue;
+        {
+            char selected_section[PORPOISE_PATH_CAPACITY];
+            bool selected_is_data = false;
+            if (parse_section_directive(
+                    line, selected_section, sizeof(selected_section),
+                    &selected_is_data)) {
+                if (pending_aliases.count != 0U &&
+                    strcmp(current_section, selected_section) != 0) {
+                    size_t pending_index;
+                    for (pending_index = 0U;
+                         pending_index < pending_aliases.count;
+                         pending_index++) {
+                        porpoise_diagnostics_add(
+                            diagnostics, PORPOISE_SEVERITY_ERROR,
+                            file->path,
+                            pending_aliases.items[pending_index].source_line,
+                            0U,
+                            "symbol alias %s crosses section boundary from %s to %s before an annotated instruction",
+                            pending_aliases.items[pending_index].name,
+                            current_section, selected_section);
+                    }
+                    pending_alias_list_clear(&pending_aliases);
+                    ok = false;
+                }
+                if (!porpoise_copy_string(
+                        current_section, sizeof(current_section),
+                        selected_section)) {
+                    ok = false;
+                    break;
+                }
+                in_data_section = selected_is_data;
+                continue;
+            }
+        }
         if (parse_function_start(line, function_name, sizeof(function_name), &is_global)) {
             if (current != NULL) {
                 porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, file->path,
@@ -892,13 +1010,13 @@ static bool parse_file(
                 ok = false;
                 continue;
             }
-            current = file_add_function(file, function_name, is_global);
+            current = file_add_function(
+                file, function_name, is_global, current_section);
             if (current == NULL) {
                 ok = false;
                 break;
             }
             have_previous_instruction = false;
-            in_data_section = false;
             continue;
         }
         if (strncmp(line, ".fn", 3U) == 0 &&
@@ -1029,7 +1147,8 @@ static bool parse_file(
                 break;
             }
             if (!function_bind_pending_aliases(current, &pending_aliases, address,
-                                               current->item_count - 1U)) {
+                                               current->item_count - 1U,
+                                               file->path)) {
                 function_rollback_last_item(current, item);
                 ok = false;
                 break;
@@ -1595,6 +1714,7 @@ static bool function_merge_alias(
     PorpoiseFunction *function,
     const char *name,
     const char *c_name,
+    const char *section,
     bool is_global,
     bool is_function_name,
     size_t source_line,
@@ -1604,12 +1724,14 @@ static bool function_merge_alias(
     size_t index;
     char *name_copy;
     char *c_name_copy;
+    char *section_copy;
     PorpoiseAddressAlias *alias;
 
     for (index = 0U; index < function->alias_count; index++) {
         alias = &function->aliases[index];
         if (strcmp(alias->name, name) == 0 &&
             strcmp(alias->c_name, c_name) == 0 &&
+            strcmp(alias->section, section) == 0 &&
             alias->address == address &&
             alias->instruction_item_index == instruction_item_index) {
             alias->is_global = alias->is_global || is_global;
@@ -1621,9 +1743,11 @@ static bool function_merge_alias(
 
     name_copy = porpoise_strdup(name);
     c_name_copy = porpoise_strdup(c_name);
-    if (name_copy == NULL || c_name_copy == NULL) {
+    section_copy = porpoise_strdup(section);
+    if (name_copy == NULL || c_name_copy == NULL || section_copy == NULL) {
         free(name_copy);
         free(c_name_copy);
+        free(section_copy);
         return false;
     }
     if (function->alias_count == SIZE_MAX ||
@@ -1632,11 +1756,13 @@ static bool function_merge_alias(
             sizeof(*function->aliases), function->alias_count + 1U)) {
         free(name_copy);
         free(c_name_copy);
+        free(section_copy);
         return false;
     }
     alias = &function->aliases[function->alias_count++];
     alias->name = name_copy;
     alias->c_name = c_name_copy;
+    alias->section = section_copy;
     alias->is_global = is_global;
     alias->is_function_name = is_function_name;
     alias->source_line = source_line;
@@ -1672,6 +1798,7 @@ static bool merge_duplicate_function(
         canonical->is_global = canonical->is_global || duplicate->is_global;
     } else if (!function_merge_alias(
                    canonical, duplicate->name, duplicate->c_name,
+                   duplicate->section,
                    duplicate->is_global, true, source_line,
                    duplicate_file->path,
                    canonical->start_address, first_instruction_item_index)) {
@@ -1683,7 +1810,8 @@ static bool merge_duplicate_function(
          alias_index++) {
         const PorpoiseAddressAlias *alias = &duplicate->aliases[alias_index];
         if (!function_merge_alias(
-                canonical, alias->name, alias->c_name, alias->is_global,
+                canonical, alias->name, alias->c_name, alias->section,
+                alias->is_global,
                 alias->is_function_name, alias->source_line,
                 alias->source_path != NULL
                     ? alias->source_path
@@ -1813,6 +1941,111 @@ static bool coalesce_exact_duplicate_functions(PorpoiseProgram *program) {
     return true;
 }
 
+static const PorpoiseSourceFile *program_file_for_path(
+    const PorpoiseProgram *program,
+    const char *path) {
+    size_t file_index;
+    if (path == NULL) return NULL;
+    for (file_index = 0U; file_index < program->file_count; file_index++) {
+        if (strcmp(program->files[file_index].path, path) == 0) {
+            return &program->files[file_index];
+        }
+    }
+    return NULL;
+}
+
+static bool make_local_c_name(
+    const char *name,
+    const PorpoiseSourceFile *file,
+    const char *section,
+    uint32_t address,
+    char *destination,
+    size_t capacity) {
+    char base[PORPOISE_NAME_CAPACITY];
+    char unit[PORPOISE_NAME_CAPACITY];
+    char section_name[PORPOISE_NAME_CAPACITY];
+    char suffix[96];
+    int required;
+    size_t base_length;
+    size_t suffix_length;
+
+    if (name == NULL || file == NULL || section == NULL ||
+        destination == NULL || capacity == 0U) {
+        return false;
+    }
+    porpoise_sanitize_identifier(name, base, sizeof(base));
+    porpoise_sanitize_identifier(file->output_stem, unit, sizeof(unit));
+    porpoise_sanitize_identifier(section, section_name, sizeof(section_name));
+    required = snprintf(
+        destination, capacity, "%s__%s_%s_%08lX", base, unit,
+        section_name, (unsigned long)address);
+    if (required >= 0 && (size_t)required < capacity) return true;
+
+    required = snprintf(
+        suffix, sizeof(suffix), "__tu%016llX_s%016llX_%08lX",
+        (unsigned long long)hash_identifier(file->relative_path),
+        (unsigned long long)hash_identifier(section),
+        (unsigned long)address);
+    if (required < 0 || (size_t)required >= sizeof(suffix)) return false;
+    suffix_length = (size_t)required;
+    if (suffix_length + 1U >= capacity) return false;
+    base_length = strlen(base);
+    if (base_length > capacity - suffix_length - 1U) {
+        base_length = capacity - suffix_length - 1U;
+    }
+    memcpy(destination, base, base_length);
+    memcpy(destination + base_length, suffix, suffix_length + 1U);
+    return true;
+}
+
+static bool namespace_local_symbols(PorpoiseProgram *program) {
+    size_t file_index;
+    for (file_index = 0U; file_index < program->file_count; file_index++) {
+        PorpoiseSourceFile *file = &program->files[file_index];
+        size_t function_index;
+        for (function_index = 0U;
+             function_index < file->function_count;
+             function_index++) {
+            PorpoiseFunction *function = &file->functions[function_index];
+            size_t alias_index;
+            if (!function->is_global) {
+                char c_name[PORPOISE_NAME_CAPACITY];
+                char *replacement;
+                if (!make_local_c_name(
+                        function->name, file, function->section,
+                        function->start_address, c_name, sizeof(c_name))) {
+                    return false;
+                }
+                replacement = porpoise_strdup(c_name);
+                if (replacement == NULL) return false;
+                free(function->c_name);
+                function->c_name = replacement;
+            }
+            for (alias_index = 0U;
+                 alias_index < function->alias_count;
+                 alias_index++) {
+                PorpoiseAddressAlias *alias = &function->aliases[alias_index];
+                const PorpoiseSourceFile *alias_file;
+                char c_name[PORPOISE_NAME_CAPACITY];
+                char *replacement;
+                if (alias->is_global) continue;
+                alias_file = program_file_for_path(program, alias->source_path);
+                if (alias_file == NULL) alias_file = file;
+                if (!make_local_c_name(
+                        alias->name, alias_file, alias->section,
+                        alias->address, c_name, sizeof(c_name))) {
+                    return false;
+                }
+                replacement = porpoise_strdup(c_name);
+                if (replacement == NULL) return false;
+                free(alias->c_name);
+                alias->c_name = replacement;
+            }
+        }
+    }
+    return true;
+}
+
 static void initialize_name_validation_ref(
     PorpoiseNameValidationRef *reference,
     const char *name,
@@ -1841,6 +2074,86 @@ static const char *name_validation_source_path(
         return reference->alias->source_path;
     }
     return reference->file->path;
+}
+
+static const char *name_validation_source_key(
+    const PorpoiseNameValidationRef *reference,
+    char *buffer,
+    size_t capacity) {
+    porpoise_sanitize_identifier(reference->name, buffer, capacity);
+    return buffer;
+}
+
+static int compare_source_name_validation_refs(
+    const void *left,
+    const void *right) {
+    const PorpoiseNameValidationRef *left_ref =
+        (const PorpoiseNameValidationRef *)left;
+    const PorpoiseNameValidationRef *right_ref =
+        (const PorpoiseNameValidationRef *)right;
+    char left_buffer[PORPOISE_NAME_CAPACITY];
+    char right_buffer[PORPOISE_NAME_CAPACITY];
+    int comparison = strcmp(
+        name_validation_source_key(
+            left_ref, left_buffer, sizeof(left_buffer)),
+        name_validation_source_key(
+            right_ref, right_buffer, sizeof(right_buffer)));
+    if (comparison != 0) return comparison;
+    if (left_ref->order < right_ref->order) return -1;
+    if (left_ref->order > right_ref->order) return 1;
+    return 0;
+}
+
+static bool source_name_validation_keys_equal(
+    const PorpoiseNameValidationRef *left,
+    const PorpoiseNameValidationRef *right) {
+    char left_buffer[PORPOISE_NAME_CAPACITY];
+    char right_buffer[PORPOISE_NAME_CAPACITY];
+    return strcmp(
+        name_validation_source_key(left, left_buffer, sizeof(left_buffer)),
+        name_validation_source_key(right, right_buffer, sizeof(right_buffer))) == 0;
+}
+
+static bool name_validation_is_global(
+    const PorpoiseNameValidationRef *reference) {
+    if (reference->kind == PORPOISE_VALIDATION_FUNCTION) {
+        return reference->function->is_global;
+    }
+    if (reference->kind == PORPOISE_VALIDATION_ALIAS) {
+        return reference->alias->is_global;
+    }
+    return false;
+}
+
+static const char *name_validation_section(
+    const PorpoiseNameValidationRef *reference) {
+    if (reference->kind == PORPOISE_VALIDATION_ALIAS) {
+        return reference->alias->section;
+    }
+    return reference->function->section;
+}
+
+static const PorpoiseSourceFile *name_validation_declaring_file(
+    const PorpoiseProgram *program,
+    const PorpoiseNameValidationRef *reference) {
+    const PorpoiseSourceFile *file;
+    if (reference->kind != PORPOISE_VALIDATION_ALIAS) {
+        return reference->file;
+    }
+    file = program_file_for_path(program, reference->alias->source_path);
+    return file != NULL ? file : reference->file;
+}
+
+static bool name_validation_same_local_scope(
+    const PorpoiseProgram *program,
+    const PorpoiseNameValidationRef *left,
+    const PorpoiseNameValidationRef *right) {
+    const char *left_section = name_validation_section(left);
+    const char *right_section = name_validation_section(right);
+    return name_validation_declaring_file(program, left) ==
+               name_validation_declaring_file(program, right) &&
+           left_section != NULL && right_section != NULL &&
+           strcmp(left_section, right_section) == 0;
 }
 
 static bool ensure_unique_symbols(
@@ -2098,6 +2411,118 @@ static bool ensure_unique_symbols(
         name_cursor = group_end;
     }
 
+    /*
+     * Local declarations intentionally receive distinct generated C names.
+     * Validate their assembly spellings separately, within the translation
+     * unit and section where a bare reference can actually see them.
+     */
+    if (name_count > 1U) {
+        qsort(name_refs, name_count, sizeof(*name_refs),
+              compare_source_name_validation_refs);
+    }
+    for (name_cursor = 0U; name_cursor < name_count;) {
+        size_t group_end = name_cursor + 1U;
+        size_t left_index;
+        while (group_end < name_count &&
+               source_name_validation_keys_equal(
+                   &name_refs[name_cursor], &name_refs[group_end])) {
+            group_end++;
+        }
+        for (left_index = name_cursor;
+             left_index < group_end;
+             left_index++) {
+            const PorpoiseNameValidationRef *left = &name_refs[left_index];
+            size_t right_index;
+            if (left->kind == PORPOISE_VALIDATION_LABEL) continue;
+            for (right_index = name_cursor;
+                 right_index < group_end;
+                 right_index++) {
+                const PorpoiseNameValidationRef *right =
+                    &name_refs[right_index];
+                const PorpoiseNameValidationRef *alias_ref;
+                const PorpoiseNameValidationRef *other_ref;
+
+                if (right_index == left_index) continue;
+                if (right->kind != PORPOISE_VALIDATION_LABEL &&
+                    right_index < left_index) continue;
+                if (left->kind == PORPOISE_VALIDATION_LABEL ||
+                    right->kind == PORPOISE_VALIDATION_LABEL) {
+                    alias_ref = left->kind == PORPOISE_VALIDATION_ALIAS
+                        ? left
+                        : right->kind == PORPOISE_VALIDATION_ALIAS
+                            ? right
+                            : NULL;
+                    other_ref = left->kind == PORPOISE_VALIDATION_LABEL
+                        ? left
+                        : right;
+                    if (alias_ref == NULL ||
+                        name_validation_is_global(alias_ref) ||
+                        alias_ref->function != other_ref->function ||
+                        !name_validation_same_local_scope(
+                            program, alias_ref, other_ref)) {
+                        continue;
+                    }
+                    porpoise_diagnostics_add(
+                        diagnostics, PORPOISE_SEVERITY_ERROR,
+                        name_validation_source_path(alias_ref),
+                        alias_ref->alias->source_line,
+                        alias_ref->alias->address,
+                        "symbol alias %s conflicts with label %s in function %s",
+                        alias_ref->alias->name, other_ref->label->label,
+                        other_ref->function->name);
+                    ok = false;
+                    continue;
+                }
+                if (name_validation_is_global(left) &&
+                    name_validation_is_global(right)) {
+                    continue;
+                }
+                if (!name_validation_is_global(left) &&
+                    !name_validation_is_global(right) &&
+                    !name_validation_same_local_scope(program, left, right)) {
+                    continue;
+                }
+                if (left->kind == PORPOISE_VALIDATION_FUNCTION &&
+                    right->kind == PORPOISE_VALIDATION_FUNCTION) {
+                    porpoise_diagnostics_add(
+                        diagnostics, PORPOISE_SEVERITY_ERROR,
+                        right->file->path, 0U,
+                        right->function->start_address,
+                        "duplicate or colliding function symbol %s in section %s",
+                        right->function->name,
+                        name_validation_section(right));
+                    ok = false;
+                    continue;
+                }
+                alias_ref = left->kind == PORPOISE_VALIDATION_ALIAS
+                    ? left
+                    : right;
+                other_ref = alias_ref == left ? right : left;
+                if (other_ref->kind == PORPOISE_VALIDATION_FUNCTION) {
+                    porpoise_diagnostics_add(
+                        diagnostics, PORPOISE_SEVERITY_ERROR,
+                        name_validation_source_path(alias_ref),
+                        alias_ref->alias->source_line,
+                        alias_ref->alias->address,
+                        "symbol alias %s conflicts with function symbol %s in section %s",
+                        alias_ref->alias->name, other_ref->function->name,
+                        name_validation_section(alias_ref));
+                } else {
+                    porpoise_diagnostics_add(
+                        diagnostics, PORPOISE_SEVERITY_ERROR,
+                        name_validation_source_path(alias_ref),
+                        alias_ref->alias->source_line,
+                        alias_ref->alias->address,
+                        "duplicate or colliding symbol alias %s in section %s",
+                        alias_ref->alias->name,
+                        name_validation_section(alias_ref));
+                }
+                ok = false;
+            }
+        }
+        name_cursor = group_end;
+    }
+
     free(file_refs);
     free(data_refs);
     free(function_refs);
@@ -2185,6 +2610,7 @@ int porpoise_program_load(
     }
     path_list_free(&paths);
     if (ok && !coalesce_exact_duplicate_functions(program)) ok = false;
+    if (ok && !namespace_local_symbols(program)) ok = false;
     if (ok && !materialize_gap_data_regions(program)) ok = false;
     if (ok && !ensure_unique_symbols(program, diagnostics)) ok = false;
     if (ok && !program_build_lookup_indices(program)) ok = false;
@@ -2194,6 +2620,14 @@ int porpoise_program_load(
         return porpoise_diagnostics_have_errors(diagnostics) ? PORPOISE_EXIT_TRANSLATION : PORPOISE_EXIT_INTERNAL;
     }
     return PORPOISE_EXIT_OK;
+}
+
+static bool legacy_sanitized_name_matches(
+    const char *source_name,
+    const char *lookup_name) {
+    char sanitized[PORPOISE_NAME_CAPACITY];
+    porpoise_sanitize_identifier(source_name, sanitized, sizeof(sanitized));
+    return strcmp(sanitized, lookup_name) == 0;
 }
 
 const PorpoiseFunction *porpoise_program_find_function(
@@ -2211,6 +2645,31 @@ const PorpoiseFunction *porpoise_program_find_function(
         if ((entry->alias == NULL || entry->alias->is_function_name) &&
             !entry->function->skipped) {
             return entry->function;
+        }
+    }
+    for (index = 0U; index < program->file_count; index++) {
+        const PorpoiseSourceFile *file = &program->files[index];
+        size_t function_index;
+        for (function_index = 0U;
+             function_index < file->function_count;
+             function_index++) {
+            const PorpoiseFunction *function = &file->functions[function_index];
+            size_t alias_index;
+            if (!function->skipped &&
+                legacy_sanitized_name_matches(function->name, name)) {
+                return function;
+            }
+            if (function->skipped) continue;
+            for (alias_index = 0U;
+                 alias_index < function->alias_count;
+                 alias_index++) {
+                const PorpoiseAddressAlias *alias =
+                    &function->aliases[alias_index];
+                if (alias->is_function_name &&
+                    legacy_sanitized_name_matches(alias->name, name)) {
+                    return function;
+                }
+            }
         }
     }
     return NULL;
@@ -2233,6 +2692,27 @@ const PorpoiseAddressAlias *porpoise_program_find_alias(
         if (entry->alias != NULL && !entry->function->skipped) {
             if (function_out != NULL) *function_out = entry->function;
             return entry->alias;
+        }
+    }
+    for (index = 0U; index < program->file_count; index++) {
+        const PorpoiseSourceFile *file = &program->files[index];
+        size_t function_index;
+        for (function_index = 0U;
+             function_index < file->function_count;
+             function_index++) {
+            const PorpoiseFunction *function = &file->functions[function_index];
+            size_t alias_index;
+            if (function->skipped) continue;
+            for (alias_index = 0U;
+                 alias_index < function->alias_count;
+                 alias_index++) {
+                const PorpoiseAddressAlias *alias =
+                    &function->aliases[alias_index];
+                if (legacy_sanitized_name_matches(alias->name, name)) {
+                    if (function_out != NULL) *function_out = function;
+                    return alias;
+                }
+            }
         }
     }
     return NULL;
@@ -2341,37 +2821,250 @@ const PorpoiseAddressAlias *porpoise_program_alias_at(
     return NULL;
 }
 
+static bool symbol_spelling_matches(
+    const char *name,
+    const char *source_name,
+    const char *c_name) {
+    return strcmp(name, source_name) == 0 || strcmp(name, c_name) == 0 ||
+           legacy_sanitized_name_matches(source_name, name);
+}
+
+static bool scoped_symbol_accept_candidate(
+    const PorpoiseFunction *function,
+    const PorpoiseAddressAlias *alias,
+    const PorpoiseFunction **matched_function,
+    const PorpoiseAddressAlias **matched_alias,
+    uint32_t *matched_address,
+    size_t *match_count) {
+    uint32_t address = alias != NULL
+        ? alias->address
+        : function->start_address;
+    if (*match_count != 0U) {
+        if (*matched_function == function && *matched_alias == alias &&
+            *matched_address == address) {
+            return true;
+        }
+        (*match_count)++;
+        return false;
+    }
+    *matched_function = function;
+    *matched_alias = alias;
+    *matched_address = address;
+    *match_count = 1U;
+    return true;
+}
+
+bool porpoise_program_resolve_symbol_scoped(
+    const PorpoiseProgram *program,
+    const PorpoiseSourceFile *scope_file,
+    const PorpoiseFunction *scope_function,
+    const char *scope_section,
+    const char *name,
+    const PorpoiseFunction **function_out,
+    const PorpoiseAddressAlias **alias_out,
+    uint32_t *address_out) {
+    const PorpoiseFunction *matched_function = NULL;
+    const PorpoiseAddressAlias *matched_alias = NULL;
+    uint32_t matched_address = 0U;
+    size_t match_count = 0U;
+    size_t file_index;
+
+    if (function_out != NULL) *function_out = NULL;
+    if (alias_out != NULL) *alias_out = NULL;
+    if (address_out != NULL) *address_out = 0U;
+    if (program == NULL || name == NULL) return false;
+    if (scope_section == NULL && scope_function != NULL) {
+        scope_section = scope_function->section;
+    }
+
+    /* The currently lowered function is the innermost symbol scope. */
+    if (scope_function != NULL && !scope_function->skipped) {
+        size_t alias_index;
+        if (symbol_spelling_matches(
+                name, scope_function->name, scope_function->c_name)) {
+            if (function_out != NULL) *function_out = scope_function;
+            if (address_out != NULL) {
+                *address_out = scope_function->start_address;
+            }
+            return true;
+        }
+        for (alias_index = 0U;
+             alias_index < scope_function->alias_count;
+             alias_index++) {
+            const PorpoiseAddressAlias *alias =
+                &scope_function->aliases[alias_index];
+            const PorpoiseSourceFile *alias_file =
+                program_file_for_path(program, alias->source_path);
+            bool same_scope =
+                (alias_file == NULL ? scope_file : alias_file) == scope_file &&
+                scope_section != NULL && alias->section != NULL &&
+                strcmp(alias->section, scope_section) == 0;
+            if ((!alias->is_global && !same_scope) ||
+                !symbol_spelling_matches(
+                    name, alias->name, alias->c_name)) {
+                continue;
+            }
+            if (function_out != NULL) *function_out = scope_function;
+            if (alias_out != NULL) *alias_out = alias;
+            if (address_out != NULL) *address_out = alias->address;
+            return true;
+        }
+    }
+
+    /* Next search local declarations from this translation unit and section. */
+    if (scope_file != NULL && scope_section != NULL) {
+        for (file_index = 0U; file_index < program->file_count; file_index++) {
+            const PorpoiseSourceFile *file = &program->files[file_index];
+            size_t function_index;
+            for (function_index = 0U;
+                 function_index < file->function_count;
+                 function_index++) {
+                const PorpoiseFunction *function =
+                    &file->functions[function_index];
+                size_t alias_index;
+                if (!function->skipped && !function->is_global &&
+                    file == scope_file && function->section != NULL &&
+                    strcmp(function->section, scope_section) == 0 &&
+                    symbol_spelling_matches(
+                        name, function->name, function->c_name) &&
+                    !scoped_symbol_accept_candidate(
+                        function, NULL, &matched_function, &matched_alias,
+                        &matched_address, &match_count)) {
+                    return false;
+                }
+                if (function->skipped) continue;
+                for (alias_index = 0U;
+                     alias_index < function->alias_count;
+                     alias_index++) {
+                    const PorpoiseAddressAlias *alias =
+                        &function->aliases[alias_index];
+                    const PorpoiseSourceFile *alias_file;
+                    if (alias->is_global || alias->section == NULL ||
+                        strcmp(alias->section, scope_section) != 0 ||
+                        !symbol_spelling_matches(
+                            name, alias->name, alias->c_name)) {
+                        continue;
+                    }
+                    alias_file = program_file_for_path(
+                        program, alias->source_path);
+                    if ((alias_file != NULL ? alias_file : file) != scope_file) {
+                        continue;
+                    }
+                    if (!scoped_symbol_accept_candidate(
+                            function, alias, &matched_function,
+                            &matched_alias, &matched_address, &match_count)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if (match_count == 1U) {
+            if (function_out != NULL) *function_out = matched_function;
+            if (alias_out != NULL) *alias_out = matched_alias;
+            if (address_out != NULL) *address_out = matched_address;
+            return true;
+        }
+    }
+
+    matched_function = NULL;
+    matched_alias = NULL;
+    matched_address = 0U;
+    match_count = 0U;
+    for (file_index = 0U; file_index < program->file_count; file_index++) {
+        const PorpoiseSourceFile *file = &program->files[file_index];
+        size_t function_index;
+        for (function_index = 0U;
+             function_index < file->function_count;
+             function_index++) {
+            const PorpoiseFunction *function = &file->functions[function_index];
+            size_t alias_index;
+            if (function->skipped) continue;
+            if (function->is_global &&
+                symbol_spelling_matches(
+                    name, function->name, function->c_name) &&
+                !scoped_symbol_accept_candidate(
+                    function, NULL, &matched_function, &matched_alias,
+                    &matched_address, &match_count)) {
+                return false;
+            }
+            for (alias_index = 0U;
+                 alias_index < function->alias_count;
+                 alias_index++) {
+                const PorpoiseAddressAlias *alias =
+                    &function->aliases[alias_index];
+                if (!alias->is_global ||
+                    !symbol_spelling_matches(
+                        name, alias->name, alias->c_name)) {
+                    continue;
+                }
+                if (!scoped_symbol_accept_candidate(
+                        function, alias, &matched_function, &matched_alias,
+                        &matched_address, &match_count)) {
+                    return false;
+                }
+            }
+        }
+    }
+    if (match_count != 1U) return false;
+    if (function_out != NULL) *function_out = matched_function;
+    if (alias_out != NULL) *alias_out = matched_alias;
+    if (address_out != NULL) *address_out = matched_address;
+    return true;
+}
+
 bool porpoise_program_resolve_symbol(
     const PorpoiseProgram *program,
     const char *name,
     const PorpoiseFunction **function_out,
     const PorpoiseAddressAlias **alias_out,
     uint32_t *address_out) {
-    const PorpoiseFunction *function;
-    const PorpoiseAddressAlias *alias;
+    const PorpoiseFunction *matched_function = NULL;
+    const PorpoiseAddressAlias *matched_alias = NULL;
+    uint32_t matched_address = 0U;
+    size_t match_count = 0U;
+    size_t file_index;
     if (function_out != NULL) *function_out = NULL;
     if (alias_out != NULL) *alias_out = NULL;
     if (address_out != NULL) *address_out = 0U;
     if (program == NULL || name == NULL) return false;
-    function = porpoise_program_find_function(program, name);
-    if (function != NULL) {
-        const PorpoiseFunction *alias_owner = NULL;
-        alias = porpoise_program_find_alias(program, name, &alias_owner);
-        if (alias != NULL && alias->is_function_name) {
-            if (function_out != NULL) *function_out = alias_owner;
-            if (alias_out != NULL) *alias_out = alias;
-            if (address_out != NULL) *address_out = alias->address;
-            return true;
+    for (file_index = 0U; file_index < program->file_count; file_index++) {
+        const PorpoiseSourceFile *file = &program->files[file_index];
+        size_t function_index;
+        for (function_index = 0U;
+             function_index < file->function_count;
+             function_index++) {
+            const PorpoiseFunction *function =
+                &file->functions[function_index];
+            size_t alias_index;
+            if (function->skipped) continue;
+            if (symbol_spelling_matches(
+                    name, function->name, function->c_name) &&
+                !scoped_symbol_accept_candidate(
+                    function, NULL, &matched_function, &matched_alias,
+                    &matched_address, &match_count)) {
+                return false;
+            }
+            for (alias_index = 0U;
+                 alias_index < function->alias_count;
+                 alias_index++) {
+                const PorpoiseAddressAlias *alias =
+                    &function->aliases[alias_index];
+                if (!symbol_spelling_matches(
+                        name, alias->name, alias->c_name)) {
+                    continue;
+                }
+                if (!scoped_symbol_accept_candidate(
+                        function, alias, &matched_function,
+                        &matched_alias, &matched_address, &match_count)) {
+                    return false;
+                }
+            }
         }
-        if (function_out != NULL) *function_out = function;
-        if (address_out != NULL) *address_out = function->start_address;
-        return true;
     }
-    alias = porpoise_program_find_alias(program, name, &function);
-    if (alias == NULL) return false;
-    if (function_out != NULL) *function_out = function;
-    if (alias_out != NULL) *alias_out = alias;
-    if (address_out != NULL) *address_out = alias->address;
+    if (match_count != 1U) return false;
+    if (function_out != NULL) *function_out = matched_function;
+    if (alias_out != NULL) *alias_out = matched_alias;
+    if (address_out != NULL) *address_out = matched_address;
     return true;
 }
 

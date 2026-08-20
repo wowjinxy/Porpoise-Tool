@@ -930,8 +930,9 @@ static bool emit_branch_target(
         return file_printf(output, "    goto porpoise_entry_item_%lu;\n",
                            (unsigned long)target_item_index);
     }
-    if (porpoise_program_resolve_symbol(
-            program, target, &callee, &alias, &target_address)) {
+    if (porpoise_program_resolve_symbol_scoped(
+            program, source, function, function->section, target,
+            &callee, &alias, &target_address)) {
         if (!file_printf(output,
             "    if (!porpoise_call_address(state, UINT32_C(0x%08lX))) return;\n",
             (unsigned long)target_address)) return false;
@@ -990,8 +991,9 @@ static bool emit_conditional_target(
         return file_printf(output, "    if (%s) goto porpoise_entry_item_%lu;\n",
                            condition, (unsigned long)target_item_index);
     }
-    if (porpoise_program_resolve_symbol(
-            program, target, &callee, &alias, &target_address)) {
+    if (porpoise_program_resolve_symbol_scoped(
+            program, source, function, function->section, target,
+            &callee, &alias, &target_address)) {
         return file_printf(output,
             "    if (%s) { (void)porpoise_call_address(state, UINT32_C(0x%08lX)); return; }\n",
             condition, (unsigned long)target_address);

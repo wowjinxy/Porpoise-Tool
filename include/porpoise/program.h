@@ -21,6 +21,7 @@ typedef struct PorpoiseAsmItem {
 typedef struct PorpoiseAddressAlias {
     char *name;
     char *c_name;
+    char *section;
     bool is_global;
     bool is_function_name;
     size_t source_line;
@@ -32,6 +33,7 @@ typedef struct PorpoiseAddressAlias {
 typedef struct PorpoiseFunction {
     char *name;
     char *c_name;
+    char *section;
     bool is_global;
     bool skipped;
     bool data_region;
@@ -227,6 +229,21 @@ const PorpoiseAddressAlias *porpoise_program_alias_at(
     const PorpoiseFunction **function_out);
 bool porpoise_program_resolve_symbol(
     const PorpoiseProgram *program,
+    const char *name,
+    const PorpoiseFunction **function_out,
+    const PorpoiseAddressAlias **alias_out,
+    uint32_t *address_out);
+/*
+ * Resolve a lifted symbol from an assembly translation-unit scope. Local
+ * declarations in the owning function and then the same file/section take
+ * precedence over global declarations. Bare local names that are outside the
+ * requested scope are never selected.
+ */
+bool porpoise_program_resolve_symbol_scoped(
+    const PorpoiseProgram *program,
+    const PorpoiseSourceFile *scope_file,
+    const PorpoiseFunction *scope_function,
+    const char *scope_section,
     const char *name,
     const PorpoiseFunction **function_out,
     const PorpoiseAddressAlias **alias_out,

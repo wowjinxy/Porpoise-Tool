@@ -1,5 +1,6 @@
 #include "porpoise/program.h"
 #include "porpoise/analysis.h"
+#include "porpoise/lower.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -71,7 +72,7 @@ static void test_valid_aliases(const char *source_root) {
     CHECK(!porpoise_diagnostics_have_errors(&diagnostics));
     CHECK(program.file_count == 1U);
     CHECK(program.files[0].function_count == 2U);
-    CHECK(program.symbol_index_count == 9U);
+    CHECK(program.symbol_index_count == 12U);
     CHECK(program.symbol_index_capacity == program.symbol_index_count);
     CHECK(program.label_index_count == 1U);
     CHECK(program.label_index_capacity == program.label_index_count);
@@ -103,7 +104,11 @@ static void test_valid_aliases(const char *source_root) {
             CHECK(primary->aliases[2].instruction_item_index == 2U);
 
             CHECK(strcmp(primary->aliases[3].name, "same-address-alias") == 0);
-            CHECK(strcmp(primary->aliases[3].c_name, "same_address_alias") == 0);
+            CHECK(strstr(primary->aliases[3].c_name,
+                         "same_address_alias__symbol_aliases_valid_") ==
+                  primary->aliases[3].c_name);
+            CHECK(strstr(primary->aliases[3].c_name, "80001004") != NULL);
+            CHECK(strcmp(primary->aliases[3].section, ".text") == 0);
             CHECK(!primary->aliases[3].is_global);
             CHECK(primary->aliases[3].source_line == 8U);
             CHECK(primary->aliases[3].address == UINT32_C(0x80001004));
@@ -161,6 +166,159 @@ static void test_valid_aliases(const char *source_root) {
     CHECK(porpoise_program_find_alias(&program, "entry.alias", &owner) == NULL);
     CHECK(owner == NULL);
     CHECK(porpoise_program_count_aliases(&program) == 5U);
+
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_program_free(&program);
+}
+
+static const PorpoiseFunction *find_file_function(
+    const PorpoiseSourceFile *file,
+    const char *name) {
+    size_t index;
+    for (index = 0U; index < file->function_count; index++) {
+        if (strcmp(file->functions[index].name, name) == 0) {
+            return &file->functions[index];
+        }
+    }
+    return NULL;
+}
+
+static bool lowered_function_contains(
+    const PorpoiseProgram *program,
+    const PorpoiseSourceFile *file,
+    const PorpoiseFunction *function,
+    const char *needle,
+    PorpoiseDiagnostics *diagnostics) {
+    PorpoiseAbiManifest abi = {0};
+    PorpoiseLoweringOptions options = {0};
+    PorpoiseReport report;
+    FILE *output = tmpfile();
+    char buffer[8192];
+    size_t length;
+    int result;
+    bool found = false;
+    if (output == NULL) return false;
+    porpoise_report_init(&report);
+    result = porpoise_lower_function(
+        output, program, file, function, &abi, &options, &report,
+        diagnostics);
+    if (result == PORPOISE_EXIT_OK && fflush(output) == 0 &&
+        fseek(output, 0L, SEEK_SET) == 0) {
+        length = fread(buffer, 1U, sizeof(buffer) - 1U, output);
+        buffer[length] = '\0';
+        found = strstr(buffer, needle) != NULL;
+    }
+    porpoise_report_free(&report);
+    fclose(output);
+    return found;
+}
+
+static void test_local_symbol_scopes(const char *source_root) {
+    char path[PORPOISE_PATH_CAPACITY];
+    PorpoiseProgram program;
+    PorpoiseDiagnostics diagnostics;
+    const PorpoiseSourceFile *file_a;
+    const PorpoiseSourceFile *file_b;
+    const PorpoiseFunction *caller_a;
+    const PorpoiseFunction *caller_b;
+    const PorpoiseFunction *helper_a;
+    const PorpoiseFunction *helper_b;
+    const PorpoiseFunction *init_caller;
+    const PorpoiseFunction *owner = NULL;
+    const PorpoiseAddressAlias *alias = NULL;
+    uint32_t address = 0U;
+    int result;
+
+    CHECK(make_fixture_path(path, sizeof(path), source_root,
+                            "local_symbol_scopes"));
+    porpoise_program_init(&program);
+    porpoise_diagnostics_init(&diagnostics);
+    result = porpoise_program_load(&program, path, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    CHECK(!porpoise_diagnostics_have_errors(&diagnostics));
+    CHECK(program.file_count == 2U);
+    file_a = program.file_count > 0U ? &program.files[0] : NULL;
+    file_b = program.file_count > 1U ? &program.files[1] : NULL;
+    CHECK(file_a != NULL && strcmp(file_a->relative_path, "a.s") == 0);
+    CHECK(file_b != NULL && strcmp(file_b->relative_path, "b.s") == 0);
+    if (file_a == NULL || file_b == NULL) {
+        porpoise_diagnostics_free(&diagnostics);
+        porpoise_program_free(&program);
+        return;
+    }
+
+    caller_a = find_file_function(file_a, "caller_a");
+    caller_b = find_file_function(file_b, "caller_b");
+    helper_a = find_file_function(file_a, "helper");
+    helper_b = find_file_function(file_b, "helper");
+    init_caller = find_file_function(file_a, "init_caller_a");
+    CHECK(caller_a != NULL);
+    CHECK(caller_b != NULL);
+    CHECK(helper_a != NULL);
+    CHECK(helper_b != NULL);
+    CHECK(init_caller != NULL);
+    if (caller_a == NULL || caller_b == NULL || helper_a == NULL ||
+        helper_b == NULL || init_caller == NULL) {
+        porpoise_diagnostics_free(&diagnostics);
+        porpoise_program_free(&program);
+        return;
+    }
+    CHECK(strcmp(helper_a->section, ".text") == 0);
+    CHECK(strcmp(helper_b->section, ".text") == 0);
+    CHECK(strcmp(init_caller->section, ".init") == 0);
+    CHECK(strcmp(helper_a->c_name, helper_b->c_name) != 0);
+    CHECK(strstr(helper_a->c_name, "helper__a_") == helper_a->c_name);
+    CHECK(strstr(helper_a->c_name, "80010100") != NULL);
+    CHECK(strstr(helper_b->c_name, "helper__b_") == helper_b->c_name);
+    CHECK(strstr(helper_b->c_name, "80011100") != NULL);
+
+    CHECK(porpoise_program_resolve_symbol_scoped(
+        &program, file_a, caller_a, caller_a->section, "helper",
+        &owner, &alias, &address));
+    CHECK(owner == helper_a);
+    CHECK(alias == NULL);
+    CHECK(address == UINT32_C(0x80010100));
+    CHECK(porpoise_program_resolve_symbol_scoped(
+        &program, file_b, caller_b, caller_b->section, "helper",
+        &owner, &alias, &address));
+    CHECK(owner == helper_b);
+    CHECK(alias == NULL);
+    CHECK(address == UINT32_C(0x80011100));
+    CHECK(lowered_function_contains(
+        &program, file_a, caller_a, "UINT32_C(0x80010100)",
+        &diagnostics));
+    CHECK(lowered_function_contains(
+        &program, file_b, caller_b, "UINT32_C(0x80011100)",
+        &diagnostics));
+
+    CHECK(porpoise_program_resolve_symbol_scoped(
+        &program, file_a, caller_a, caller_a->section, "scoped_alias",
+        &owner, &alias, &address));
+    CHECK(owner == helper_a);
+    CHECK(alias != NULL && strcmp(alias->section, ".text") == 0);
+    CHECK(address == UINT32_C(0x80010100));
+    CHECK(porpoise_program_resolve_symbol_scoped(
+        &program, file_a, init_caller, init_caller->section, "scoped_alias",
+        &owner, &alias, &address));
+    CHECK(owner != NULL && strcmp(owner->name, "init_helper") == 0);
+    CHECK(alias != NULL && strcmp(alias->section, ".init") == 0);
+    CHECK(address == UINT32_C(0x80010300));
+    CHECK(porpoise_program_resolve_symbol_scoped(
+        &program, file_b, caller_b, caller_b->section, "scoped_alias",
+        &owner, &alias, &address));
+    CHECK(owner == helper_b);
+    CHECK(alias != NULL && strstr(alias->c_name, "scoped_alias__b_") ==
+                              alias->c_name);
+    CHECK(address == UINT32_C(0x80011100));
+
+    /* Unscoped lookup rejects an ambiguous local spelling, while each stable
+     * generated identifier remains directly addressable. */
+    CHECK(!porpoise_program_resolve_symbol(
+        &program, "helper", &owner, &alias, &address));
+    CHECK(porpoise_program_resolve_symbol(
+        &program, helper_a->c_name, &owner, &alias, &address));
+    CHECK(owner == helper_a);
+    CHECK(address == UINT32_C(0x80010100));
 
     porpoise_diagnostics_free(&diagnostics);
     porpoise_program_free(&program);
@@ -793,6 +951,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     test_valid_aliases(argv[1]);
+    test_local_symbol_scopes(argv[1]);
     test_unique_label_resolution(argv[1]);
     test_weak_function_scope(argv[1]);
     test_multiline_comments(argv[1]);
@@ -811,6 +970,8 @@ int main(int argc, char **argv) {
                        "before .endfn");
     test_invalid_program(argv[1], "symbol_aliases_unresolved_outside.s",
                        "not followed by an annotated instruction");
+    test_invalid_program(argv[1], "symbol_alias_crosses_section.s",
+                       "crosses section boundary");
     test_invalid_program(argv[1], "symbol_aliases_function_conflict.s",
                        "conflicts with function symbol");
     test_invalid_program(argv[1], "symbol_aliases_label_conflict.s",
