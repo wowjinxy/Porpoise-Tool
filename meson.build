@@ -34,6 +34,8 @@ porpoise_core_sources = files(
   'src/raw_word.c',
   'src/relocation.c',
   'src/report.c',
+  'src/session.c',
+  'src/plan.c',
   'src/system_lower.c',
   'src/util.c',
   'third_party/jsmn/jsmn.c',
@@ -752,6 +754,19 @@ relocation_test = executable(
   c_args: ['-Werror'],
 )
 test('relocation', relocation_test)
+
+session_plan_test = executable(
+  'test_session_plan',
+  'tests/test_session_plan.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test(
+  'session-plan',
+  session_plan_test,
+  args: [meson.project_source_root()],
+)
 
 program_test = executable(
   'test_program',
