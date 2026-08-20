@@ -959,6 +959,45 @@ void porpoise_plan_free(PorpoiseTranslationPlan *plan) {
     free(plan);
 }
 
+static bool plan_function_has_contiguous_bytes(
+    const PorpoiseFunction *function) {
+    uint64_t expected = function->start_address;
+    uint64_t end = expected + function->size;
+    size_t item_index;
+    if (function->size == 0U || (function->size & UINT32_C(3)) != 0U ||
+        end > (UINT64_C(1) << 32)) {
+        return false;
+    }
+    for (item_index = 0U; item_index < function->item_count; item_index++) {
+        const PorpoiseAsmItem *item = &function->items[item_index];
+        if (item->kind != PORPOISE_ASM_INSTRUCTION) continue;
+        if ((uint64_t)item->address != expected || expected + 4U > end) {
+            return false;
+        }
+        expected += 4U;
+    }
+    return expected == end;
+}
+
+static bool plan_data_action_overlaps_existing_data(
+    const PorpoiseProgram *program,
+    const PorpoiseFunction *function) {
+    uint64_t function_start = function->start_address;
+    uint64_t function_end = function_start + function->size;
+    size_t span_index;
+    for (span_index = 0U;
+         span_index < program->data_span_count;
+         span_index++) {
+        const PorpoiseDataSpan *span = &program->data_spans[span_index];
+        uint64_t span_start = span->address;
+        uint64_t span_end = span_start + span->size;
+        if (function_start < span_end && span_start < function_end) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int porpoise_plan_validate(
     const PorpoiseTranslationPlan *plan,
     PorpoiseDiagnostics *diagnostics) {
@@ -1027,7 +1066,18 @@ int porpoise_plan_validate(
                     if (action_valid) lifted_count++;
                     break;
                 case PORPOISE_PLAN_ACTION_DATA:
-                    action_valid = view->binding == NULL;
+                    action_valid = view->binding == NULL &&
+                                   (function->data_region ||
+                                    (plan_function_has_contiguous_bytes(function) &&
+                                     !plan_data_action_overlaps_existing_data(
+                                         program, function)));
+                    if (!action_valid && !function->data_region) {
+                        porpoise_diagnostics_add(
+                            diagnostics, PORPOISE_SEVERITY_ERROR,
+                            source->path, 0U, function->start_address,
+                            "function %s cannot be treated as data because its byte range is incomplete or overlaps existing data",
+                            function->name);
+                    }
                     break;
                 case PORPOISE_PLAN_ACTION_OMIT:
                     action_valid = !function->data_region &&

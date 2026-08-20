@@ -1,6 +1,8 @@
 #include "porpoise/options.h"
 #include "porpoise/plan.h"
 #include "porpoise/project.h"
+#include "porpoise/recovery_project.h"
+#include "porpoise/recovery_runner.h"
 #include "porpoise/report.h"
 #include "porpoise/session.h"
 #include "porpoise/util.h"
@@ -47,6 +49,94 @@ static void print_diagnostics(
     }
 }
 
+static void print_project_progress(
+    void *user_data,
+    PorpoiseOperationPhase phase,
+    size_t completed,
+    size_t total,
+    const char *detail) {
+    const PorpoiseOptions *options = (const PorpoiseOptions *)user_data;
+    if (options == NULL ||
+        options->verbosity != PORPOISE_VERBOSITY_VERBOSE) {
+        return;
+    }
+    fprintf(stderr, "porpoise: %s", porpoise_operation_phase_name(phase));
+    if (total != 0U) {
+        fprintf(stderr, " %lu/%lu", (unsigned long)completed,
+                (unsigned long)total);
+    }
+    if (detail != NULL && detail[0] != '\0') {
+        fprintf(stderr, ": %s", detail);
+    }
+    fputc('\n', stderr);
+}
+
+static int run_project_mode(
+    const PorpoiseOptions *options,
+    PorpoiseDiagnostics *diagnostics) {
+    PorpoiseRecoveryProject project;
+    PorpoiseRecoveryRunOptions run_options;
+    PorpoiseRecoveryRunResult run_result;
+    PorpoiseOperationCallbacks operation;
+    const char *target_ids[PORPOISE_TARGET_SELECTOR_LIMIT];
+    size_t index;
+    int result;
+
+    porpoise_recovery_project_init(&project);
+    porpoise_recovery_run_options_init(&run_options);
+    porpoise_recovery_run_result_init(&run_result);
+    porpoise_operation_callbacks_init(&operation);
+    operation.progress = print_project_progress;
+    operation.user_data = (void *)options;
+
+    result = porpoise_recovery_project_load(
+        &project, options->project_path, diagnostics);
+    if (result != PORPOISE_EXIT_OK) goto finished;
+
+    for (index = 0U; index < options->target_id_count; index++) {
+        target_ids[index] = options->target_ids[index];
+    }
+    run_options.target_ids = options->target_id_count == 0U
+        ? NULL : target_ids;
+    run_options.target_id_count = options->target_id_count;
+    run_options.analyze_only = options->analyze_only;
+    run_options.force = options->force;
+    run_options.report_path = options->report_path[0] == '\0'
+        ? NULL : options->report_path;
+    run_options.runtime_directory = select_runtime_directory();
+    run_options.operation = &operation;
+    result = porpoise_recovery_project_run(
+        &project, &run_options, &run_result, diagnostics);
+
+    if (result == PORPOISE_EXIT_OK &&
+        options->verbosity != PORPOISE_VERBOSITY_QUIET) {
+        fprintf(stdout, "%s %lu project target(s)%s.\n",
+                options->analyze_only ? "Analyzed" : "Generated",
+                (unsigned long)run_result.target_count,
+                options->analyze_only
+                    ? " without publishing output"
+                    : " transactionally");
+        if (options->verbosity == PORPOISE_VERBOSITY_VERBOSE) {
+            for (index = 0U; index < run_result.target_count; index++) {
+                const PorpoiseRecoveryRunTarget *target =
+                    &run_result.targets[index];
+                fprintf(stdout, "  %s: %lu function(s)%s%s\n",
+                        target->target->id,
+                        (unsigned long)porpoise_plan_function_count(
+                            target->plan),
+                        options->analyze_only ? "" : " -> ",
+                        options->analyze_only
+                            ? "" : target->target->output.resolved);
+            }
+        }
+    }
+
+finished:
+    porpoise_recovery_run_result_free(&run_result);
+    porpoise_recovery_project_free(&project);
+    return result;
+}
+
 int main(int argc, char **argv) {
     PorpoiseOptions options;
     PorpoiseSessionOpenOptions session_options;
@@ -78,6 +168,14 @@ int main(int argc, char **argv) {
 
     porpoise_report_init(&report);
     porpoise_diagnostics_init(&diagnostics);
+
+    if (options.project_path[0] != '\0') {
+        result = run_project_mode(&options, &diagnostics);
+        print_diagnostics(&diagnostics, options.verbosity);
+        porpoise_diagnostics_free(&diagnostics);
+        porpoise_report_free(&report);
+        return result;
+    }
 
     if (!porpoise_path_normalize_lexical(normalized_output, sizeof(normalized_output),
                                          options.output_path) ||

@@ -18,6 +18,10 @@
 
 typedef struct CliValues {
     PorpoiseOptions values;
+    bool project_seen;
+    bool target_seen;
+    bool analyze_only_seen;
+    bool report_seen;
     bool input_seen;
     bool output_seen;
     bool config_seen;
@@ -142,15 +146,21 @@ void porpoise_options_print_help(FILE *stream, const char *program_name) {
 
     fprintf(stream,
             "Usage: %s INPUT --output DIR [OPTIONS]\n"
+            "       %s --project FILE [PROJECT OPTIONS]\n"
             "\n"
             "Translate one annotated PowerPC assembly file, or all .s files\n"
             "beneath an input directory, into a libPorpoise-backed C project.\n"
+            "Project mode processes every enabled target unless --target is used.\n"
             "\n"
             "Required:\n"
             "  INPUT                 Assembly file or directory to translate\n"
             "  --output DIR          Destination directory (must be empty)\n"
             "\n"
             "Options:\n"
+            "  --project FILE        Load a schema-version 1 .porpoise.json project\n"
+            "  --target ID           Select a project target (repeatable, max %u)\n"
+            "  --analyze-only        Build and validate plans without generation\n"
+            "  --report FILE         Write the project-mode aggregate report\n"
             "  --config FILE         Load an explicit schema-version 1 JSON config\n"
             "  --abi FILE            ABI manifest for typed external calls\n"
             "  --skip-list FILE      List of functions not to translate\n"
@@ -173,7 +183,7 @@ void porpoise_options_print_help(FILE *stream, const char *program_name) {
             "sdk_policy, module, entry, strict, and verbosity. Config-relative file\n"
             "paths are resolved beside the config file; CLI values override\n"
             "config values. --force is accepted only on the command line.\n",
-            name);
+            name, name, (unsigned int)PORPOISE_TARGET_SELECTOR_LIMIT);
 }
 
 void porpoise_options_print_version(FILE *stream) {
@@ -218,7 +228,62 @@ static PorpoiseExitCode parse_cli(CliValues *cli,
                                 "%s must be used by itself", argument);
         }
 
-        if (!positional_only && strcmp(argument, "--output") == 0) {
+        if (!positional_only && strcmp(argument, "--project") == 0) {
+            target = cli->values.project_path;
+            target_capacity = sizeof(cli->values.project_path);
+            description = "project path";
+            seen = &cli->project_seen;
+        } else if (!positional_only && strcmp(argument, "--target") == 0) {
+            size_t selector_index;
+            if (index + 1 >= argc) {
+                return option_error(
+                    error_stream, "option --target requires a value");
+            }
+            if (cli->values.target_id_count >=
+                PORPOISE_TARGET_SELECTOR_LIMIT) {
+                return option_error(
+                    error_stream,
+                    "option --target may be specified at most %u times",
+                    (unsigned int)PORPOISE_TARGET_SELECTOR_LIMIT);
+            }
+            index++;
+            for (selector_index = 0U;
+                 selector_index < cli->values.target_id_count;
+                 selector_index++) {
+                if (strcmp(
+                        cli->values.target_ids[selector_index],
+                        argv[index]) == 0) {
+                    return option_error(
+                        error_stream,
+                        "project target '%s' was selected more than once",
+                        argv[index]);
+                }
+            }
+            if (!copy_checked(
+                    cli->values.target_ids[cli->values.target_id_count],
+                    sizeof(cli->values.target_ids[0]), argv[index],
+                    "target selector", error_stream)) {
+                return PORPOISE_EXIT_USAGE;
+            }
+            cli->values.target_id_count++;
+            cli->target_seen = true;
+            continue;
+        } else if (!positional_only &&
+                   strcmp(argument, "--analyze-only") == 0) {
+            if (cli->analyze_only_seen) {
+                return option_error(
+                    error_stream,
+                    "option --analyze-only was specified more than once");
+            }
+            cli->analyze_only_seen = true;
+            cli->values.analyze_only = true;
+            continue;
+        } else if (!positional_only && strcmp(argument, "--report") == 0) {
+            target = cli->values.report_path;
+            target_capacity = sizeof(cli->values.report_path);
+            description = "report path";
+            seen = &cli->report_seen;
+        } else if (!positional_only && strcmp(argument, "--output") == 0) {
             target = cli->values.output_path;
             target_capacity = sizeof(cli->values.output_path);
             description = "output directory";
@@ -351,6 +416,78 @@ static PorpoiseExitCode parse_cli(CliValues *cli,
         }
     }
 
+    if (cli->project_seen) {
+        if (cli->input_seen) {
+            return option_error(
+                error_stream, "--project is mutually exclusive with INPUT");
+        }
+        if (cli->output_seen) {
+            return option_error(
+                error_stream, "--project is mutually exclusive with --output");
+        }
+        if (cli->config_seen) {
+            return option_error(
+                error_stream, "--project is mutually exclusive with --config");
+        }
+        if (cli->abi_seen) {
+            return option_error(
+                error_stream, "--project is mutually exclusive with --abi");
+        }
+        if (cli->skip_list_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --skip-list");
+        }
+        if (cli->map_seen) {
+            return option_error(
+                error_stream, "--project is mutually exclusive with --map");
+        }
+        if (cli->dtk_symbols_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --dtk-symbols");
+        }
+        if (cli->dtk_splits_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --dtk-splits");
+        }
+        if (cli->sdk_catalog_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --sdk-catalog");
+        }
+        if (cli->sdk_policy_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --sdk-policy");
+        }
+        if (cli->module_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --module");
+        }
+        if (cli->entry_seen) {
+            return option_error(
+                error_stream, "--project is mutually exclusive with --entry");
+        }
+        if (cli->strict_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --strict");
+        }
+        return PORPOISE_EXIT_SUCCESS;
+    }
+    if (cli->target_seen) {
+        return option_error(error_stream, "--target requires --project FILE");
+    }
+    if (cli->analyze_only_seen) {
+        return option_error(
+            error_stream, "--analyze-only requires --project FILE");
+    }
+    if (cli->report_seen) {
+        return option_error(error_stream, "--report requires --project FILE");
+    }
     if (!cli->input_seen) {
         return option_error(error_stream, "missing INPUT");
     }
@@ -1117,6 +1254,10 @@ PorpoiseExitCode porpoise_options_parse(PorpoiseOptions *options,
         return result;
     }
     if (cli.values.show_help || cli.values.show_version) {
+        *options = cli.values;
+        return PORPOISE_EXIT_SUCCESS;
+    }
+    if (cli.project_seen) {
         *options = cli.values;
         return PORPOISE_EXIT_SUCCESS;
     }

@@ -30,7 +30,10 @@ typedef struct PorpoiseSessionSymbolSource {
  */
 typedef struct PorpoiseSessionOpenOptions {
     const char *input_path;
+    /* Legacy single manifest; loaded before abi_paths when both are present. */
     const char *abi_path;
+    const char *const *abi_paths;
+    size_t abi_path_count;
     const char *skip_list_path;
     const PorpoiseSessionSymbolSource *symbol_sources;
     size_t symbol_source_count;

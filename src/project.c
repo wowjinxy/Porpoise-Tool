@@ -27,6 +27,16 @@ typedef struct ProjectDataChunk {
     uint8_t *bytes;
 } ProjectDataChunk;
 
+typedef struct ProjectDataRange {
+    uint32_t address;
+    uint32_t size;
+    const uint8_t *bytes;
+    uint8_t *owned_bytes;
+    const PorpoiseDataSpan *span;
+    const PorpoiseFunction *function;
+    bool zero_fill;
+} ProjectDataRange;
+
 typedef struct ProjectContext {
     const PorpoiseProgram *program;
     const PorpoiseAbiManifest *abi;
@@ -46,6 +56,21 @@ typedef struct ProjectContext {
     size_t data_chunk_capacity;
     bool cancellation_reported;
 } ProjectContext;
+
+struct PorpoiseStagedProject {
+    char output_path[PORPOISE_PATH_CAPACITY];
+    char stage_path[PORPOISE_PATH_CAPACITY];
+    const PorpoiseOperationCallbacks *operation;
+    bool published;
+};
+
+typedef struct ProjectPublishEntry {
+    PorpoiseStagedProject *staged;
+    char backup_path[PORPOISE_PATH_CAPACITY];
+    bool had_output;
+    bool backup_moved;
+    bool output_published;
+} ProjectPublishEntry;
 
 enum {
     PORPOISE_REGISTRY_SHARD_SHIFT = 16,
@@ -916,67 +941,249 @@ static bool begin_data_chunk(ProjectContext *context, uint32_t address) {
     return true;
 }
 
+static int compare_project_data_ranges(const void *left, const void *right) {
+    const ProjectDataRange *left_range = (const ProjectDataRange *)left;
+    const ProjectDataRange *right_range = (const ProjectDataRange *)right;
+    if (left_range->address < right_range->address) return -1;
+    if (left_range->address > right_range->address) return 1;
+    if (left_range->size < right_range->size) return -1;
+    if (left_range->size > right_range->size) return 1;
+    return 0;
+}
+
+static void free_project_data_ranges(
+    ProjectDataRange *ranges,
+    size_t range_count) {
+    size_t index;
+    for (index = 0U; index < range_count; index++) {
+        free(ranges[index].owned_bytes);
+    }
+    free(ranges);
+}
+
+static bool prepare_function_data_range(
+    ProjectContext *context,
+    const PorpoiseFunction *function,
+    ProjectDataRange *range) {
+    uint64_t expected_address = function->start_address;
+    uint64_t end_address = expected_address + function->size;
+    size_t item_index;
+    if (function->size == 0U || (function->size & UINT32_C(3)) != 0U ||
+        end_address > (UINT64_C(1) << 32)) {
+        porpoise_diagnostics_add(
+            context->diagnostics, PORPOISE_SEVERITY_ERROR, NULL, 0U,
+            function->start_address,
+            "function %s cannot be treated as data because its byte range is invalid",
+            function->name);
+        record_failure(context, PORPOISE_EXIT_TRANSLATION);
+        return false;
+    }
+    range->owned_bytes = (uint8_t *)malloc((size_t)function->size);
+    if (range->owned_bytes == NULL) {
+        record_failure(context, PORPOISE_EXIT_INTERNAL);
+        return false;
+    }
+    for (item_index = 0U; item_index < function->item_count; item_index++) {
+        const PorpoiseAsmItem *item = &function->items[item_index];
+        size_t offset;
+        if (item->kind != PORPOISE_ASM_INSTRUCTION) continue;
+        if ((uint64_t)item->address != expected_address ||
+            expected_address + 4U > end_address) {
+            porpoise_diagnostics_add(
+                context->diagnostics, PORPOISE_SEVERITY_ERROR, NULL,
+                item->source_line, item->address,
+                "function %s cannot be treated as data because its instruction bytes are not contiguous",
+                function->name);
+            record_failure(context, PORPOISE_EXIT_TRANSLATION);
+            return false;
+        }
+        offset = (size_t)(expected_address - function->start_address);
+        range->owned_bytes[offset] = (uint8_t)(item->word >> 24U);
+        range->owned_bytes[offset + 1U] = (uint8_t)(item->word >> 16U);
+        range->owned_bytes[offset + 2U] = (uint8_t)(item->word >> 8U);
+        range->owned_bytes[offset + 3U] = (uint8_t)item->word;
+        expected_address += 4U;
+    }
+    if (expected_address != end_address) {
+        porpoise_diagnostics_add(
+            context->diagnostics, PORPOISE_SEVERITY_ERROR, NULL, 0U,
+            function->start_address,
+            "function %s cannot be treated as data because its annotated bytes do not cover its range",
+            function->name);
+        record_failure(context, PORPOISE_EXIT_TRANSLATION);
+        return false;
+    }
+    range->address = function->start_address;
+    range->size = function->size;
+    range->bytes = range->owned_bytes;
+    range->function = function;
+    return true;
+}
+
+static bool append_project_data_bytes(
+    ProjectContext *context,
+    uint32_t start_address,
+    const uint8_t *bytes,
+    size_t size) {
+    size_t offset = 0U;
+    while (offset < size) {
+        ProjectDataChunk *chunk = NULL;
+        uint32_t address = start_address + (uint32_t)offset;
+        size_t remaining = size - offset;
+        size_t amount;
+        if (context->data_chunk_count != 0U) {
+            ProjectDataChunk *candidate =
+                &context->data_chunks[context->data_chunk_count - 1U];
+            uint64_t candidate_end =
+                (uint64_t)candidate->address + (uint64_t)candidate->size;
+            if (candidate_end == (uint64_t)address &&
+                candidate->size < candidate->capacity) {
+                chunk = candidate;
+            }
+        }
+        if (chunk == NULL) {
+            if (!begin_data_chunk(context, address)) return false;
+            chunk = &context->data_chunks[context->data_chunk_count - 1U];
+        }
+        amount = chunk->capacity - chunk->size;
+        if (amount > remaining) amount = remaining;
+        memcpy(chunk->bytes + chunk->size, bytes + offset, amount);
+        chunk->size += amount;
+        offset += amount;
+    }
+    return true;
+}
+
 static bool prepare_data_chunks(ProjectContext *context) {
-    size_t span_index;
+    ProjectDataRange *ranges;
+    size_t range_capacity = context->program->data_span_count;
+    size_t range_count = 0U;
+    size_t file_index;
+    size_t range_index;
     uint64_t previous_end = 0U;
     bool have_previous = false;
 
-    for (span_index = 0U;
-         span_index < context->program->data_span_count;
-         span_index++) {
-        const PorpoiseDataSpan *span =
-            &context->program->data_spans[span_index];
-        uint64_t span_end = (uint64_t)span->address + (uint64_t)span->size;
-        size_t offset = 0U;
-
-        if (span->size == 0U) {
-            return report_invalid_data_ir(
-                context, span, "assembly data IR contains an empty span");
-        }
-        if (span_end > (UINT64_C(1) << 32)) {
-            return report_invalid_data_ir(
-                context, span, "assembly data span exceeds the 32-bit guest address space");
-        }
-        if (have_previous && (uint64_t)span->address < previous_end) {
-            return report_invalid_data_ir(
-                context, span, "assembly data spans overlap or are not sorted");
-        }
-        have_previous = true;
-        previous_end = span_end;
-
-        if (span->kind == PORPOISE_DATA_SPAN_ZERO_FILL) continue;
-        if (span->kind != PORPOISE_DATA_SPAN_INITIALIZED || span->bytes == NULL) {
-            return report_invalid_data_ir(
-                context, span, "assembly data span has an invalid kind or missing bytes");
-        }
-
-        while (offset < (size_t)span->size) {
-            ProjectDataChunk *chunk = NULL;
-            uint32_t address = span->address + (uint32_t)offset;
-            size_t remaining = (size_t)span->size - offset;
-            size_t amount;
-
-            if (context->data_chunk_count != 0U) {
-                ProjectDataChunk *candidate =
-                    &context->data_chunks[context->data_chunk_count - 1U];
-                uint64_t candidate_end =
-                    (uint64_t)candidate->address + (uint64_t)candidate->size;
-                if (candidate_end == (uint64_t)address &&
-                    candidate->size < candidate->capacity) {
-                    chunk = candidate;
+    if (context->plan != NULL) {
+        for (file_index = 0U;
+             file_index < context->program->file_count;
+             file_index++) {
+            const PorpoiseSourceFile *file =
+                &context->program->files[file_index];
+            size_t function_index;
+            for (function_index = 0U;
+                 function_index < file->function_count;
+                 function_index++) {
+                const PorpoiseFunction *function =
+                    &file->functions[function_index];
+                if (!function->data_region &&
+                    function_action(context, function) ==
+                        PORPOISE_PLAN_ACTION_DATA) {
+                    if (range_capacity == SIZE_MAX) return false;
+                    range_capacity++;
                 }
             }
-            if (chunk == NULL) {
-                if (!begin_data_chunk(context, address)) return false;
-                chunk = &context->data_chunks[context->data_chunk_count - 1U];
-            }
-            amount = chunk->capacity - chunk->size;
-            if (amount > remaining) amount = remaining;
-            memcpy(chunk->bytes + chunk->size, span->bytes + offset, amount);
-            chunk->size += amount;
-            offset += amount;
         }
     }
+    if (range_capacity > SIZE_MAX / sizeof(*ranges)) return false;
+    ranges = range_capacity == 0U
+        ? NULL
+        : (ProjectDataRange *)calloc(range_capacity, sizeof(*ranges));
+    if (range_capacity != 0U && ranges == NULL) return false;
+    for (range_index = 0U;
+         range_index < context->program->data_span_count;
+         range_index++) {
+        const PorpoiseDataSpan *span =
+            &context->program->data_spans[range_index];
+        ProjectDataRange *range = &ranges[range_count++];
+        range->address = span->address;
+        range->size = span->size;
+        range->bytes = span->bytes;
+        range->span = span;
+        range->zero_fill = span->kind == PORPOISE_DATA_SPAN_ZERO_FILL;
+        if (span->kind != PORPOISE_DATA_SPAN_ZERO_FILL &&
+            (span->kind != PORPOISE_DATA_SPAN_INITIALIZED ||
+             span->bytes == NULL)) {
+            free_project_data_ranges(ranges, range_count);
+            return report_invalid_data_ir(
+                context, span,
+                "assembly data span has an invalid kind or missing bytes");
+        }
+    }
+    if (context->plan != NULL) {
+        for (file_index = 0U;
+             file_index < context->program->file_count;
+             file_index++) {
+            const PorpoiseSourceFile *file =
+                &context->program->files[file_index];
+            size_t function_index;
+            for (function_index = 0U;
+                 function_index < file->function_count;
+                 function_index++) {
+                const PorpoiseFunction *function =
+                    &file->functions[function_index];
+                if (function->data_region ||
+                    function_action(context, function) !=
+                        PORPOISE_PLAN_ACTION_DATA) {
+                    continue;
+                }
+                if (!prepare_function_data_range(
+                        context, function, &ranges[range_count])) {
+                    free_project_data_ranges(ranges, range_count + 1U);
+                    return false;
+                }
+                range_count++;
+            }
+        }
+    }
+    if (range_count > 1U) {
+        qsort(ranges, range_count, sizeof(*ranges),
+              compare_project_data_ranges);
+    }
+    for (range_index = 0U; range_index < range_count; range_index++) {
+        const ProjectDataRange *range = &ranges[range_index];
+        uint64_t range_end =
+            (uint64_t)range->address + (uint64_t)range->size;
+        if (range->size == 0U || range_end > (UINT64_C(1) << 32)) {
+            bool result = range->span != NULL
+                ? report_invalid_data_ir(
+                      context, range->span,
+                      "assembly data span is empty or exceeds the 32-bit guest address space")
+                : false;
+            if (range->function != NULL) {
+                porpoise_diagnostics_add(
+                    context->diagnostics, PORPOISE_SEVERITY_ERROR,
+                    NULL, 0U, range->address,
+                    "data action for %s has an invalid range",
+                    range->function->name);
+                record_failure(context, PORPOISE_EXIT_TRANSLATION);
+            }
+            free_project_data_ranges(ranges, range_count);
+            return result;
+        }
+        if (have_previous && (uint64_t)range->address < previous_end) {
+            porpoise_diagnostics_add(
+                context->diagnostics, PORPOISE_SEVERITY_ERROR, NULL,
+                0U, range->address,
+                "data action ranges overlap existing assembly data");
+            record_failure(
+                context,
+                range->function != NULL
+                    ? PORPOISE_EXIT_TRANSLATION
+                    : PORPOISE_EXIT_INTERNAL);
+            free_project_data_ranges(ranges, range_count);
+            return false;
+        }
+        have_previous = true;
+        previous_end = range_end;
+        if (!range->zero_fill &&
+            !append_project_data_bytes(
+                context, range->address, range->bytes,
+                (size_t)range->size)) {
+            free_project_data_ranges(ranges, range_count);
+            return false;
+        }
+    }
+    free_project_data_ranges(ranges, range_count);
     return true;
 }
 
@@ -2115,44 +2322,144 @@ static bool generate_stage(ProjectContext *context) {
     return true;
 }
 
-static bool publish_stage(ProjectContext *context) {
-    char backup[PORPOISE_PATH_CAPACITY];
-    const char *output = context->options->output_path;
-    bool had_output = porpoise_path_exists(output);
-    porpoise_operation_progress(
-        context->options->operation,
-        PORPOISE_PHASE_PUBLISH,
-        0U,
-        1U,
-        output);
-    if (had_output) {
-        if (!make_unique_sibling(output, "backup", backup, context->diagnostics) ||
-            !porpoise_move_path(output, backup, context->diagnostics)) return false;
-    }
-    if (!porpoise_move_path(context->stage, output, context->diagnostics)) {
-        if (had_output) {
-            if (!porpoise_move_path(backup, output, context->diagnostics))
-                porpoise_diagnostics_add(context->diagnostics, PORPOISE_SEVERITY_ERROR, output, 0U, 0U,
-                                         "publication failed and the previous output could not be restored from %s", backup);
-        }
+static bool write_publish_journal(
+    const char *journal_path,
+    const char *state,
+    const ProjectPublishEntry *entries,
+    size_t entry_count,
+    PorpoiseDiagnostics *diagnostics) {
+    FILE *journal = fopen(journal_path, "wb");
+    size_t index;
+    if (journal == NULL) {
+        porpoise_diagnostics_add(
+            diagnostics, PORPOISE_SEVERITY_ERROR, journal_path, 0U, 0U,
+            "cannot create publication rollback journal: %s",
+            strerror(errno));
         return false;
     }
-    if (had_output) {
-        PorpoiseDiagnostics cleanup_diagnostics;
-        porpoise_diagnostics_init(&cleanup_diagnostics);
-        if (!porpoise_remove_tree(backup, &cleanup_diagnostics)) {
-            porpoise_diagnostics_add(context->diagnostics, PORPOISE_SEVERITY_WARNING, backup, 0U, 0U,
-                                     "generated output was published, but its recoverable backup could not be removed");
+    fputs("{\n  \"schema_version\": 1,\n  \"state\": ", journal);
+    porpoise_json_write_string(journal, state);
+    fputs(",\n  \"targets\": [", journal);
+    for (index = 0U; index < entry_count; index++) {
+        const ProjectPublishEntry *entry = &entries[index];
+        fputs(index == 0U ? "\n    {\"output\": " :
+                            ",\n    {\"output\": ", journal);
+        porpoise_json_write_string(
+            journal, entry->staged->output_path);
+        fputs(", \"stage\": ", journal);
+        porpoise_json_write_string(
+            journal, entry->staged->stage_path);
+        fputs(", \"backup\": ", journal);
+        if (entry->had_output) {
+            porpoise_json_write_string(journal, entry->backup_path);
+        } else {
+            fputs("null", journal);
         }
-        porpoise_diagnostics_free(&cleanup_diagnostics);
+        fprintf(
+            journal,
+            ", \"backup_moved\": %s, \"output_published\": %s}",
+            entry->backup_moved ? "true" : "false",
+            entry->output_published ? "true" : "false");
     }
-    porpoise_operation_progress(
-        context->options->operation,
-        PORPOISE_PHASE_PUBLISH,
-        1U,
-        1U,
-        output);
+    fputs(entry_count == 0U ? "]\n}\n" : "\n  ]\n}\n", journal);
+    return checked_close(journal, journal_path, diagnostics);
+}
+
+static bool publish_batch_cancelled(
+    const ProjectPublishEntry *entries,
+    size_t entry_count) {
+    size_t index;
+    for (index = 0U; index < entry_count; index++) {
+        if (porpoise_operation_cancelled(entries[index].staged->operation)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool validate_publish_batch(
+    PorpoiseStagedProject *const *staged,
+    size_t staged_count,
+    PorpoiseDiagnostics *diagnostics) {
+    size_t left;
+    size_t right;
+    if (staged == NULL || staged_count == 0U) {
+        porpoise_diagnostics_add(
+            diagnostics, PORPOISE_SEVERITY_ERROR, NULL, 0U, 0U,
+            "publication batch contains no staged targets");
+        return false;
+    }
+    for (left = 0U; left < staged_count; left++) {
+        if (staged[left] == NULL || staged[left]->published ||
+            staged[left]->stage_path[0] == '\0' ||
+            staged[left]->output_path[0] == '\0' ||
+            !porpoise_path_is_directory(staged[left]->stage_path)) {
+            porpoise_diagnostics_add(
+                diagnostics, PORPOISE_SEVERITY_ERROR,
+                staged[left] == NULL ? NULL : staged[left]->stage_path,
+                0U, 0U,
+                "publication batch contains an invalid staged target");
+            return false;
+        }
+        for (right = 0U; right < left; right++) {
+            bool overlap = false;
+            if (!porpoise_path_trees_overlap(
+                    staged[left]->output_path,
+                    staged[right]->output_path,
+                    &overlap)) {
+                porpoise_diagnostics_add(
+                    diagnostics, PORPOISE_SEVERITY_ERROR,
+                    staged[left]->output_path, 0U, 0U,
+                    "cannot compare project output paths safely");
+                return false;
+            }
+            if (overlap) {
+                porpoise_diagnostics_add(
+                    diagnostics, PORPOISE_SEVERITY_ERROR,
+                    staged[left]->output_path, 0U, 0U,
+                    "project output paths overlap: %s",
+                    staged[right]->output_path);
+                return false;
+            }
+        }
+    }
     return true;
+}
+
+static bool rollback_publish_batch(
+    ProjectPublishEntry *entries,
+    size_t entry_count,
+    PorpoiseDiagnostics *diagnostics) {
+    bool restored = true;
+    size_t remaining = entry_count;
+    while (remaining != 0U) {
+        ProjectPublishEntry *entry = &entries[--remaining];
+        if (entry->output_published &&
+            porpoise_path_exists(entry->staged->output_path)) {
+            if (!porpoise_remove_tree(
+                    entry->staged->output_path, diagnostics)) {
+                restored = false;
+                continue;
+            }
+            entry->output_published = false;
+        }
+        if (entry->backup_moved) {
+            if (!porpoise_move_path(
+                    entry->backup_path,
+                    entry->staged->output_path,
+                    diagnostics)) {
+                porpoise_diagnostics_add(
+                    diagnostics, PORPOISE_SEVERITY_ERROR,
+                    entry->staged->output_path, 0U, 0U,
+                    "publication rollback could not restore the previous output from %s",
+                    entry->backup_path);
+                restored = false;
+            } else {
+                entry->backup_moved = false;
+            }
+        }
+    }
+    return restored;
 }
 
 static int prepare_project_output(ProjectContext *context) {
@@ -2180,8 +2487,13 @@ static int prepare_project_output(ProjectContext *context) {
     return PORPOISE_EXIT_OK;
 }
 
-static int generate_project_context(ProjectContext *context) {
+static int stage_project_context(
+    ProjectContext *context,
+    PorpoiseStagedProject **staged_out) {
+    PorpoiseStagedProject *staged;
     bool generated;
+    if (staged_out == NULL) return PORPOISE_EXIT_INTERNAL;
+    *staged_out = NULL;
     if (project_cancelled(context)) return PORPOISE_EXIT_CANCELLED;
     if (!prepare_data_chunks(context)) {
         int result = context->failure_code != PORPOISE_EXIT_OK
@@ -2218,24 +2530,31 @@ static int generate_project_context(ProjectContext *context) {
         }
         return PORPOISE_EXIT_CANCELLED;
     }
-    if (!publish_stage(context)) {
-        free(context->registry_shards);
-        free_data_chunks(context);
-        if (porpoise_path_exists(context->stage)) {
-            (void)porpoise_remove_tree(
-                context->stage, context->diagnostics);
-        }
-        return PORPOISE_EXIT_IO;
-    }
     free(context->registry_shards);
+    context->registry_shards = NULL;
     free_data_chunks(context);
+    staged = (PorpoiseStagedProject *)calloc(1U, sizeof(*staged));
+    if (staged == NULL ||
+        !porpoise_copy_string(
+            staged->output_path, sizeof(staged->output_path),
+            context->options->output_path) ||
+        !porpoise_copy_string(
+            staged->stage_path, sizeof(staged->stage_path),
+            context->stage)) {
+        free(staged);
+        (void)porpoise_remove_tree(context->stage, context->diagnostics);
+        return PORPOISE_EXIT_INTERNAL;
+    }
+    staged->operation = context->options->operation;
+    *staged_out = staged;
     return PORPOISE_EXIT_OK;
 }
 
-int porpoise_project_generate_plan(
+int porpoise_project_stage_plan(
     const PorpoiseTranslationPlan *plan,
     const PorpoiseProjectOptions *options,
     PorpoiseReport *report,
+    PorpoiseStagedProject **staged_out,
     PorpoiseDiagnostics *diagnostics) {
     ProjectContext context;
     const PorpoiseSession *session;
@@ -2244,9 +2563,10 @@ int porpoise_project_generate_plan(
 
     if (plan == NULL || options == NULL || options->output_path == NULL ||
         options->runtime_directory == NULL || report == NULL ||
-        diagnostics == NULL) {
+        staged_out == NULL || diagnostics == NULL) {
         return PORPOISE_EXIT_INTERNAL;
     }
+    *staged_out = NULL;
     result = porpoise_plan_validate(plan, diagnostics);
     if (result != PORPOISE_EXIT_OK) return result;
     session = porpoise_plan_session(plan);
@@ -2269,7 +2589,205 @@ int porpoise_project_generate_plan(
 
     result = prepare_project_output(&context);
     if (result != PORPOISE_EXIT_OK) return result;
-    return generate_project_context(&context);
+    return stage_project_context(&context, staged_out);
+}
+
+const char *porpoise_staged_project_output_path(
+    const PorpoiseStagedProject *staged) {
+    return staged == NULL ? NULL : staged->output_path;
+}
+
+const char *porpoise_staged_project_stage_path(
+    const PorpoiseStagedProject *staged) {
+    return staged == NULL ? NULL : staged->stage_path;
+}
+
+int porpoise_project_publish_batch(
+    PorpoiseStagedProject *const *staged,
+    size_t staged_count,
+    PorpoiseDiagnostics *diagnostics) {
+    ProjectPublishEntry *entries;
+    char journal_path[PORPOISE_PATH_CAPACITY];
+    bool journal_written = false;
+    bool rollback_ok;
+    size_t index;
+    int failure = PORPOISE_EXIT_IO;
+
+    if (diagnostics == NULL) return PORPOISE_EXIT_INTERNAL;
+    if (!validate_publish_batch(staged, staged_count, diagnostics)) {
+        return PORPOISE_EXIT_USAGE;
+    }
+    entries = (ProjectPublishEntry *)calloc(staged_count, sizeof(*entries));
+    if (entries == NULL) return PORPOISE_EXIT_INTERNAL;
+    for (index = 0U; index < staged_count; index++) {
+        entries[index].staged = staged[index];
+        entries[index].had_output =
+            porpoise_path_exists(staged[index]->output_path);
+        if (entries[index].had_output &&
+            !make_unique_sibling(
+                staged[index]->output_path, "backup",
+                entries[index].backup_path, diagnostics)) {
+            free(entries);
+            return PORPOISE_EXIT_IO;
+        }
+    }
+    if (!make_unique_sibling(
+            staged[0]->output_path, "journal", journal_path,
+            diagnostics) ||
+        !write_publish_journal(
+            journal_path, "prepared", entries, staged_count,
+            diagnostics)) {
+        free(entries);
+        return PORPOISE_EXIT_IO;
+    }
+    journal_written = true;
+
+    if (publish_batch_cancelled(entries, staged_count)) {
+        failure = PORPOISE_EXIT_CANCELLED;
+        goto rollback;
+    }
+    porpoise_operation_progress(
+        entries[0].staged->operation,
+        PORPOISE_PHASE_PUBLISH, 0U, staged_count,
+        entries[0].staged->output_path);
+    for (index = 0U; index < staged_count; index++) {
+        if (entries[index].had_output) {
+            if (!porpoise_move_path(
+                    entries[index].staged->output_path,
+                    entries[index].backup_path, diagnostics)) {
+                goto rollback;
+            }
+            entries[index].backup_moved = true;
+            if (!write_publish_journal(
+                    journal_path, "backing_up", entries,
+                    staged_count, diagnostics)) {
+                goto rollback;
+            }
+        }
+        if (publish_batch_cancelled(entries, staged_count)) {
+            failure = PORPOISE_EXIT_CANCELLED;
+            goto rollback;
+        }
+    }
+
+    for (index = 0U; index < staged_count; index++) {
+        if (!porpoise_move_path(
+                entries[index].staged->stage_path,
+                entries[index].staged->output_path, diagnostics)) {
+            goto rollback;
+        }
+        entries[index].output_published = true;
+        if (!write_publish_journal(
+                journal_path, "publishing", entries, staged_count,
+                diagnostics)) {
+            goto rollback;
+        }
+        porpoise_operation_progress(
+            entries[0].staged->operation,
+            PORPOISE_PHASE_PUBLISH, index + 1U, staged_count,
+            entries[index].staged->output_path);
+        if (publish_batch_cancelled(entries, staged_count)) {
+            failure = PORPOISE_EXIT_CANCELLED;
+            goto rollback;
+        }
+    }
+
+    for (index = 0U; index < staged_count; index++) {
+        entries[index].staged->published = true;
+        porpoise_operation_progress(
+            entries[index].staged->operation,
+            PORPOISE_PHASE_PUBLISH, staged_count, staged_count,
+            entries[index].staged->output_path);
+    }
+    (void)write_publish_journal(
+        journal_path, "published", entries, staged_count, diagnostics);
+    for (index = 0U; index < staged_count; index++) {
+        if (entries[index].backup_moved) {
+            PorpoiseDiagnostics cleanup_diagnostics;
+            porpoise_diagnostics_init(&cleanup_diagnostics);
+            if (!porpoise_remove_tree(
+                    entries[index].backup_path,
+                    &cleanup_diagnostics)) {
+                porpoise_diagnostics_add(
+                    diagnostics, PORPOISE_SEVERITY_WARNING,
+                    entries[index].backup_path, 0U, 0U,
+                    "generated output was published, but its recoverable backup could not be removed");
+            }
+            porpoise_diagnostics_free(&cleanup_diagnostics);
+        }
+    }
+    if (remove(journal_path) != 0) {
+        porpoise_diagnostics_add(
+            diagnostics, PORPOISE_SEVERITY_WARNING, journal_path,
+            0U, 0U,
+            "outputs were published, but the completed rollback journal could not be removed");
+    }
+    free(entries);
+    return PORPOISE_EXIT_OK;
+
+rollback:
+    if (failure == PORPOISE_EXIT_CANCELLED) {
+        porpoise_diagnostics_add(
+            diagnostics, PORPOISE_SEVERITY_INFO, journal_path,
+            0U, 0U,
+            "multi-target publication was cancelled; restoring previous outputs");
+    }
+    rollback_ok = rollback_publish_batch(
+        entries, staged_count, diagnostics);
+    if (journal_written && rollback_ok) {
+        (void)write_publish_journal(
+            journal_path, "rolled_back", entries, staged_count,
+            diagnostics);
+        if (remove(journal_path) != 0) {
+            porpoise_diagnostics_add(
+                diagnostics, PORPOISE_SEVERITY_WARNING, journal_path,
+                0U, 0U,
+                "publication was rolled back, but its completed journal could not be removed");
+        }
+    } else if (!rollback_ok) {
+        porpoise_diagnostics_add(
+            diagnostics, PORPOISE_SEVERITY_ERROR, journal_path,
+            0U, 0U,
+            "publication rollback is incomplete; preserve this journal and its backup paths for recovery");
+    }
+    free(entries);
+    return rollback_ok ? failure : PORPOISE_EXIT_IO;
+}
+
+int porpoise_project_publish_staged(
+    PorpoiseStagedProject *staged,
+    PorpoiseDiagnostics *diagnostics) {
+    PorpoiseStagedProject *batch[1];
+    batch[0] = staged;
+    return porpoise_project_publish_batch(batch, 1U, diagnostics);
+}
+
+void porpoise_staged_project_free(PorpoiseStagedProject *staged) {
+    if (staged == NULL) return;
+    if (!staged->published && staged->stage_path[0] != '\0' &&
+        porpoise_path_exists(staged->stage_path)) {
+        PorpoiseDiagnostics cleanup_diagnostics;
+        porpoise_diagnostics_init(&cleanup_diagnostics);
+        (void)porpoise_remove_tree(
+            staged->stage_path, &cleanup_diagnostics);
+        porpoise_diagnostics_free(&cleanup_diagnostics);
+    }
+    free(staged);
+}
+
+int porpoise_project_generate_plan(
+    const PorpoiseTranslationPlan *plan,
+    const PorpoiseProjectOptions *options,
+    PorpoiseReport *report,
+    PorpoiseDiagnostics *diagnostics) {
+    PorpoiseStagedProject *staged = NULL;
+    int result = porpoise_project_stage_plan(
+        plan, options, report, &staged, diagnostics);
+    if (result == PORPOISE_EXIT_OK) {
+        result = porpoise_project_publish_staged(staged, diagnostics);
+    }
+    porpoise_staged_project_free(staged);
+    return result;
 }
 
 int porpoise_project_generate(
@@ -2280,6 +2798,7 @@ int porpoise_project_generate(
     PorpoiseDiagnostics *diagnostics) {
     ProjectContext context;
     PorpoiseAnalysis analysis;
+    PorpoiseStagedProject *staged = NULL;
     int result;
 
     if (program == NULL || abi == NULL || options == NULL ||
@@ -2305,7 +2824,11 @@ int porpoise_project_generate(
     }
     context.analysis = &analysis;
     context.entry = analysis.entry;
-    result = generate_project_context(&context);
+    result = stage_project_context(&context, &staged);
     porpoise_analysis_free(&analysis);
+    if (result == PORPOISE_EXIT_OK) {
+        result = porpoise_project_publish_staged(staged, diagnostics);
+    }
+    porpoise_staged_project_free(staged);
     return result;
 }

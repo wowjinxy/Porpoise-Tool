@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "sdk_catalogs": [
+    "../../../catalogs/nintendo.json",
+    "/opt/porpoise/catalogs/local.json"
+  ],
+  "abi_contracts": [
+    "../../../abi/common.json",
+    "\\\\server\\share\\contracts.json"
+  ],
+  "targets": [
+    {
+      "id": "main-dol",
+      "enabled": true,
+      "source_kind": "assembly",
+      "input": "../../../inputs/main/asm",
+      "output": "../../../generated/main",
+      "entry": "_start",
+      "strict": true,
+      "sdk_policy": "imported",
+      "symbol_sources": [
+        {
+          "kind": "codewarrior_map",
+          "path": "../../../maps/main.map",
+          "auxiliary_path": null,
+          "module": "",
+          "permissive": false
+        },
+        {
+          "kind": "dtk_symbols",
+          "path": "../../../dtk/symbols.txt",
+          "auxiliary_path": "../../../dtk/splits.txt",
+          "module": "main",
+          "permissive": true
+        }
+      ],
+      "skip_list": "../../../config/skip.txt",
+      "overrides": [
+        {
+          "target": "main-dol",
+          "module": "",
+          "address": 2147487744,
+          "size": 32,
+          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+          "action": "import",
+          "contract": "OSReport",
+          "acknowledge_conflict": true
+        }
+      ],
+      "annotations": [
+        {
+          "target": "main-dol",
+          "module": "",
+          "address": 2150629376,
+          "size": 16,
+          "fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+          "exact_bytes_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "interpretation": "shift_jis",
+          "count": 8,
+          "encoding": "shift-jis"
+        }
+      ],
+      "cache": {
+        "input_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "settings_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "dtk_version": null,
+        "dependencies": [
+          {
+            "path": "Z:\\NintendoSDK\\demo.a",
+            "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            "size": 9876543210,
+            "mtime_ns": 18446744073709551615
+          }
+        ],
+        "matches": [
+          {
+            "module": "",
+            "address": 2147487744,
+            "size": 32,
+            "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+            "canonical_identity": "sdk:OSReport",
+            "contract": "OSReport"
+          }
+        ]
+      }
+    },
+    {
+      "id": "overlay-rel",
+      "enabled": false,
+      "source_kind": "managed_elf",
+      "input": "C:\\recovery-inputs\\overlay.elf",
+      "output": "../../../generated/overlay",
+      "entry": null,
+      "strict": false,
+      "sdk_policy": "keep",
+      "symbol_sources": [],
+      "skip_list": null,
+      "overrides": [],
+      "annotations": [],
+      "cache": null
+    }
+  ]
+}

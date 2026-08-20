@@ -33,6 +33,10 @@ porpoise_core_sources = files(
   'src/program.c',
   'src/project.c',
   'src/raw_word.c',
+  'src/recovery_annotation.c',
+  'src/recovery_cache.c',
+  'src/recovery_project.c',
+  'src/recovery_runner.c',
   'src/relocation.c',
   'src/report.c',
   'src/session.c',
@@ -41,6 +45,7 @@ porpoise_core_sources = files(
   'src/sdk_catalog.c',
   'src/signature.c',
   'src/symbol_map.c',
+  'src/dtk_import.c',
   'src/plan.c',
   'src/system_lower.c',
   'src/util.c',
@@ -858,6 +863,79 @@ test(
   'session-plan',
   session_plan_test,
   args: [meson.project_source_root()],
+  timeout: 180,
+)
+
+recovery_project_test = executable(
+  'test_recovery_project',
+  'tests/test_recovery_project.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test(
+  'recovery-project',
+  recovery_project_test,
+  args: [meson.project_source_root()],
+)
+
+options_project_test = executable(
+  'test_options_project',
+  'tests/test_options_project.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test('project-options', options_project_test)
+
+recovery_annotation_test = executable(
+  'test_recovery_annotation',
+  'tests/test_recovery_annotation.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test('recovery-annotation', recovery_annotation_test)
+
+recovery_cache_test = executable(
+  'test_recovery_cache',
+  'tests/test_recovery_cache.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test(
+  'recovery-cache',
+  recovery_cache_test,
+  args: [meson.project_source_root(), meson.current_build_dir()],
+)
+
+dtk_import_test = executable(
+  'test_dtk_import',
+  'tests/test_dtk_import.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test(
+  'dtk-import',
+  dtk_import_test,
+  args: [meson.project_source_root(), meson.current_build_dir()],
+  timeout: 180,
+)
+
+recovery_runner_test = executable(
+  'test_recovery_runner',
+  'tests/test_recovery_runner.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test(
+  'recovery-runner',
+  recovery_runner_test,
+  args: [meson.project_source_root(), meson.current_build_dir()],
+  timeout: 180,
 )
 
 program_test = executable(
@@ -878,6 +956,17 @@ test(
   python,
   args: [
     files('tests/test_cli.py'),
+    porpoise,
+    meson.project_source_root(),
+  ],
+  timeout: 180,
+)
+
+test(
+  'project-cli-contract',
+  python,
+  args: [
+    files('tests/test_project_cli.py'),
     porpoise,
     meson.project_source_root(),
   ],

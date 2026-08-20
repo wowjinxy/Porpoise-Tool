@@ -21,6 +21,9 @@ __pycache__/
 # Interrupted atomic-publication siblings
 .*.porpoise-stage-*
 .*.porpoise-backup-*
+.*.porpoise-journal-*
+.porpoise-cache/
+.porpoise-autosave.json
 
 # Editor/IDE files
 .vscode/

@@ -66,7 +66,9 @@ int porpoise_session_open(
     if ((options->symbol_source_count != 0U &&
          options->symbol_sources == NULL) ||
         (options->sdk_catalog_path_count != 0U &&
-         options->sdk_catalog_paths == NULL)) {
+         options->sdk_catalog_paths == NULL) ||
+        (options->abi_path_count != 0U &&
+         options->abi_paths == NULL)) {
         return session_invalid_argument(
             diagnostics, "session optional source arrays are inconsistent");
     }
@@ -201,8 +203,25 @@ int porpoise_session_open(
     if (result == PORPOISE_EXIT_OK &&
         options->abi_path != NULL &&
         options->abi_path[0] != '\0') {
-        result = porpoise_abi_load(
+        result = porpoise_abi_load_additive(
             &session->abi, options->abi_path, diagnostics);
+    }
+    for (source_index = 0U;
+         result == PORPOISE_EXIT_OK &&
+         source_index < options->abi_path_count;
+         source_index++) {
+        const char *path = options->abi_paths[source_index];
+        if (path == NULL || path[0] == '\0') {
+            result = session_invalid_argument(
+                diagnostics, "ABI contract path is required");
+            break;
+        }
+        if (porpoise_operation_cancelled(options->operation)) {
+            result = session_cancelled(options, diagnostics);
+            break;
+        }
+        result = porpoise_abi_load_additive(
+            &session->abi, path, diagnostics);
     }
     if (result == PORPOISE_EXIT_OK) {
         porpoise_operation_progress(
@@ -210,7 +229,9 @@ int porpoise_session_open(
             PORPOISE_PHASE_LOAD,
             3U,
             3U,
-            options->abi_path);
+            options->abi_path_count != 0U
+                ? options->abi_paths[options->abi_path_count - 1U]
+                : options->abi_path);
         if (porpoise_operation_cancelled(options->operation)) {
             result = session_cancelled(options, diagnostics);
         }

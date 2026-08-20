@@ -22,6 +22,12 @@ extern "C" {
 #define PORPOISE_TOOL_VERSION "development"
 #endif
 
+/* Project target selection is fixed-size so PorpoiseOptions remains fully
+ * owned and requires no separate free lifecycle. */
+#ifndef PORPOISE_TARGET_SELECTOR_LIMIT
+#define PORPOISE_TARGET_SELECTOR_LIMIT 64U
+#endif
+
 /** Options parsing uses the exit values declared in porpoise/common.h. */
 typedef int PorpoiseExitCode;
 #define PORPOISE_EXIT_SUCCESS PORPOISE_EXIT_OK
@@ -37,6 +43,10 @@ typedef enum PorpoiseVerbosity {
  * corresponding option was not supplied.
  */
 typedef struct PorpoiseOptions {
+    char project_path[PORPOISE_PATH_CAPACITY];
+    char target_ids[PORPOISE_TARGET_SELECTOR_LIMIT][PORPOISE_NAME_CAPACITY];
+    size_t target_id_count;
+    char report_path[PORPOISE_PATH_CAPACITY];
     char input_path[PORPOISE_PATH_CAPACITY];
     char output_path[PORPOISE_PATH_CAPACITY];
     char config_path[PORPOISE_PATH_CAPACITY];
@@ -50,6 +60,7 @@ typedef struct PorpoiseOptions {
     char entry_symbol[PORPOISE_SYMBOL_CAPACITY];
     PorpoiseSdkPolicy sdk_policy;
     PorpoiseVerbosity verbosity;
+    bool analyze_only;
     bool force;
     bool strict;
     bool show_help;
