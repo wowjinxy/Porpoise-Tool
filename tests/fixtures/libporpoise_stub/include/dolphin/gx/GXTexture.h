@@ -1,0 +1,4 @@
+#ifndef TEST_LIBPORPOISE_DOLPHIN_GX_TEXTURE_H
+#define TEST_LIBPORPOISE_DOLPHIN_GX_TEXTURE_H
+#include <dolphin/gx/GXSplitStub.h>
+#endif

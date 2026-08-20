@@ -16,7 +16,7 @@ FIXTURES = ROOT / "tests" / "fixtures"
 CHILD_MESON_ARGS = shlex.split(os.environ.get("PORPOISE_TEST_MESON_ARGS", ""))
 
 
-def run(*arguments, cwd=None, expected=0):
+def run(*arguments, cwd=None, expected=0, env=None):
     completed = subprocess.run(
         [str(argument) for argument in arguments],
         cwd=cwd,
@@ -24,6 +24,7 @@ def run(*arguments, cwd=None, expected=0):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=env,
     )
     if completed.returncode != expected:
         raise AssertionError(
@@ -46,6 +47,23 @@ def add_stub(project):
     target = project / "subprojects" / "libPorpoise"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(FIXTURES / "libporpoise_stub", target)
+
+
+def assert_generated_consumer_command(command):
+    tokens = {
+        token.strip("\"'") for token in shlex.split(command, posix=False)
+    }
+    assert "-w" not in tokens
+    assert "-DLIBPORPOISE_PORT=1" not in tokens
+    assert "-DLIBPORPOISE_PORT" in tokens
+    if os.name == "nt":
+        assert "-DLIBPORPOISE_BUILD_WIN64" in tokens
+        assert "-DLIBPORPOISE_BUILD_LINUX" not in tokens
+        assert "-D_POSIX_C_SOURCE=200112L" not in tokens
+    else:
+        assert "-DLIBPORPOISE_BUILD_LINUX" in tokens
+        assert "-D_POSIX_C_SOURCE=200112L" in tokens
+        assert "-DLIBPORPOISE_BUILD_WIN64" not in tokens
 
 
 with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors=True) as temporary:
@@ -116,10 +134,13 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "gap_02_80300200_text": "lifted",
         "gap_helper": "lifted",
     }
-    data_source = (data_output / "src" / "porpoise_data.c").read_text(encoding="utf-8")
-    assert "0x80300000" in data_source
-    assert "0x80300100" in data_source
-    assert "0x4D657472" in data_source
+    data_sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((data_output / "src" / "data").glob("porpoise_data_*.c"))
+    )
+    assert "0x80300000" in data_sources
+    assert "0x80300100" in data_sources
+    assert "0x4D, 0x65, 0x74, 0x72" in data_sources
     assert "porpoise_lifted_gap_01_80300100_text" not in (
         data_output / "include" / "porpoise_generated.h"
     ).read_text(encoding="utf-8")
@@ -140,9 +161,62 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     assert (no_entry / "meson.build").read_bytes() == (
         ROOT / "tests" / "golden" / "basic" / "meson.build"
     ).read_bytes()
+    no_entry_meson = (no_entry / "meson.build").read_text(encoding="utf-8")
+    assert (
+        "libporpoise_raw_dep = dependency('libPorpoise', "
+        "fallback: ['libPorpoise','libporpoise_dep'])"
+    ) in no_entry_meson
+    assert "libporpoise_raw_dep.partial_dependency(" in no_entry_meson
+    assert "compile_args: false" in no_entry_meson
+    assert ").as_system('system')" in no_entry_meson
+    assert "'-DLIBPORPOISE_BUILD_WIN64'" in no_entry_meson
+    assert "'-DLIBPORPOISE_BUILD_LINUX'" in no_entry_meson
+    assert "'-D_POSIX_C_SOURCE=200112L'" in no_entry_meson
+    assert no_entry_meson.count("c_args: porpoise_consumer_c_args") == 1
     registry_source = (
         no_entry / "src" / "porpoise_function_registry.c"
     ).read_text(encoding="utf-8")
+    dispatch_header = (
+        no_entry / "src" / "porpoise_dispatch_private.h"
+    ).read_text(encoding="utf-8")
+    assert "enum porpoise_dispatch_kind" in dispatch_header
+    assert "struct porpoise_dispatch_target" in dispatch_header
+    assert "PORPOISE_GUEST_ARQ_CALLBACK_HACK_ADDRESS" not in dispatch_header
+    public_generated_header = (
+        no_entry / "include" / "porpoise_generated.h"
+    ).read_text(encoding="utf-8")
+    public_adapter_header = (
+        no_entry / "include" / "porpoise_libporpoise_adapter.h"
+    ).read_text(encoding="utf-8")
+    assert "porpoise_generated_bind" in public_generated_header
+    assert "porpoise_call_address" not in public_generated_header
+    assert "porpoise_lifted_" not in public_generated_header
+    assert "_adapter(" not in public_adapter_header
+    assert "porpoise_libporpoise_configure_title_arena" in public_adapter_header
+    assert (
+        no_entry / "src" / "porpoise_libporpoise_builtins_private.h"
+    ).exists()
+    assert (no_entry / "src" / "porpoise_libporpoise_gx.c").exists()
+    assert (
+        no_entry / "src" / "porpoise_libporpoise_gx_headers.h"
+    ).exists()
+    assert (
+        no_entry / "src" / "porpoise_libporpoise_gx_objects.c"
+    ).exists()
+    assert (
+        no_entry / "src" / "porpoise_libporpoise_gx_values.c"
+    ).exists()
+    assert not (
+        no_entry / "include" / "porpoise_libporpoise_builtins_private.h"
+    ).exists()
+    assert (no_entry / "src" / "generated" / "no_entry.h").exists()
+    assert not (no_entry / "include" / "porpoise" / "generated").exists()
+    for public_header_path in (no_entry / "include").rglob("*.h"):
+        public_header = public_header_path.read_text(encoding="utf-8")
+        assert "porpoise_call_address" not in public_header
+        assert "void porpoise_import_" not in public_header
+        assert "void porpoise_lifted_" not in public_header
+        assert "porpoise_initialize_data" not in public_header
     registry_shards = sorted(
         path.name
         for path in (no_entry / "src").glob("porpoise_function_registry_*.c")
@@ -154,6 +228,10 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "porpoise_resolve_address_8000(address);"
     ) in registry_source
     assert "porpoise_lifted_add_one" not in registry_source
+    assert "state->lifted_call_depth == UINT32_MAX" in registry_source
+    assert "state->lifted_call_depth++" in registry_source
+    assert "state->lifted_call_depth--" in registry_source
+    assert "porpoise_poll_host_events(state, address)" in registry_source
     registry_shard_source = (
         no_entry / "src" / registry_shards[0]
     ).read_text(encoding="utf-8")
@@ -162,14 +240,72 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         in registry_shard_source
     )
     assert (
-        "case UINT32_C(0x80001000): return porpoise_lifted_add_one;"
+        "case UINT32_C(0x80001000): return "
+        "(struct porpoise_dispatch_target){porpoise_lifted_add_one, "
+        "PORPOISE_DISPATCH_LIFTED};"
     ) in registry_shard_source
+    public_consumer = no_entry / "tests" / "public_consumer.c"
+    public_consumer.parent.mkdir(parents=True)
+    public_consumer.write_text(
+        "#include <porpoise_generated.h>\n"
+        "#include <stdlib.h>\n"
+        "#define CHECK(condition) do { if (!(condition)) abort(); } while (0)\n"
+        "int main(void) {\n"
+        "  PorpoiseHostAdapter host;\n"
+        "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
+        "  CHECK(porpoise_generated_bind(&host) == PORPOISE_HOST_OK);\n"
+        "  porpoise_libporpoise_adapter_shutdown(&host);\n"
+        "  return 0;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    private_adapter_consumer = (
+        no_entry / "tests" / "private_adapter_consumer.c"
+    )
+    private_adapter_consumer.write_text(
+        "#include <porpoise_generated.h>\n"
+        "int main(void) {\n"
+        "  porpoise_libporpoise_os_report_adapter((PorpoisePpcState *)0);\n"
+        "  return 0;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    with (no_entry / "meson.build").open("a", encoding="utf-8") as meson_file:
+        meson_file.write(
+            "\npublic_consumer = executable('public_consumer', "
+            "'tests/public_consumer.c', dependencies: porpoise_lifted_dep)\n"
+            "private_adapter_consumer = executable('private_adapter_consumer', "
+            "'tests/private_adapter_consumer.c', "
+            "dependencies: porpoise_lifted_dep)\n"
+        )
     add_stub(no_entry)
-    assert "fallback: ['libPorpoise', 'libporpoise_dep']" in (no_entry / "meson.build").read_text(encoding="utf-8")
+    assert "fallback: ['libPorpoise','libporpoise_dep']" in no_entry_meson
     assert "porpoise-title-host" not in (no_entry / "meson.build").read_text(encoding="utf-8")
     assert not any(no_entry.glob("subprojects/*.wrap"))
     run("meson", "setup", "build", "--wrap-mode=forcefallback", *CHILD_MESON_ARGS, cwd=no_entry)
-    run("meson", "compile", "-C", "build", cwd=no_entry)
+    compile_commands = json.loads(
+        (no_entry / "build" / "compile_commands.json").read_text(encoding="utf-8")
+    )
+    lifted_compile_commands = [
+        item["command"]
+        for item in compile_commands
+        if Path(item["file"]).as_posix().endswith("src/porpoise_lifted.c")
+    ]
+    assert len(lifted_compile_commands) == 1
+    assert_generated_consumer_command(lifted_compile_commands[0])
+    run("meson", "compile", "-C", "build", "public_consumer", cwd=no_entry)
+    private_adapter_compile = run(
+        "meson",
+        "compile",
+        "-C",
+        "build",
+        "private_adapter_consumer",
+        cwd=no_entry,
+        expected=1,
+    )
+    assert "porpoise_libporpoise_os_report_adapter" in (
+        private_adapter_compile.stdout + private_adapter_compile.stderr
+    )
 
     sharded_input = temporary / "registry-shards-input"
     sharded_input.mkdir()
@@ -185,7 +321,11 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         ".fn registry_high, global\n"
         "/* 80101000 00100000  38 63 00 02 */ addi r3, r3, 2\n"
         "/* 80101004 00100004  4E 80 00 20 */ blr\n"
-        ".endfn registry_high\n",
+        ".endfn registry_high\n\n"
+        ".global __ARQCallbackHack\n"
+        ".fn __ARQCallbackHack, global\n"
+        "/* 80102000 00101000  4E 80 00 20 */ blr\n"
+        ".endfn __ARQCallbackHack\n",
         encoding="utf-8",
     )
     sharded_output = temporary / "registry-shards-output"
@@ -211,6 +351,13 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     assert sharded_meson.index("porpoise_function_registry_8000.c") < (
         sharded_meson.index("porpoise_function_registry_8010.c")
     )
+    sharded_dispatch = (
+        sharded_output / "src" / "porpoise_dispatch_private.h"
+    ).read_text(encoding="utf-8")
+    assert (
+        "#define PORPOISE_GUEST_ARQ_CALLBACK_HACK_ADDRESS "
+        "UINT32_C(0x80102000)"
+    ) in sharded_dispatch
 
     opcodes = temporary / "opcodes"
     run(TOOL, FIXTURES / "inputs" / "opcodes", "--output", opcodes)
@@ -394,11 +541,16 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "#include <stdlib.h>\n"
         "#include \"porpoise_generated.h\"\n"
         "#include \"porpoise_libporpoise_adapter.h\"\n"
+        "#include \"generated/extended_semantics.h\"\n"
+        "#include \"generated/fp_integer_memory_semantics.h\"\n"
+        "#include \"generated/raw_word_semantics.h\"\n"
+        "#include \"generated/semantics.h\"\n"
         "#include <porpoise/stub.h>\n"
         "#define CHECK(condition) do { if (!(condition)) abort(); } while (0)\n"
         "int main(void) {\n"
         "  PorpoiseHostAdapter host; PorpoisePpcState state; unsigned int raw_index;\n"
         "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
+        "  CHECK(porpoise_generated_bind(&host) == PORPOISE_HOST_OK);\n"
         "  porpoise_state_init(&state, &host);\n"
         "  porpoise_lifted_integer_semantics(&state);\n"
         "  CHECK(!porpoise_state_has_fault(&state));\n"
@@ -519,14 +671,14 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "  CHECK(state.gpr[3] == 42U);\n"
         "  state.gpr[3] = 0U; porpoise_lifted_alias_mid_owner(&state);\n"
         "  CHECK(state.gpr[3] == 5U);\n"
-        "  state.gpr[3] = 10U; CHECK(porpoise_call_address(&state, UINT32_C(0x80006B04)));\n"
+        "  state.gpr[3] = 10U; CHECK(porpoise_libporpoise_run_guest(&state, UINT32_C(0x80006B04)));\n"
         "  CHECK(!porpoise_state_has_fault(&state) && state.gpr[3] == 14U);\n"
         "  porpoise_lifted_alias_branch_caller(&state); CHECK(state.gpr[3] == 25U);\n"
-        "  state.gpr[3] = 0U; CHECK(porpoise_call_address(&state, UINT32_C(0x80006B20)));\n"
+        "  state.gpr[3] = 0U; CHECK(porpoise_libporpoise_run_guest(&state, UINT32_C(0x80006B20)));\n"
         "  CHECK(!porpoise_state_has_fault(&state) && state.gpr[3] == 7U);\n"
         "  state.gpr[3] = 0U; porpoise_lifted_cross_label_owner(&state);\n"
         "  CHECK(state.gpr[3] == 105U);\n"
-        "  state.gpr[3] = 40U; CHECK(porpoise_call_address(&state, UINT32_C(0x80006BA4)));\n"
+        "  state.gpr[3] = 40U; CHECK(porpoise_libporpoise_run_guest(&state, UINT32_C(0x80006BA4)));\n"
         "  CHECK(!porpoise_state_has_fault(&state) && state.gpr[3] == 45U);\n"
         "  porpoise_lifted_cross_label_linked_caller(&state); CHECK(state.gpr[3] == 16U);\n"
         "  porpoise_lifted_cross_label_tail_caller(&state); CHECK(state.gpr[3] == 25U);\n"
@@ -831,7 +983,9 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     with (opcodes / "meson.build").open("a", encoding="utf-8") as meson_file:
         meson_file.write(
             "\nsemantic_harness = executable('semantic_harness', "
-            "'tests/semantic_harness.c', dependencies: porpoise_lifted_dep)\n"
+            "'tests/semantic_harness.c', "
+            "include_directories: generated_private_inc, "
+            "dependencies: porpoise_lifted_dep)\n"
         )
     add_stub(opcodes)
     run("meson", "setup", "build", "--wrap-mode=forcefallback", *CHILD_MESON_ARGS, cwd=opcodes)
@@ -844,21 +998,78 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     assert (with_entry / "src" / "porpoise_entry.c").exists()
     entry_source = (with_entry / "src" / "porpoise_entry.c").read_text(encoding="utf-8")
     assert "DolphinMain" in entry_source
-    assert "PorpoiseHostPrepareTitleEntryV1" in entry_source
+    assert "PorpoiseHostPrepareRuntimeV1" in entry_source
+    assert "PorpoiseHostPrepareTitleEntryV3" in entry_source
+    assert entry_source.index("PorpoiseHostPrepareRuntimeV1") < (
+        entry_source.index("porpoise_libporpoise_adapter_init_for_title")
+    )
+    assert entry_source.index("porpoise_libporpoise_adapter_init_for_title") < (
+        entry_source.index("porpoise_generated_bind")
+    )
+    assert entry_source.index("porpoise_generated_bind") < (
+        entry_source.index("porpoise_state_init(&state, &host)")
+    )
+    assert "porpoise_libporpoise_bind_guest_dispatch" not in entry_source
+    assert "porpoise_call_address" not in entry_source
+    assert "host.call_guest = porpoise_call_address" not in entry_source
+    assert "title_state.startup_function_count" in entry_source
+    assert "PORPOISE_TITLE_HOST_STARTUP_FUNCTION_CAPACITY" in entry_source
+    assert "title_state.startup_functions[startup_function_index]" in entry_source
+    assert ".guest_address" in entry_source
+    assert ".flags" in entry_source
+    assert "Porpoise title host returned a null startup function" in entry_source
+    assert "Porpoise title host returned unknown startup-function flags" in entry_source
+    assert "PORPOISE_TITLE_STARTUP_ESTABLISH_GUEST_MAIN_THREAD_AFTER" in entry_source
+    assert "porpoise_libporpoise_bind_guest_main_thread(&state)" in entry_source
+    assert entry_source.count("(void)porpoise_libporpoise_run_guest(") == 2
+    assert entry_source.index("porpoise_initialize_data(&state)") < (
+        entry_source.index("PorpoiseHostPrepareTitleEntryV3")
+    )
     assert "porpoise_state_prepare_title_entry(&state)" in entry_source
     assert "__start" not in entry_source
     entry_meson = (with_entry / "meson.build").read_text(encoding="utf-8")
     assert "dependency('porpoise-title-host', fallback:" in entry_meson
+    assert entry_meson.count("c_args: porpoise_consumer_c_args") == 2
     lifted_entry_source = (
         with_entry / "src" / "lifted" / "main.c"
     ).read_text(encoding="utf-8")
     assert "porpoise_psq_load" in lifted_entry_source
     add_stub(with_entry)
     run("meson", "setup", "build", "--wrap-mode=forcefallback", *CHILD_MESON_ARGS, cwd=with_entry)
+    entry_compile_commands = json.loads(
+        (with_entry / "build" / "compile_commands.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    title_compile_commands = [
+        item["command"]
+        for item in entry_compile_commands
+        if Path(item["file"]).as_posix().endswith("src/porpoise_entry.c")
+    ]
+    assert len(title_compile_commands) == 1
+    assert_generated_consumer_command(title_compile_commands[0])
     run("meson", "compile", "-C", "build", cwd=with_entry)
     executable = with_entry / "build" / ("porpoise_title.exe" if os.name == "nt" else "porpoise_title")
-    entry_result = run(executable, cwd=with_entry)
+    entry_environment = os.environ.copy()
+    entry_environment["PORPOISE_STUB_ORDERED_STARTUP"] = "1"
+    entry_result = run(executable, cwd=with_entry, env=entry_environment)
     assert entry_result.stderr == ""
+
+    invalid_startup_modes = (
+        ("too-many", "too many startup functions"),
+        ("null", "null startup function"),
+        ("unknown-flags", "unknown startup-function flags"),
+    )
+    for startup_mode, expected_message in invalid_startup_modes:
+        invalid_startup_environment = os.environ.copy()
+        invalid_startup_environment["PORPOISE_STUB_ORDERED_STARTUP"] = startup_mode
+        invalid_startup_result = run(
+            executable,
+            cwd=with_entry,
+            env=invalid_startup_environment,
+            expected=2,
+        )
+        assert expected_message in invalid_startup_result.stderr
 
     unknown_output = temporary / "unknown-output"
     run(TOOL, FIXTURES / "inputs" / "invalid" / "unknown.s", "--output", unknown_output, expected=3)
@@ -1144,11 +1355,13 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "#include <stdlib.h>\n"
         "#include \"porpoise_generated.h\"\n"
         "#include \"porpoise_libporpoise_adapter.h\"\n"
+        "#include \"generated/calls.h\"\n"
         "#include <porpoise/stub.h>\n"
         "#define CHECK(condition) do { if (!(condition)) abort(); } while (0)\n"
         "int main(void) {\n"
         "  PorpoiseHostAdapter host; PorpoisePpcState state;\n"
         "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
+        "  CHECK(porpoise_generated_bind(&host) == PORPOISE_HOST_OK);\n"
         "  porpoise_state_init(&state, &host);\n"
         "  state.gpr[3] = 1U; state.gpr[4] = 2U;\n"
         "  porpoise_fpr_set_f64(&state, 1U, 0U, 1.5); porpoise_fpr_set_f64(&state, 2U, 0U, 2.25);\n"
@@ -1165,7 +1378,9 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     with (imported / "meson.build").open("a", encoding="utf-8") as meson_file:
         meson_file.write(
             "\nabi_harness = executable('abi_harness', "
-            "'tests/abi_harness.c', dependencies: porpoise_lifted_dep)\n"
+            "'tests/abi_harness.c', "
+            "include_directories: generated_private_inc, "
+            "dependencies: porpoise_lifted_dep)\n"
         )
     add_stub(imported)
     run("meson", "setup", "build", "--wrap-mode=forcefallback", *CHILD_MESON_ARGS, cwd=imported)
@@ -1242,7 +1457,9 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         skipped_imported / "src" / "porpoise_function_registry_8000.c"
     ).read_text(encoding="utf-8")
     assert (
-        "case UINT32_C(0x80007000): return porpoise_import_HostAdd;"
+        "case UINT32_C(0x80007000): return "
+        "(struct porpoise_dispatch_target){porpoise_import_HostAdd, "
+        "PORPOISE_DISPATCH_IMPORT};"
         in skipped_registry
     )
     assert "porpoise_lifted_HostAdd" not in skipped_registry
@@ -1260,15 +1477,41 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "#include <stdlib.h>\n"
         "#include \"porpoise_generated.h\"\n"
         "#include \"porpoise_libporpoise_adapter.h\"\n"
+        "#include \"generated/skipped_import.h\"\n"
         "#define CHECK(condition) do { if (!(condition)) abort(); } while (0)\n"
+        "static unsigned int poll_count;\n"
+        "static int poll_should_fail;\n"
+        "static PorpoiseHostResult count_events(void *context, PorpoisePpcState *state) {\n"
+        "  (void)context; CHECK(state->lifted_call_depth == 0U); poll_count++;\n"
+        "  return poll_should_fail ? PORPOISE_HOST_IO_ERROR : PORPOISE_HOST_OK;\n"
+        "}\n"
         "int main(void) {\n"
         "  PorpoiseHostAdapter host; PorpoisePpcState state;\n"
         "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
+        "  CHECK(porpoise_generated_bind(&host) == PORPOISE_HOST_OK);\n"
         "  porpoise_state_init(&state, &host);\n"
         "  porpoise_lifted_call_host_by_name(&state); CHECK(state.gpr[3] == 9U);\n"
         "  porpoise_lifted_call_host_by_numeric(&state); CHECK(state.gpr[3] == 13U);\n"
         "  porpoise_lifted_call_host_by_ctr(&state); CHECK(state.gpr[3] == 17U);\n"
-        "  CHECK(!porpoise_state_has_fault(&state));\n"
+        "  CHECK(!porpoise_state_has_fault(&state)); CHECK(poll_count == 0U);\n"
+        "  host.poll_events = count_events; state.msr |= PORPOISE_MSR_EE;\n"
+        "  CHECK(porpoise_libporpoise_run_guest(&state, UINT32_C(0x80007100)));\n"
+        "  CHECK(poll_count == 1U && state.lifted_call_depth == 0U);\n"
+        "  CHECK(porpoise_libporpoise_run_guest(&state, UINT32_C(0x80007000)));\n"
+        "  CHECK(poll_count == 1U && state.lifted_call_depth == 0U);\n"
+        "  state.msr &= ~PORPOISE_MSR_EE;\n"
+        "  CHECK(porpoise_libporpoise_run_guest(&state, UINT32_C(0x80007100)));\n"
+        "  CHECK(poll_count == 1U); state.msr |= PORPOISE_MSR_EE;\n"
+        "  poll_should_fail = 1;\n"
+        "  CHECK(!porpoise_libporpoise_run_guest(&state, UINT32_C(0x80007100)));\n"
+        "  CHECK(state.fault == PORPOISE_FAULT_HOST_IO);\n"
+        "  CHECK(state.lifted_call_depth == 0U && poll_count == 2U);\n"
+        "  porpoise_state_clear_fault(&state); poll_should_fail = 0;\n"
+        "  state.lifted_call_depth = UINT32_MAX;\n"
+        "  CHECK(!porpoise_libporpoise_run_guest(&state, UINT32_C(0x80007100)));\n"
+        "  CHECK(state.fault == PORPOISE_FAULT_INVALID_STATE);\n"
+        "  CHECK(state.lifted_call_depth == UINT32_MAX && poll_count == 2U);\n"
+        "  porpoise_state_clear_fault(&state); state.lifted_call_depth = 0U;\n"
         "  porpoise_libporpoise_adapter_shutdown(&host);\n"
         "  return 0;\n"
         "}\n",
@@ -1277,7 +1520,9 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     with (skipped_imported / "meson.build").open("a", encoding="utf-8") as meson_file:
         meson_file.write(
             "\nskipped_import_harness = executable('skipped_import_harness', "
-            "'tests/skipped_import_harness.c', dependencies: porpoise_lifted_dep)\n"
+            "'tests/skipped_import_harness.c', "
+            "include_directories: generated_private_inc, "
+            "dependencies: porpoise_lifted_dep)\n"
         )
     add_stub(skipped_imported)
     run(
@@ -1346,12 +1591,14 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "#include <stdlib.h>\n"
         "#include \"porpoise_generated.h\"\n"
         "#include \"porpoise_libporpoise_adapter.h\"\n"
+        "#include \"generated/terminal_import.h\"\n"
         "#include \"terminal_import_adapter.h\"\n"
         "#define CHECK(condition) do { if (!(condition)) abort(); } while (0)\n"
         "void TerminalImportAdapter(PorpoisePpcState *state) { state->status = PORPOISE_EXECUTION_RETURNED; }\n"
         "int main(void) {\n"
         "  PorpoiseHostAdapter host; PorpoisePpcState state;\n"
         "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
+        "  CHECK(porpoise_generated_bind(&host) == PORPOISE_HOST_OK);\n"
         "  porpoise_state_init(&state, &host); state.status = PORPOISE_EXECUTION_RUNNING; state.gpr[3] = 7U;\n"
         "  porpoise_lifted_terminal_import_caller(&state);\n"
         "  CHECK(!porpoise_state_has_fault(&state)); CHECK(state.status == PORPOISE_EXECUTION_RETURNED);\n"
@@ -1362,7 +1609,9 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     with (terminal_imported / "meson.build").open("a", encoding="utf-8") as meson_file:
         meson_file.write(
             "\nterminal_harness = executable('terminal_harness', "
-            "'tests/terminal_harness.c', dependencies: porpoise_lifted_dep)\n"
+            "'tests/terminal_harness.c', "
+            "include_directories: generated_private_inc, "
+            "dependencies: porpoise_lifted_dep)\n"
         )
     add_stub(terminal_imported)
     run(
@@ -1379,6 +1628,1100 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     )
     run(terminal_executable, cwd=terminal_imported)
 
+    def gpr(value_type, register):
+        return {"type": value_type, "register": f"r{register}"}
+
+    def fpr(value_type, register):
+        return {"type": value_type, "register": f"f{register}"}
+
+    builtin_adapter_contracts = (
+        (
+            "porpoise_libporpoise_ai_init_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_ar_alloc_adapter",
+            gpr("u32", 3),
+            [gpr("u32", 3)],
+        ),
+        (
+            "porpoise_libporpoise_ar_free_adapter",
+            gpr("u32", 3),
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_ar_get_size_adapter",
+            gpr("u32", 3),
+            [],
+        ),
+        (
+            "porpoise_libporpoise_ar_init_adapter",
+            gpr("u32", 3),
+            [gpr("pointer", 3), gpr("u32", 4)],
+        ),
+        (
+            "porpoise_libporpoise_ar_reset_adapter",
+            {"type": "void"},
+            [],
+        ),
+        (
+            "porpoise_libporpoise_arq_post_request_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3)]
+            + [gpr("u32", register) for register in range(4, 11)],
+        ),
+        (
+            "porpoise_libporpoise_card_probe_ex_adapter",
+            gpr("s32", 3),
+            [gpr("s32", 3), gpr("pointer", 4), gpr("pointer", 5)],
+        ),
+        (
+            "porpoise_libporpoise_dsp_add_task_adapter",
+            gpr("pointer", 3),
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_gx_init_adapter",
+            gpr("pointer", 3),
+            [gpr("pointer", 3), gpr("u32", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_draw_done_callback_adapter",
+            gpr("pointer", 3),
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_copy_filter_adapter",
+            {"type": "void"},
+            [
+                gpr("u8", 3),
+                gpr("pointer", 4),
+                gpr("u8", 5),
+                gpr("pointer", 6),
+            ],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_copy_clear_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3), gpr("u32", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_disp_copy_dst_adapter",
+            {"type": "void"},
+            [gpr("u16", 3), gpr("u16", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_tex_copy_dst_adapter",
+            {"type": "void"},
+            [
+                gpr("u16", 3),
+                gpr("u16", 4),
+                gpr("u32", 5),
+                gpr("u8", 6),
+            ],
+        ),
+        (
+            "porpoise_libporpoise_gx_copy_disp_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3), gpr("u8", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_copy_tex_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3), gpr("u8", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_load_light_obj_imm_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3), gpr("u32", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_array_adapter",
+            {"type": "void"},
+            [gpr("u32", 3), gpr("pointer", 4), gpr("u8", 5)],
+        ),
+        (
+            "porpoise_libporpoise_gx_load_tex_obj_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3), gpr("u32", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_load_tlut_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3), gpr("u32", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_chan_amb_color_adapter",
+            {"type": "void"},
+            [gpr("u32", 3), gpr("pointer", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_chan_mat_color_adapter",
+            {"type": "void"},
+            [gpr("u32", 3), gpr("pointer", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_call_display_list_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3), gpr("u32", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_projection_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3), gpr("u32", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_get_projectionv_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_gx_load_pos_mtx_imm_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3), gpr("u32", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_load_nrm_mtx_imm_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3), gpr("u32", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_load_tex_mtx_imm_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3), gpr("u32", 4), gpr("u32", 5)],
+        ),
+        (
+            "porpoise_libporpoise_gx_get_viewportv_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_ind_tex_mtx_adapter",
+            {"type": "void"},
+            [gpr("u32", 3), gpr("pointer", 4), gpr("s8", 5)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_tev_color_adapter",
+            {"type": "void"},
+            [gpr("u32", 3), gpr("pointer", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_tev_color_s10_adapter",
+            {"type": "void"},
+            [gpr("u32", 3), gpr("pointer", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_tev_kcolor_adapter",
+            {"type": "void"},
+            [gpr("u32", 3), gpr("pointer", 4)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_fog_adapter",
+            {"type": "void"},
+            [
+                gpr("u32", 3),
+                fpr("f32", 1),
+                fpr("f32", 2),
+                fpr("f32", 3),
+                fpr("f32", 4),
+                gpr("pointer", 4),
+            ],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_fog_range_adj_adapter",
+            {"type": "void"},
+            [gpr("u8", 3), gpr("u16", 4), gpr("pointer", 5)],
+        ),
+        (
+            "porpoise_libporpoise_gx_set_tev_indirect_adapter",
+            {"type": "void"},
+            [gpr("u32", register) for register in range(3, 10)]
+            + [gpr("u8", 10)],
+        ),
+        (
+            "porpoise_libporpoise_dvd_cancel_adapter",
+            gpr("s32", 3),
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_dvd_close_adapter",
+            gpr("s32", 3),
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_dvd_convert_path_to_entry_adapter",
+            gpr("s32", 3),
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_dvd_fast_open_adapter",
+            gpr("s32", 3),
+            [gpr("s32", 3), gpr("pointer", 4)],
+        ),
+        (
+            "porpoise_libporpoise_dvd_get_command_block_status_adapter",
+            gpr("s32", 3),
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_dvd_open_adapter",
+            gpr("s32", 3),
+            [gpr("pointer", 3), gpr("pointer", 4)],
+        ),
+        (
+            "porpoise_libporpoise_dvd_read_prio_adapter",
+            gpr("s32", 3),
+            [
+                gpr("pointer", 3),
+                gpr("pointer", 4),
+                gpr("s32", 5),
+                gpr("s32", 6),
+                gpr("s32", 7),
+            ],
+        ),
+        (
+            "porpoise_libporpoise_os_alloc_from_arena_hi_adapter",
+            gpr("pointer", 3),
+            [gpr("u32", 3), gpr("u32", 4)],
+        ),
+        (
+            "porpoise_libporpoise_os_alloc_from_arena_lo_adapter",
+            gpr("pointer", 3),
+            [gpr("u32", 3), gpr("u32", 4)],
+        ),
+        (
+            "porpoise_libporpoise_os_exit_thread_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_os_get_arena_hi_adapter",
+            gpr("pointer", 3),
+            [],
+        ),
+        (
+            "porpoise_libporpoise_os_get_arena_lo_adapter",
+            gpr("pointer", 3),
+            [],
+        ),
+        (
+            "porpoise_libporpoise_os_get_current_thread_adapter",
+            gpr("pointer", 3),
+            [],
+        ),
+        (
+            "porpoise_libporpoise_os_init_message_queue_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3), gpr("pointer", 4), gpr("s32", 5)],
+        ),
+        (
+            "porpoise_libporpoise_os_receive_message_adapter",
+            gpr("s32", 3),
+            [gpr("pointer", 3), gpr("pointer", 4), gpr("s32", 5)],
+        ),
+        (
+            "porpoise_libporpoise_os_report_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_os_resume_thread_adapter",
+            gpr("s32", 3),
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_os_send_message_adapter",
+            gpr("s32", 3),
+            [gpr("pointer", 3), gpr("pointer", 4), gpr("s32", 5)],
+        ),
+        (
+            "porpoise_libporpoise_os_set_arena_hi_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_os_set_arena_lo_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_os_sleep_thread_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_os_suspend_thread_adapter",
+            gpr("s32", 3),
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_os_wakeup_thread_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_vi_configure_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_vi_set_next_frame_buffer_adapter",
+            {"type": "void"},
+            [gpr("pointer", 3)],
+        ),
+    )
+    builtin_contracts_by_adapter = {
+        contract[0]: contract for contract in builtin_adapter_contracts
+    }
+    protected_native_callables = (
+        ("AIInit", "porpoise_libporpoise_ai_init_adapter"),
+        ("ARAlloc", "porpoise_libporpoise_ar_alloc_adapter"),
+        ("ARFree", "porpoise_libporpoise_ar_free_adapter"),
+        ("ARGetSize", "porpoise_libporpoise_ar_get_size_adapter"),
+        ("ARInit", "porpoise_libporpoise_ar_init_adapter"),
+        ("ARReset", "porpoise_libporpoise_ar_reset_adapter"),
+        ("ARQPostRequest", "porpoise_libporpoise_arq_post_request_adapter"),
+        ("CARDProbeEx", "porpoise_libporpoise_card_probe_ex_adapter"),
+        ("DSPAddTask", "porpoise_libporpoise_dsp_add_task_adapter"),
+        ("GXInit", "porpoise_libporpoise_gx_init_adapter"),
+        (
+            "GXSetDrawDoneCallback",
+            "porpoise_libporpoise_gx_set_draw_done_callback_adapter",
+        ),
+        (
+            "GXSetCopyFilter",
+            "porpoise_libporpoise_gx_set_copy_filter_adapter",
+        ),
+        (
+            "GXSetCopyClear",
+            "porpoise_libporpoise_gx_set_copy_clear_adapter",
+        ),
+        (
+            "GXSetDispCopyDst",
+            "porpoise_libporpoise_gx_set_disp_copy_dst_adapter",
+        ),
+        (
+            "GXSetTexCopyDst",
+            "porpoise_libporpoise_gx_set_tex_copy_dst_adapter",
+        ),
+        ("GXCopyDisp", "porpoise_libporpoise_gx_copy_disp_adapter"),
+        ("GXCopyTex", "porpoise_libporpoise_gx_copy_tex_adapter"),
+        (
+            "GXLoadLightObjImm",
+            "porpoise_libporpoise_gx_load_light_obj_imm_adapter",
+        ),
+        ("GXSetArray", "porpoise_libporpoise_gx_set_array_adapter"),
+        (
+            "GXLoadTexObj",
+            "porpoise_libporpoise_gx_load_tex_obj_adapter",
+        ),
+        ("GXLoadTlut", "porpoise_libporpoise_gx_load_tlut_adapter"),
+        (
+            "GXSetChanAmbColor",
+            "porpoise_libporpoise_gx_set_chan_amb_color_adapter",
+        ),
+        (
+            "GXSetChanMatColor",
+            "porpoise_libporpoise_gx_set_chan_mat_color_adapter",
+        ),
+        (
+            "GXCallDisplayList",
+            "porpoise_libporpoise_gx_call_display_list_adapter",
+        ),
+        (
+            "GXSetProjection",
+            "porpoise_libporpoise_gx_set_projection_adapter",
+        ),
+        (
+            "GXGetProjectionv",
+            "porpoise_libporpoise_gx_get_projectionv_adapter",
+        ),
+        (
+            "GXLoadPosMtxImm",
+            "porpoise_libporpoise_gx_load_pos_mtx_imm_adapter",
+        ),
+        (
+            "GXLoadNrmMtxImm",
+            "porpoise_libporpoise_gx_load_nrm_mtx_imm_adapter",
+        ),
+        (
+            "GXLoadTexMtxImm",
+            "porpoise_libporpoise_gx_load_tex_mtx_imm_adapter",
+        ),
+        (
+            "GXGetViewportv",
+            "porpoise_libporpoise_gx_get_viewportv_adapter",
+        ),
+        (
+            "GXSetIndTexMtx",
+            "porpoise_libporpoise_gx_set_ind_tex_mtx_adapter",
+        ),
+        (
+            "GXSetTevColor",
+            "porpoise_libporpoise_gx_set_tev_color_adapter",
+        ),
+        (
+            "GXSetTevColorS10",
+            "porpoise_libporpoise_gx_set_tev_color_s10_adapter",
+        ),
+        (
+            "GXSetTevKColor",
+            "porpoise_libporpoise_gx_set_tev_kcolor_adapter",
+        ),
+        ("GXSetFog", "porpoise_libporpoise_gx_set_fog_adapter"),
+        (
+            "GXSetFogRangeAdj",
+            "porpoise_libporpoise_gx_set_fog_range_adj_adapter",
+        ),
+        (
+            "GXSetTevIndirect",
+            "porpoise_libporpoise_gx_set_tev_indirect_adapter",
+        ),
+        ("DVDCancel", "porpoise_libporpoise_dvd_cancel_adapter"),
+        ("DVDClose", "porpoise_libporpoise_dvd_close_adapter"),
+        (
+            "DVDConvertPathToEntrynum",
+            "porpoise_libporpoise_dvd_convert_path_to_entry_adapter",
+        ),
+        ("DVDFastOpen", "porpoise_libporpoise_dvd_fast_open_adapter"),
+        (
+            "DVDGetCommandBlockStatus",
+            "porpoise_libporpoise_dvd_get_command_block_status_adapter",
+        ),
+        ("DVDOpen", "porpoise_libporpoise_dvd_open_adapter"),
+        ("DVDReadPrio", "porpoise_libporpoise_dvd_read_prio_adapter"),
+        (
+            "OSAllocFromArenaHi",
+            "porpoise_libporpoise_os_alloc_from_arena_hi_adapter",
+        ),
+        (
+            "OSAllocFromArenaLo",
+            "porpoise_libporpoise_os_alloc_from_arena_lo_adapter",
+        ),
+        ("OSExitThread", "porpoise_libporpoise_os_exit_thread_adapter"),
+        ("OSGetArenaHi", "porpoise_libporpoise_os_get_arena_hi_adapter"),
+        ("OSGetArenaLo", "porpoise_libporpoise_os_get_arena_lo_adapter"),
+        (
+            "OSGetCurrentThread",
+            "porpoise_libporpoise_os_get_current_thread_adapter",
+        ),
+        (
+            "OSInitMessageQueue",
+            "porpoise_libporpoise_os_init_message_queue_adapter",
+        ),
+        (
+            "OSReceiveMessage",
+            "porpoise_libporpoise_os_receive_message_adapter",
+        ),
+        ("OSReport", "porpoise_libporpoise_os_report_adapter"),
+        ("OSResumeThread", "porpoise_libporpoise_os_resume_thread_adapter"),
+        ("OSSendMessage", "porpoise_libporpoise_os_send_message_adapter"),
+        ("OSSetArenaHi", "porpoise_libporpoise_os_set_arena_hi_adapter"),
+        ("OSSetArenaLo", "porpoise_libporpoise_os_set_arena_lo_adapter"),
+        ("OSSleepThread", "porpoise_libporpoise_os_sleep_thread_adapter"),
+        (
+            "OSSuspendThread",
+            "porpoise_libporpoise_os_suspend_thread_adapter",
+        ),
+        ("OSWakeupThread", "porpoise_libporpoise_os_wakeup_thread_adapter"),
+        ("VIConfigure", "porpoise_libporpoise_vi_configure_adapter"),
+        (
+            "VISetNextFrameBuffer",
+            "porpoise_libporpoise_vi_set_next_frame_buffer_adapter",
+        ),
+    )
+    assert {adapter for _, adapter in protected_native_callables} == set(
+        builtin_contracts_by_adapter
+    )
+    for adapter in builtin_contracts_by_adapter:
+        assert adapter not in public_adapter_header
+
+    def builtin_manifest(adapter, result, arguments):
+        return {
+            "schema_version": 1,
+            "functions": [
+                {
+                    "kind": "import",
+                    # Built-in adapters bind by adapter name; guest symbols may
+                    # use any valid alias declared by the input assembly.
+                    "symbol": "TerminalHostCall",
+                    "adapter": adapter,
+                    "header": "porpoise_libporpoise_builtins_private.h",
+                    "return": result,
+                    "arguments": arguments,
+                }
+            ],
+        }
+
+    for adapter_index, (adapter, result, arguments) in enumerate(
+        builtin_adapter_contracts
+    ):
+        adapter_abi = temporary / f"builtin-adapter-{adapter_index}.json"
+        adapter_abi.write_text(
+            json.dumps(builtin_manifest(adapter, result, arguments)),
+            encoding="utf-8",
+        )
+        adapter_output = temporary / f"builtin-adapter-{adapter_index}-output"
+        run(
+            TOOL,
+            terminal_import_input,
+            "--output",
+            adapter_output,
+            "--abi",
+            adapter_abi,
+        )
+        import_source = (
+            adapter_output / "src" / "porpoise_imports.c"
+        ).read_text(encoding="utf-8")
+        assert f"{adapter}(state)" in import_source
+        assert import_source.count(
+            '#include "porpoise_libporpoise_builtins_private.h"'
+        ) == 1
+        assert "#include <porpoise_libporpoise_adapter.h>" not in import_source
+
+    def reject_builtin_manifest(
+        label, manifest, diagnostic=None, input_path=terminal_import_input
+    ):
+        manifest_path = temporary / f"builtin-adapter-{label}.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        completed = run(
+            TOOL,
+            input_path,
+            "--output",
+            temporary / f"builtin-adapter-{label}-output",
+            "--abi",
+            manifest_path,
+            expected=2,
+        )
+        if diagnostic is not None:
+            assert diagnostic in completed.stderr
+        return completed
+
+    def write_import_caller(path, function_name, symbols):
+        lines = [
+            ".text\n",
+            f".global {function_name}\n",
+            f".fn {function_name}, global\n",
+        ]
+        start_address = 0x80004200
+        for symbol_index, symbol in enumerate(symbols):
+            address = start_address + symbol_index * 4
+            offset = symbol_index * 4
+            lines.append(
+                f"/* {address:08X} {offset:08X}  48 00 00 01 */ bl {symbol}\n"
+            )
+        final_index = len(symbols)
+        lines.append(
+            f"/* {start_address + final_index * 4:08X} "
+            f"{final_index * 4:08X}  4E 80 00 20 */ blr\n"
+        )
+        lines.append(f".endfn {function_name}\n")
+        path.write_text("".join(lines), encoding="utf-8")
+
+    protected_native_input = temporary / "protected-native-imports.s"
+    write_import_caller(
+        protected_native_input,
+        "protected_native_caller",
+        [native for native, _ in protected_native_callables],
+    )
+
+    canonical_native_manifest = {"schema_version": 1, "functions": []}
+    for native, adapter in protected_native_callables:
+        _, result, arguments = builtin_contracts_by_adapter[adapter]
+        canonical_native_manifest["functions"].append(
+            {
+                "kind": "import",
+                "symbol": native,
+                "adapter": adapter,
+                "header": "porpoise_libporpoise_builtins_private.h",
+                "return": result,
+                "arguments": arguments,
+            }
+        )
+    canonical_native_abi = temporary / "canonical-native-imports.json"
+    canonical_native_abi.write_text(
+        json.dumps(canonical_native_manifest), encoding="utf-8"
+    )
+    canonical_native_output = temporary / "canonical-native-imports-output"
+    run(
+        TOOL,
+        protected_native_input,
+        "--output",
+        canonical_native_output,
+        "--abi",
+        canonical_native_abi,
+    )
+    canonical_native_source = (
+        canonical_native_output / "src" / "porpoise_imports.c"
+    ).read_text(encoding="utf-8")
+    for _, adapter in protected_native_callables:
+        assert f"{adapter}(state)" in canonical_native_source
+
+    default_native_manifest = {"schema_version": 1, "functions": []}
+    for native, adapter in protected_native_callables:
+        _, result, arguments = builtin_contracts_by_adapter[adapter]
+        default_native_manifest["functions"].append(
+            {
+                "kind": "import",
+                "symbol": native,
+                "header": "porpoise/stub.h",
+                "return": result,
+                "arguments": arguments,
+            }
+        )
+    default_native_result = reject_builtin_manifest(
+        "protected-default-native-callables",
+        default_native_manifest,
+        input_path=protected_native_input,
+    )
+    for native, adapter in protected_native_callables:
+        assert (
+            f"ABI import {native} must use built-in adapter {adapter}"
+            in default_native_result.stderr
+        )
+
+    protected_aliases = [
+        f"ProtectedNativeAlias{index}"
+        for index in range(len(protected_native_callables))
+    ]
+    protected_alias_input = temporary / "protected-native-aliases.s"
+    write_import_caller(
+        protected_alias_input,
+        "protected_native_alias_caller",
+        protected_aliases,
+    )
+
+    explicit_native_manifest = {"schema_version": 1, "functions": []}
+    for alias, (native, adapter) in zip(
+        protected_aliases, protected_native_callables
+    ):
+        _, result, arguments = builtin_contracts_by_adapter[adapter]
+        explicit_native_manifest["functions"].append(
+            {
+                "kind": "import",
+                "symbol": alias,
+                "wrapper": native,
+                "header": "porpoise/stub.h",
+                "return": result,
+                "arguments": arguments,
+            }
+        )
+    explicit_native_result = reject_builtin_manifest(
+        "protected-explicit-native-wrappers",
+        explicit_native_manifest,
+        input_path=protected_alias_input,
+    )
+    for alias, (native, adapter) in zip(
+        protected_aliases, protected_native_callables
+    ):
+        assert (
+            f"ABI import {alias} cannot use protected native callable {native} "
+            f"as its typed wrapper; use built-in adapter {adapter}"
+            in explicit_native_result.stderr
+        )
+
+    native_adapter_manifest = {"schema_version": 1, "functions": []}
+    for alias, (native, adapter) in zip(
+        protected_aliases, protected_native_callables
+    ):
+        _, result, arguments = builtin_contracts_by_adapter[adapter]
+        native_adapter_manifest["functions"].append(
+            {
+                "kind": "import",
+                "symbol": alias,
+                "adapter": native,
+                "header": "porpoise/stub.h",
+                "return": result,
+                "arguments": arguments,
+            }
+        )
+    native_adapter_result = reject_builtin_manifest(
+        "protected-native-adapter-identifiers",
+        native_adapter_manifest,
+        input_path=protected_alias_input,
+    )
+    for alias, (native, adapter) in zip(
+        protected_aliases, protected_native_callables
+    ):
+        assert (
+            f"ABI import {alias} cannot use protected native callable {native} "
+            f"as its adapter; use built-in adapter {adapter}"
+            in native_adapter_result.stderr
+        )
+
+    wrong_adapter_manifest = {"schema_version": 1, "functions": []}
+    for native_index, (native, expected_adapter) in enumerate(
+        protected_native_callables
+    ):
+        wrong_adapter = protected_native_callables[
+            (native_index + 1) % len(protected_native_callables)
+        ][1]
+        _, result, arguments = builtin_contracts_by_adapter[wrong_adapter]
+        wrong_adapter_manifest["functions"].append(
+            {
+                "kind": "import",
+                "symbol": native,
+                "adapter": wrong_adapter,
+                "header": "porpoise_libporpoise_builtins_private.h",
+                "return": result,
+                "arguments": arguments,
+            }
+        )
+    wrong_adapter_result = reject_builtin_manifest(
+        "protected-wrong-built-in-adapters",
+        wrong_adapter_manifest,
+        input_path=protected_native_input,
+    )
+    for native, expected_adapter in protected_native_callables:
+        assert (
+            f"ABI import {native} must use built-in adapter {expected_adapter}"
+            in wrong_adapter_result.stderr
+        )
+
+    custom_adapter_manifest = {"schema_version": 1, "functions": []}
+    for native_index, (native, expected_adapter) in enumerate(
+        protected_native_callables
+    ):
+        _, result, arguments = builtin_contracts_by_adapter[expected_adapter]
+        custom_adapter_manifest["functions"].append(
+            {
+                "kind": "import",
+                "symbol": native,
+                "adapter": f"ProtectedCustomAdapter{native_index}",
+                "header": "porpoise/stub.h",
+                "return": result,
+                "arguments": arguments,
+            }
+        )
+    custom_adapter_result = reject_builtin_manifest(
+        "protected-custom-adapters",
+        custom_adapter_manifest,
+        input_path=protected_native_input,
+    )
+    for native, expected_adapter in protected_native_callables:
+        assert (
+            f"ABI import {native} must use built-in adapter {expected_adapter}"
+            in custom_adapter_result.stderr
+        )
+
+    convert_contract = builtin_contracts_by_adapter[
+        "porpoise_libporpoise_dvd_convert_path_to_entry_adapter"
+    ]
+    wrong_return = builtin_manifest(*convert_contract)
+    wrong_return["functions"][0]["return"] = gpr("u32", 3)
+    reject_builtin_manifest("wrong-return", wrong_return, "return mapping")
+
+    open_contract = builtin_contracts_by_adapter[
+        "porpoise_libporpoise_dvd_open_adapter"
+    ]
+    missing_argument = builtin_manifest(*open_contract)
+    missing_argument["functions"][0]["arguments"] = [gpr("pointer", 3)]
+    reject_builtin_manifest("missing-argument", missing_argument, "1 ABI arguments")
+
+    extra_argument = builtin_manifest(*convert_contract)
+    extra_argument["functions"][0]["arguments"] = [
+        gpr("pointer", 3),
+        gpr("pointer", 4),
+    ]
+    reject_builtin_manifest("extra-argument", extra_argument, "2 ABI arguments")
+
+    fast_open_contract = builtin_contracts_by_adapter[
+        "porpoise_libporpoise_dvd_fast_open_adapter"
+    ]
+    reordered_arguments = builtin_manifest(*fast_open_contract)
+    reordered_arguments["functions"][0]["arguments"] = [
+        gpr("pointer", 3),
+        gpr("s32", 4),
+    ]
+    reject_builtin_manifest(
+        "reordered-arguments", reordered_arguments, "argument 1 mapping"
+    )
+
+    init_message_contract = builtin_contracts_by_adapter[
+        "porpoise_libporpoise_os_init_message_queue_adapter"
+    ]
+    wrong_argument_kind = builtin_manifest(*init_message_contract)
+    wrong_argument_kind["functions"][0]["arguments"] = [
+        gpr("pointer", 3),
+        gpr("pointer", 4),
+        gpr("u32", 5),
+    ]
+    reject_builtin_manifest(
+        "wrong-argument-kind", wrong_argument_kind, "argument 3 mapping"
+    )
+
+    wrong_register = builtin_manifest(*convert_contract)
+    wrong_register["functions"][0]["arguments"] = [gpr("pointer", 4)]
+    reject_builtin_manifest(
+        "wrong-argument-register", wrong_register, "argument 1 mapping"
+    )
+
+    wrong_header = builtin_manifest(*convert_contract)
+    wrong_header["functions"][0]["header"] = "porpoise/stub.h"
+    reject_builtin_manifest(
+        "wrong-header",
+        wrong_header,
+        "must use header porpoise_libporpoise_builtins_private.h",
+    )
+
+    old_public_header = builtin_manifest(*convert_contract)
+    old_public_header["functions"][0]["header"] = (
+        "porpoise_libporpoise_adapter.h"
+    )
+    reject_builtin_manifest(
+        "old-public-header",
+        old_public_header,
+        "must use header porpoise_libporpoise_builtins_private.h",
+    )
+
+    wrong_function_kind = builtin_manifest(*convert_contract)
+    wrong_function_kind["functions"][0]["kind"] = "export"
+    wrong_function_kind["functions"][0]["wrapper"] = "TerminalExport"
+    reject_builtin_manifest("wrong-function-kind", wrong_function_kind)
+
+    ai_init_contract = builtin_contracts_by_adapter[
+        "porpoise_libporpoise_ai_init_adapter"
+    ]
+    wrong_ai_init_return = builtin_manifest(*ai_init_contract)
+    wrong_ai_init_return["functions"][0]["return"] = gpr("pointer", 3)
+    reject_builtin_manifest(
+        "ai-init-wrong-return", wrong_ai_init_return, "return mapping"
+    )
+
+    missing_ai_init_stack = builtin_manifest(*ai_init_contract)
+    missing_ai_init_stack["functions"][0]["arguments"] = []
+    reject_builtin_manifest(
+        "ai-init-missing-stack",
+        missing_ai_init_stack,
+        "has 0 ABI arguments; expected 1",
+    )
+
+    wrong_ai_init_stack = builtin_manifest(*ai_init_contract)
+    wrong_ai_init_stack["functions"][0]["arguments"] = [gpr("u32", 3)]
+    reject_builtin_manifest(
+        "ai-init-wrong-stack",
+        wrong_ai_init_stack,
+        "argument 1 mapping u32 r3; expected pointer r3",
+    )
+
+    gx_init_contract = builtin_contracts_by_adapter[
+        "porpoise_libporpoise_gx_init_adapter"
+    ]
+    wrong_gx_init_return = builtin_manifest(*gx_init_contract)
+    wrong_gx_init_return["functions"][0]["return"] = gpr("u32", 3)
+    reject_builtin_manifest(
+        "gx-init-wrong-return", wrong_gx_init_return, "return mapping"
+    )
+
+    missing_gx_init_size = builtin_manifest(*gx_init_contract)
+    missing_gx_init_size["functions"][0]["arguments"] = [gpr("pointer", 3)]
+    reject_builtin_manifest(
+        "gx-init-missing-size",
+        missing_gx_init_size,
+        "has 1 ABI arguments; expected 2",
+    )
+
+    wrong_gx_init_size = builtin_manifest(*gx_init_contract)
+    wrong_gx_init_size["functions"][0]["arguments"] = [
+        gpr("pointer", 3),
+        gpr("pointer", 4),
+    ]
+    reject_builtin_manifest(
+        "gx-init-wrong-size",
+        wrong_gx_init_size,
+        "argument 2 mapping pointer r4; expected u32 r4",
+    )
+
+    gx_set_array_contract = builtin_contracts_by_adapter[
+        "porpoise_libporpoise_gx_set_array_adapter"
+    ]
+    wrong_gx_set_array_stride = builtin_manifest(*gx_set_array_contract)
+    wrong_gx_set_array_stride["functions"][0]["arguments"] = [
+        gpr("u32", 3),
+        gpr("pointer", 4),
+        gpr("u32", 5),
+    ]
+    reject_builtin_manifest(
+        "gx-set-array-wrong-stride",
+        wrong_gx_set_array_stride,
+        "argument 3 mapping u32 r5; expected u8 r5",
+    )
+
+    os_report_contract = builtin_contracts_by_adapter[
+        "porpoise_libporpoise_os_report_adapter"
+    ]
+    wrong_report_return = builtin_manifest(*os_report_contract)
+    wrong_report_return["functions"][0]["return"] = gpr("u32", 3)
+    reject_builtin_manifest(
+        "os-report-wrong-return", wrong_report_return, "return mapping"
+    )
+
+    missing_report_format = builtin_manifest(*os_report_contract)
+    missing_report_format["functions"][0]["arguments"] = []
+    reject_builtin_manifest(
+        "os-report-missing-format",
+        missing_report_format,
+        "has 0 ABI arguments; expected 1",
+    )
+
+    wrong_report_format_type = builtin_manifest(*os_report_contract)
+    wrong_report_format_type["functions"][0]["arguments"] = [gpr("u32", 3)]
+    reject_builtin_manifest(
+        "os-report-wrong-format-type",
+        wrong_report_format_type,
+        "argument 1 mapping u32 r3; expected pointer r3",
+    )
+
+    wrong_report_format_register = builtin_manifest(*os_report_contract)
+    wrong_report_format_register["functions"][0]["arguments"] = [
+        gpr("pointer", 4)
+    ]
+    reject_builtin_manifest(
+        "os-report-wrong-format-register",
+        wrong_report_format_register,
+        "argument 1 mapping pointer r4; expected pointer r3",
+    )
+
+    extra_report_argument = builtin_manifest(*os_report_contract)
+    extra_report_argument["functions"][0]["arguments"] = [
+        gpr("pointer", 3),
+        gpr("u32", 4),
+    ]
+    reject_builtin_manifest(
+        "os-report-extra-argument",
+        extra_report_argument,
+        "has 2 ABI arguments; expected 1",
+    )
+
+    resume_contract = builtin_contracts_by_adapter[
+        "porpoise_libporpoise_os_resume_thread_adapter"
+    ]
+    get_current_thread_contract = builtin_contracts_by_adapter[
+        "porpoise_libporpoise_os_get_current_thread_adapter"
+    ]
+    suspend_contract = builtin_contracts_by_adapter[
+        "porpoise_libporpoise_os_suspend_thread_adapter"
+    ]
+    exit_contract = builtin_contracts_by_adapter[
+        "porpoise_libporpoise_os_exit_thread_adapter"
+    ]
+
+    wrong_thread_return = builtin_manifest(*resume_contract)
+    wrong_thread_return["functions"][0]["return"] = gpr("u32", 3)
+    reject_builtin_manifest(
+        "thread-wrong-return", wrong_thread_return, "return mapping"
+    )
+
+    wrong_get_current_thread_return = builtin_manifest(
+        *get_current_thread_contract
+    )
+    wrong_get_current_thread_return["functions"][0]["return"] = gpr(
+        "u32", 3
+    )
+    reject_builtin_manifest(
+        "get-current-thread-wrong-return",
+        wrong_get_current_thread_return,
+        "return mapping",
+    )
+
+    wrong_get_current_thread_register = builtin_manifest(
+        *get_current_thread_contract
+    )
+    wrong_get_current_thread_register["functions"][0]["return"] = gpr(
+        "pointer", 4
+    )
+    reject_builtin_manifest(
+        "get-current-thread-wrong-register",
+        wrong_get_current_thread_register,
+        "return must map integer/pointer returns to r3",
+    )
+
+    extra_get_current_thread_argument = builtin_manifest(
+        *get_current_thread_contract
+    )
+    extra_get_current_thread_argument["functions"][0]["arguments"] = [
+        gpr("pointer", 3)
+    ]
+    reject_builtin_manifest(
+        "get-current-thread-extra-argument",
+        extra_get_current_thread_argument,
+        "has 1 ABI arguments; expected 0",
+    )
+
+    wrong_exit_return = builtin_manifest(*exit_contract)
+    wrong_exit_return["functions"][0]["return"] = gpr("s32", 3)
+    reject_builtin_manifest(
+        "thread-exit-wrong-return", wrong_exit_return, "return mapping"
+    )
+
+    missing_thread_argument = builtin_manifest(*resume_contract)
+    missing_thread_argument["functions"][0]["arguments"] = []
+    reject_builtin_manifest(
+        "thread-missing-argument",
+        missing_thread_argument,
+        "has 0 ABI arguments; expected 1",
+    )
+
+    extra_thread_argument = builtin_manifest(*suspend_contract)
+    extra_thread_argument["functions"][0]["arguments"] = [
+        gpr("pointer", 3),
+        gpr("pointer", 4),
+    ]
+    reject_builtin_manifest(
+        "thread-extra-argument",
+        extra_thread_argument,
+        "has 2 ABI arguments; expected 1",
+    )
+
+    wrong_thread_argument_type = builtin_manifest(*exit_contract)
+    wrong_thread_argument_type["functions"][0]["arguments"] = [gpr("u32", 3)]
+    reject_builtin_manifest(
+        "thread-wrong-argument-type",
+        wrong_thread_argument_type,
+        "argument 1 mapping u32 r3; expected pointer r3",
+    )
+
+    wrong_thread_argument_register = builtin_manifest(*suspend_contract)
+    wrong_thread_argument_register["functions"][0]["arguments"] = [
+        gpr("pointer", 4)
+    ]
+    reject_builtin_manifest(
+        "thread-wrong-argument-register",
+        wrong_thread_argument_register,
+        "argument 1 mapping pointer r4; expected pointer r3",
+    )
+
+    # Every thread contract has one argument. A noncanonical first slot must
+    # fail even if the canonical r3 mapping appears later in the array.
+    reordered_thread_arguments = builtin_manifest(*resume_contract)
+    reordered_thread_arguments["functions"][0]["arguments"] = [
+        gpr("pointer", 4),
+        gpr("pointer", 3),
+    ]
+    reject_builtin_manifest(
+        "thread-reordered-arguments",
+        reordered_thread_arguments,
+        "has an out-of-order GPR mapping",
+    )
+
+    wrong_thread_header = builtin_manifest(*resume_contract)
+    wrong_thread_header["functions"][0]["header"] = "porpoise/stub.h"
+    reject_builtin_manifest(
+        "thread-wrong-header",
+        wrong_thread_header,
+        "must use header porpoise_libporpoise_builtins_private.h",
+    )
+
+    wrong_thread_function_kind = builtin_manifest(*exit_contract)
+    wrong_thread_function_kind["functions"][0]["kind"] = "export"
+    wrong_thread_function_kind["functions"][0]["wrapper"] = "TerminalExport"
+    reject_builtin_manifest(
+        "thread-wrong-function-kind",
+        wrong_thread_function_kind,
+        "must not declare an adapter",
+    )
+
     exported = temporary / "exported"
     run(
         TOOL,
@@ -1388,17 +2731,25 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "--abi",
         FIXTURES / "abi" / "exports.json",
     )
-    assert "PorpoiseAddOne" in (exported / "src" / "porpoise_exports.c").read_text(encoding="utf-8")
+    export_source = (exported / "src" / "porpoise_exports.c").read_text(
+        encoding="utf-8"
+    )
+    assert "PorpoiseAddOne" in export_source
+    assert "static __thread PorpoisePpcState *porpoise_export_state;" in export_source
+    assert "porpoise_libporpoise_run_guest(state," in export_source
+    assert "porpoise_call_address(state," not in export_source
     export_harness = exported / "tests" / "export_harness.c"
     export_harness.parent.mkdir(parents=True)
     export_harness.write_text(
         "#include <stdlib.h>\n"
         "#include \"porpoise_exports.h\"\n"
+        "#include \"porpoise_generated.h\"\n"
         "#include \"porpoise_libporpoise_adapter.h\"\n"
         "#define CHECK(condition) do { if (!(condition)) abort(); } while (0)\n"
         "int main(void) {\n"
         "  PorpoiseHostAdapter host; PorpoisePpcState state;\n"
         "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
+        "  CHECK(porpoise_generated_bind(&host) == PORPOISE_HOST_OK);\n"
         "  porpoise_state_init(&state, &host); porpoise_bind_export_state(&state);\n"
         "  CHECK(PorpoiseAddOne(41U) == 42U);\n"
         "  CHECK(PorpoiseAddFloat(1.25F, 2.5F) == 3.75F);\n"
@@ -1460,8 +2811,12 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "PORPOISE_HID2_LSQE",
         "PORPOISE_HID2_PSE",
         "PORPOISE_MSR_FP",
-        "PorpoiseTitleHostResultV1",
-        "PorpoiseHostPrepareTitleEntryV1",
+        "PorpoiseTitleHostResultV3",
+        "PorpoiseTitleInitialWordV3",
+        "PorpoiseTitleRuntimeConfigV1",
+        "PorpoiseTitleEntryStateV3",
+        "PorpoiseHostPrepareRuntimeV1",
+        "PorpoiseHostPrepareTitleEntryV3",
     )
     for helper_name in new_runtime_helpers:
         reserved_abi = temporary / f"reserved-{helper_name}.json"

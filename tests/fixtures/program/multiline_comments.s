@@ -6,7 +6,6 @@
  * Uses frame: no
  * Saved registers: none
  */
-.4byte 0x00000000
 
 .text
 .fn commented_function, global

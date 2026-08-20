@@ -1358,7 +1358,8 @@ bool porpoise_system_emit(
         case PORPOISE_SYSTEM_RFI:
             return file_printf(
                 output,
-                "    if (!porpoise_require_supervisor(state, UINT32_C(0x%08lX))) return;\n    {\n        uint32_t porpoise_rfi_target = state->srr0 & ~UINT32_C(3);\n        if (!porpoise_dispatch_available(porpoise_rfi_target)) {\n            (void)porpoise_illegal_instruction(state, UINT32_C(0x%08lX), \"rfi target is outside generated code\");\n            return;\n        }\n        state->msr = ((state->msr & ~UINT32_C(0x87C0FF73)) | (state->srr1 & UINT32_C(0x87C0FF73))) & ~UINT32_C(0x00040000);\n        state->pc = porpoise_rfi_target;\n        if (!porpoise_call_address(state, porpoise_rfi_target)) return;\n        return;\n    }\n",
+                "    if (!porpoise_require_supervisor(state, UINT32_C(0x%08lX))) return;\n    {\n        uint32_t porpoise_rfi_target = state->srr0 & ~UINT32_C(3);\n        uint32_t porpoise_rfi_msr = ((state->msr & ~UINT32_C(0x87C0FF73)) | (state->srr1 & UINT32_C(0x87C0FF73))) & ~UINT32_C(0x00040000);\n        if (!porpoise_dispatch_available(porpoise_rfi_target)) {\n            (void)porpoise_illegal_instruction(state, UINT32_C(0x%08lX), \"rfi target is outside generated code\");\n            return;\n        }\n        if (!porpoise_write_msr(state, UINT32_C(0x%08lX), porpoise_rfi_msr)) return;\n        state->pc = porpoise_rfi_target;\n        if (!porpoise_call_address(state, porpoise_rfi_target)) return;\n        return;\n    }\n",
+                (unsigned long)instruction_address,
                 (unsigned long)instruction_address,
                 (unsigned long)instruction_address);
         case PORPOISE_SYSTEM_DCBZ:

@@ -198,6 +198,14 @@ with tempfile.TemporaryDirectory(
         "files": 1,
         "functions": 4,
         "data_words": 0,
+        "data_objects": 0,
+        "anonymous_contributions": 0,
+        "anonymous_explicit_bytes": 0,
+        "data_fixups": 0,
+        "data_spans": 0,
+        "initialized_data_bytes": 0,
+        "zero_fill_data_bytes": 0,
+        "data_chunks": 0,
         "lowered": 12,
         "host_equivalent_noop": 2,
         "approximate": 19,
@@ -236,7 +244,7 @@ with tempfile.TemporaryDirectory(
         "state->thermal_management[1] = state->gpr[25]",
     ):
         assert fragment in lifted_source
-    dispatch_header = (output / "include" / "porpoise_dispatch.h").read_text(
+    dispatch_header = (output / "src" / "porpoise_dispatch_private.h").read_text(
         encoding="utf-8"
     )
     assert "int porpoise_dispatch_available(uint32_t address);" in dispatch_header
@@ -358,6 +366,8 @@ with tempfile.TemporaryDirectory(
 
             #include "porpoise_generated.h"
             #include "porpoise_libporpoise_adapter.h"
+            #include "generated/nested_status.h"
+            #include "generated/system_semantics.h"
 
             #define CHECK(condition) do { if (!(condition)) abort(); } while (0)
 
@@ -384,6 +394,7 @@ with tempfile.TemporaryDirectory(
                 size_t index;
 
                 CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);
+                CHECK(porpoise_generated_bind(&host) == PORPOISE_HOST_OK);
                 memset(write_block, 0xA5, sizeof(write_block));
                 CHECK(host.write_bytes(
                     host.context,
@@ -419,7 +430,7 @@ with tempfile.TemporaryDirectory(
                 CHECK(state.gpr[3] == UINT32_C(0x2468ACE0));
                 CHECK(state.xer == UINT32_C(0x2468ACE0));
                 CHECK(state.gqr[1] == UINT32_C(0x00040004));
-                CHECK(state.gpr[5] == PORPOISE_MSR_FP);
+                CHECK(state.gpr[5] == (PORPOISE_MSR_EE | PORPOISE_MSR_FP));
                 CHECK(state.gpr[6] == UINT32_C(0x99AABBCC));
                 CHECK(state.cr == UINT32_C(0xA1234565));
                 CHECK(state.pvr == UINT32_C(0x11223344));
@@ -487,7 +498,9 @@ with tempfile.TemporaryDirectory(
     with (build_output / "meson.build").open("a", encoding="utf-8") as meson_file:
         meson_file.write(
             "\nsystem_harness = executable('system_harness', "
-            "'tests/system_harness.c', dependencies: porpoise_lifted_dep)\n"
+            "'tests/system_harness.c', "
+            "include_directories: generated_private_inc, "
+            "dependencies: porpoise_lifted_dep)\n"
         )
     add_stub(build_output)
     run(

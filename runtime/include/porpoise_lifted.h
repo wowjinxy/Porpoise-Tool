@@ -60,6 +60,7 @@ extern "C" {
 /* Machine-state and trap masks use their architectural bit positions. */
 #define PORPOISE_HID2_LSQE UINT32_C(0x80000000)
 #define PORPOISE_HID2_PSE UINT32_C(0x20000000)
+#define PORPOISE_MSR_EE UINT32_C(0x00008000)
 #define PORPOISE_MSR_PR UINT32_C(0x00004000)
 #define PORPOISE_MSR_FP UINT32_C(0x00002000)
 #define PORPOISE_TRAP_SIGNED_LESS 0x10U
@@ -169,6 +170,16 @@ typedef PorpoiseHostResult (*PorpoiseHostSystemCallFn)(
     PorpoisePpcState *state,
     uint32_t instruction_address);
 
+/* Generated projects install their address dispatcher here. Host adapters
+ * use it only at explicit guest-safe points such as interrupt re-enablement. */
+typedef int (*PorpoiseHostCallGuestFn)(
+    PorpoisePpcState *state,
+    uint32_t guest_function_address);
+
+typedef PorpoiseHostResult (*PorpoiseHostPollEventsFn)(
+    void *context,
+    PorpoisePpcState *state);
+
 struct PorpoiseHostAdapter {
     void *context;
     PorpoiseHostReadBytesFn read_bytes;
@@ -178,6 +189,8 @@ struct PorpoiseHostAdapter {
     PorpoiseHostReadTimeBaseFn read_time_base;
     PorpoiseHostTrapFn trap;
     PorpoiseHostSystemCallFn system_call;
+    PorpoiseHostCallGuestFn call_guest;
+    PorpoiseHostPollEventsFn poll_events;
 };
 
 struct PorpoisePpcState {
@@ -234,6 +247,12 @@ struct PorpoisePpcState {
     uint32_t decrementer_value;
     uint64_t decrementer_anchor;
     int decrementer_valid;
+
+    /* Maintained by generated address dispatch. Deferred host completions use
+     * this depth to run only after the submitting lifted frame has returned. */
+    uint32_t lifted_call_depth;
+    /* Suppresses recursive host-event drains while a guest callback runs. */
+    uint32_t host_event_delivery_depth;
 
     PorpoiseExecutionStatus status;
     PorpoiseFault fault;
@@ -505,6 +524,10 @@ int porpoise_write_msr(
     PorpoisePpcState *state,
     uint32_t instruction_address,
     uint32_t value);
+/* Deliver queued host completions without bypassing guest interrupt masking. */
+int porpoise_poll_host_events(
+    PorpoisePpcState *state,
+    uint32_t instruction_address);
 int porpoise_time_base_read(
     PorpoisePpcState *state,
     uint32_t instruction_address,
@@ -556,6 +579,21 @@ int porpoise_load_multiple_words(
     PorpoisePpcState *state,
     uint32_t guest_address,
     unsigned int first_register);
+
+/*
+ * Copy raw bytes without host-endian conversion. These helpers are intended
+ * for generated title-data initialization; ordinary lifted loads/stores should
+ * continue to use the typed big-endian accessors below.
+ */
+int porpoise_store_bytes(
+    PorpoisePpcState *state,
+    uint32_t guest_address,
+    const uint8_t *source,
+    size_t size);
+int porpoise_zero_bytes(
+    PorpoisePpcState *state,
+    uint32_t guest_address,
+    size_t size);
 
 void porpoise_store_u8(
     PorpoisePpcState *state,

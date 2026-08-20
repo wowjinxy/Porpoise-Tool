@@ -24,10 +24,12 @@ typedef struct TestHost {
     PorpoiseHostResult write_result;
     PorpoiseHostResult trap_result;
     PorpoiseHostResult system_call_result;
+    PorpoiseHostResult poll_result;
     size_t time_calls;
     size_t write_calls;
     size_t trap_calls;
     size_t system_call_calls;
+    size_t poll_calls;
     uint32_t write_address;
     size_t write_size;
     uint8_t write_bytes[32];
@@ -39,6 +41,7 @@ typedef struct TestHost {
     int set_event_status;
     PorpoiseExecutionStatus event_status;
     PorpoiseFault event_fault;
+    int reenter_poll;
 } TestHost;
 
 static PorpoiseHostResult test_read_time_base(
@@ -131,6 +134,32 @@ static PorpoiseHostResult test_system_call(
     return host->system_call_result;
 }
 
+static PorpoiseHostResult test_poll_events(
+    void *context,
+    PorpoisePpcState *state)
+{
+    TestHost *host = (TestHost *)context;
+
+    host->poll_calls++;
+    host->event_state = state;
+    if (host->reenter_poll != 0) {
+        CHECK(porpoise_poll_host_events(
+            state,
+            UINT32_C(0x80006FFC)));
+    }
+    if (host->set_event_status != 0) {
+        state->status = host->event_status;
+    }
+    if (host->event_fault != PORPOISE_FAULT_NONE) {
+        porpoise_state_set_fault(
+            state,
+            host->event_fault,
+            state->pc,
+            "host poll fault");
+    }
+    return host->poll_result;
+}
+
 static PorpoiseHostAdapter test_adapter(TestHost *host)
 {
     PorpoiseHostAdapter adapter;
@@ -141,6 +170,7 @@ static PorpoiseHostAdapter test_adapter(TestHost *host)
     adapter.read_time_base = test_read_time_base;
     adapter.trap = test_trap;
     adapter.system_call = test_system_call;
+    adapter.poll_events = test_poll_events;
     return adapter;
 }
 
@@ -635,6 +665,67 @@ static void test_system_calls(void)
     CHECK(state.fault == PORPOISE_FAULT_MISSING_HOST_CALLBACK);
 }
 
+static void test_host_event_polling(void)
+{
+    TestHost host;
+    PorpoiseHostAdapter adapter;
+    PorpoisePpcState state;
+
+    memset(&host, 0, sizeof(host));
+    adapter = test_adapter(&host);
+    porpoise_state_init(&state, &adapter);
+    state.pc = UINT32_C(0x80007000);
+
+    host.reenter_poll = 1;
+    CHECK(porpoise_poll_host_events(&state, UINT32_C(0x80007004)));
+    CHECK(host.poll_calls == 1U);
+    CHECK(host.event_state == &state);
+    CHECK(state.host_event_delivery_depth == 0U);
+
+    host.reenter_poll = 0;
+    CHECK(porpoise_write_msr(
+        &state,
+        UINT32_C(0x80007008),
+        PORPOISE_MSR_EE));
+    CHECK(host.poll_calls == 2U);
+    CHECK(porpoise_write_msr(
+        &state,
+        UINT32_C(0x8000700C),
+        PORPOISE_MSR_EE | PORPOISE_MSR_FP));
+    CHECK(host.poll_calls == 2U);
+    CHECK(porpoise_write_msr(
+        &state,
+        UINT32_C(0x80007010),
+        PORPOISE_MSR_FP));
+    CHECK(host.poll_calls == 2U);
+
+    host.poll_result = PORPOISE_HOST_IO_ERROR;
+    CHECK(!porpoise_write_msr(
+        &state,
+        UINT32_C(0x80007014),
+        PORPOISE_MSR_EE | PORPOISE_MSR_FP));
+    CHECK(host.poll_calls == 3U);
+    CHECK(state.fault == PORPOISE_FAULT_HOST_IO);
+    CHECK(state.fault_address == UINT32_C(0x80007014));
+    CHECK(state.host_event_delivery_depth == 0U);
+
+    porpoise_state_clear_fault(&state);
+    host.poll_result = PORPOISE_HOST_OK;
+    host.set_event_status = 1;
+    host.event_status = PORPOISE_EXECUTION_RETURNED;
+    CHECK(!porpoise_poll_host_events(&state, UINT32_C(0x80007018)));
+    CHECK(state.status == PORPOISE_EXECUTION_RETURNED);
+    CHECK(state.fault == PORPOISE_FAULT_NONE);
+
+    state.status = PORPOISE_EXECUTION_READY;
+    host.event_status = (PorpoiseExecutionStatus)99;
+    CHECK(!porpoise_poll_host_events(&state, UINT32_C(0x8000701C)));
+    CHECK(state.fault == PORPOISE_FAULT_INVALID_STATE);
+    CHECK(strstr(
+              porpoise_state_fault_message(&state),
+              "host event poll callback") != NULL);
+}
+
 int main(void)
 {
     test_state_and_explicit_faults();
@@ -643,5 +734,6 @@ int main(void)
     test_cache_helpers();
     test_traps();
     test_system_calls();
+    test_host_event_polling();
     return 0;
 }

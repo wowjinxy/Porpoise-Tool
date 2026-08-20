@@ -1,6 +1,8 @@
 #include "porpoise/program.h"
 #include "porpoise/util.h"
 
+#include "asm_data_internal.h"
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -169,6 +171,16 @@ static void free_file(PorpoiseSourceFile *file) {
         free(file->data_words[index].directive);
     }
     free(file->data_words);
+    for (index = 0U; index < file->data_object_count; index++) {
+        porpoise_asm_data_free_object(&file->data_objects[index]);
+    }
+    free(file->data_objects);
+    for (index = 0U; index < file->anonymous_data_count; index++) {
+        porpoise_asm_data_free_object(
+            &file->anonymous_data[index].storage);
+        free(file->anonymous_data[index].present);
+    }
+    free(file->anonymous_data);
 }
 
 void porpoise_program_init(PorpoiseProgram *program) {
@@ -183,8 +195,13 @@ void porpoise_program_free(PorpoiseProgram *program) {
     for (index = 0U; index < program->file_count; index++) {
         free_file(&program->files[index]);
     }
+    for (index = 0U; index < program->data_span_count; index++) {
+        free(program->data_spans[index].bytes);
+    }
+    free(program->data_spans);
     free(program->symbol_index);
     free(program->label_index);
+    free(program->data_symbol_index);
     free(program->files);
     memset(program, 0, sizeof(*program));
 }
@@ -759,6 +776,8 @@ static bool parse_file(
     bool ok = true;
     bool in_block_comment = false;
     size_t block_comment_start_line = 0U;
+    PorpoiseAsmDataParser data_parser;
+    porpoise_asm_data_parser_init(&data_parser);
     if (input == NULL) {
         *io_failure = true;
         porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, file->path, 0U, 0U,
@@ -821,7 +840,36 @@ static bool parse_file(
             block_comment_start_line = line_number;
             continue;
         }
+        if (current == NULL) {
+            bool metadata_recognized = false;
+            PorpoiseAsmDataLineResult metadata_result =
+                porpoise_asm_data_parse_metadata(
+                    &data_parser, file, line, line_number, diagnostics,
+                    &metadata_recognized);
+            if (metadata_recognized) {
+                if (metadata_result == PORPOISE_ASM_DATA_INTERNAL_ERROR) {
+                    ok = false;
+                    break;
+                }
+                if (metadata_result == PORPOISE_ASM_DATA_ERROR) ok = false;
+                continue;
+            }
+        }
         if (line[0] == '\0' || line[0] == '#') continue;
+        if (current == NULL) {
+            PorpoiseAsmDataLineResult data_result =
+                porpoise_asm_data_parse_line(
+                    &data_parser, file, line, line_number, diagnostics);
+            if (data_result == PORPOISE_ASM_DATA_INTERNAL_ERROR) {
+                ok = false;
+                break;
+            }
+            if (data_result == PORPOISE_ASM_DATA_ERROR) {
+                ok = false;
+                continue;
+            }
+            if (data_result == PORPOISE_ASM_DATA_HANDLED) continue;
+        }
         if (parse_symbol_alias(line, alias_name, sizeof(alias_name), &is_global)) {
             if (!pending_alias_list_add(&pending_aliases, alias_name, is_global, line_number)) {
                 ok = false;
@@ -1056,6 +1104,10 @@ static bool parse_file(
         }
         ok = false;
     }
+    if (!porpoise_asm_data_finish_file(
+            &data_parser, file, line_number, diagnostics)) {
+        ok = false;
+    }
     if (fclose(input) != 0) {
         *io_failure = true;
         porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, file->path,
@@ -1231,6 +1283,7 @@ static bool program_build_lookup_indices(PorpoiseProgram *program)
                 }
                 label_entry = &label_index[label_cursor++];
                 label_entry->name = item->label;
+                label_entry->file = file;
                 label_entry->function = function;
                 label_entry->address = next_instruction == SIZE_MAX
                     ? 0U
@@ -2230,7 +2283,9 @@ int porpoise_program_load(
         return PORPOISE_EXIT_INTERNAL;
     }
     if (program->file_count != 0U || program->symbol_index_count != 0U ||
-        program->label_index_count != 0U) {
+        program->label_index_count != 0U ||
+        program->data_symbol_index_count != 0U ||
+        program->data_span_count != 0U) {
         porpoise_diagnostics_add(
             diagnostics, PORPOISE_SEVERITY_ERROR, input_path, 0U, 0U,
             "program already contains parsed input; initialize an empty program before loading");
@@ -2291,6 +2346,7 @@ int porpoise_program_load(
     if (ok && !materialize_gap_data_regions(program)) ok = false;
     if (ok && !ensure_unique_symbols(program, diagnostics)) ok = false;
     if (ok && !program_build_lookup_indices(program)) ok = false;
+    if (ok && !porpoise_asm_data_finalize(program, diagnostics)) ok = false;
     if (!ok) {
         if (io_failure) return PORPOISE_EXIT_IO;
         return porpoise_diagnostics_have_errors(diagnostics) ? PORPOISE_EXIT_TRANSLATION : PORPOISE_EXIT_INTERNAL;

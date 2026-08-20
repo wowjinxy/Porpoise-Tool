@@ -1,12 +1,19 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "data_model": {"source": "annotated_assembly", "chunks": 0},
   "files": [
     {"input": "no_entry.s", "generated": "src/lifted/no_entry.c"}
   ],
   "functions": [
     {"symbol": "add_one", "c_symbol": "add_one", "file": "no_entry.s", "address": 2147487744, "size": 8, "status": "lifted"}
   ],
-  "data": [
+  "data_objects": [
+
+  ],
+  "anonymous_data": [
+
+  ],
+  "data_spans": [
 
   ],
   "instructions": [
@@ -19,5 +26,5 @@
   "diagnostics": [
     {"severity": "warning", "file": "no_entry.s", "line": 7, "address": 2147487748, "message": "blr instruction uses approximate host semantics"}
   ],
-  "summary": {"files": 1, "functions": 1, "data_words": 0, "lowered": 1, "host_equivalent_noop": 0, "approximate": 1, "unsupported": 0}
+  "summary": {"files": 1, "functions": 1, "data_words": 0, "data_objects": 0, "anonymous_contributions": 0, "anonymous_explicit_bytes": 0, "data_fixups": 0, "data_spans": 0, "initialized_data_bytes": 0, "zero_fill_data_bytes": 0, "data_chunks": 0, "lowered": 1, "host_equivalent_noop": 0, "approximate": 1, "unsupported": 0}
 }

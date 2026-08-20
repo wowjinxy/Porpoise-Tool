@@ -442,7 +442,8 @@ static void test_title_entry_mode_preparation(void)
     state.gpr[3] = UINT32_C(0x12345678);
     CHECK(porpoise_state_prepare_title_entry(&state));
 
-    CHECK(state.msr == (UINT32_C(0x00000001) | PORPOISE_MSR_FP));
+    CHECK(state.msr == (
+        UINT32_C(0x00000001) | PORPOISE_MSR_EE | PORPOISE_MSR_FP));
     CHECK(state.hid2 == (
         UINT32_C(0x10000000) | PORPOISE_HID2_PSE | PORPOISE_HID2_LSQE));
     CHECK(state.pc == UINT32_C(0x80003100));

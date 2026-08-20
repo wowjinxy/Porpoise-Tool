@@ -406,6 +406,26 @@ int main(void) {
     porpoise_store_f32(&state, 5U, 1.5F);
     CHECK(porpoise_load_f32(&state, 5U) == 1.5F);
 
+    {
+        static const uint8_t raw[] = {0x10U, 0x20U, 0x30U, 0x40U, 0x50U};
+        memset(&memory.bytes[8], 0xA5, 16U);
+        CHECK(porpoise_store_bytes(&state, 9U, raw, sizeof(raw)));
+        CHECK(memory.bytes[8] == 0xA5U);
+        CHECK(memcmp(&memory.bytes[9], raw, sizeof(raw)) == 0);
+        CHECK(memory.bytes[14] == 0xA5U);
+        CHECK(porpoise_zero_bytes(&state, 10U, 3U));
+        CHECK(memory.bytes[9] == 0x10U);
+        CHECK(memory.bytes[10] == 0U && memory.bytes[12] == 0U);
+        CHECK(memory.bytes[13] == 0x50U);
+        CHECK(porpoise_store_bytes(&state, 0U, NULL, 0U));
+        CHECK(!porpoise_store_bytes(&state, 0U, NULL, 1U));
+        CHECK(state.fault == PORPOISE_FAULT_INVALID_ARGUMENT);
+        porpoise_state_clear_fault(&state);
+        CHECK(!porpoise_zero_bytes(&state, UINT32_MAX - 1U, 3U));
+        CHECK(state.fault == PORPOISE_FAULT_ADDRESS_OVERFLOW);
+        porpoise_state_clear_fault(&state);
+    }
+
     state.gpr[29] = UINT32_C(0x11223344);
     state.gpr[30] = UINT32_C(0x55667788);
     state.gpr[31] = UINT32_C(0x99AABBCC);

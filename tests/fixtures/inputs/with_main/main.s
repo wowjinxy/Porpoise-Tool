@@ -14,3 +14,20 @@
 /* 80002020 00000020  E0 23 80 00 */	psq_l f1, 0(r3), 1, qr0
 /* 80002024 00000024  4E 80 00 20 */	blr
 .endfn main
+
+.global startup_first
+.fn startup_first, global
+/* 80002100 00000100  3C 60 80 00 */	lis r3, 0x8000
+/* 80002104 00000104  38 80 00 11 */	li r4, 0x11
+/* 80002108 00000108  90 83 10 04 */	stw r4, 0x1004(r3)
+/* 8000210C 0000010C  4E 80 00 20 */	blr
+.endfn startup_first
+
+.global startup_second
+.fn startup_second, global
+/* 80002120 00000120  3C 60 80 00 */	lis r3, 0x8000
+/* 80002124 00000124  80 83 10 04 */	lwz r4, 0x1004(r3)
+/* 80002128 00000128  38 84 00 22 */	addi r4, r4, 0x22
+/* 8000212C 0000012C  90 83 10 08 */	stw r4, 0x1008(r3)
+/* 80002130 00000130  4E 80 00 20 */	blr
+.endfn startup_second

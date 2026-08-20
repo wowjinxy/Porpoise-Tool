@@ -53,6 +53,79 @@ typedef struct PorpoiseDataWord {
     char *directive;
 } PorpoiseDataWord;
 
+typedef struct PorpoiseDataLocalLabel {
+    char *name;
+    size_t source_line;
+    uint32_t offset;
+} PorpoiseDataLocalLabel;
+
+typedef enum PorpoiseDataFixupKind {
+    PORPOISE_DATA_FIXUP_ABSOLUTE_32 = 0,
+    /* The `.rel BASE, TARGET` dialect stores TARGET's absolute address. */
+    PORPOISE_DATA_FIXUP_REL_TARGET_32
+} PorpoiseDataFixupKind;
+
+typedef struct PorpoiseDataFixup {
+    PorpoiseDataFixupKind kind;
+    size_t source_line;
+    uint32_t offset;
+    uint8_t width;
+    char *target_symbol;
+    int64_t target_addend;
+    char *base_symbol;
+    int64_t base_addend;
+} PorpoiseDataFixup;
+
+typedef struct PorpoiseDataObject {
+    char *name;
+    char *section;
+    bool is_global;
+    size_t metadata_line;
+    size_t source_line;
+    size_t end_source_line;
+    uint32_t section_offset;
+    uint32_t address;
+    uint32_t size;
+    uint8_t *bytes;
+    /* One byte per guest byte: nonzero means explicitly initialized. */
+    uint8_t *initialized;
+    PorpoiseDataLocalLabel *labels;
+    size_t label_count;
+    size_t label_capacity;
+    PorpoiseDataFixup *fixups;
+    size_t fixup_count;
+    size_t fixup_capacity;
+} PorpoiseDataObject;
+
+/*
+ * A whole section contribution range used to address byte emitters that are
+ * intentionally outside named `.obj` records (normally alignment padding).
+ * `storage` owns the bytes, labels, and fixups; `present` distinguishes
+ * explicitly emitted bytes from ranges occupied by named objects.
+ */
+typedef struct PorpoiseAnonymousData {
+    PorpoiseDataObject storage;
+    uint8_t *present;
+} PorpoiseAnonymousData;
+
+typedef enum PorpoiseDataSpanKind {
+    PORPOISE_DATA_SPAN_INITIALIZED = 0,
+    PORPOISE_DATA_SPAN_ZERO_FILL
+} PorpoiseDataSpanKind;
+
+typedef struct PorpoiseDataSpan {
+    PorpoiseDataSpanKind kind;
+    uint32_t address;
+    uint32_t size;
+    /* Owned by the span for INITIALIZED spans; NULL for ZERO_FILL spans. */
+    uint8_t *bytes;
+    size_t source_file_index;
+    /* SIZE_MAX denotes legacy data or an explicit anonymous contribution. */
+    size_t data_object_index;
+    size_t source_line;
+    bool contribution_padding;
+} PorpoiseDataSpan;
+
 typedef struct PorpoiseSourceFile {
     char *path;
     char *relative_path;
@@ -63,6 +136,12 @@ typedef struct PorpoiseSourceFile {
     PorpoiseDataWord *data_words;
     size_t data_word_count;
     size_t data_word_capacity;
+    PorpoiseDataObject *data_objects;
+    size_t data_object_count;
+    size_t data_object_capacity;
+    PorpoiseAnonymousData *anonymous_data;
+    size_t anonymous_data_count;
+    size_t anonymous_data_capacity;
 } PorpoiseSourceFile;
 
 /* Borrowed-pointer lookup entries built once after parsing. */
@@ -75,10 +154,17 @@ typedef struct PorpoiseProgramSymbolIndexEntry {
 
 typedef struct PorpoiseProgramLabelIndexEntry {
     const char *name;
+    const PorpoiseSourceFile *file;
     const PorpoiseFunction *function;
     uint32_t address;
     size_t instruction_item_index;
 } PorpoiseProgramLabelIndexEntry;
+
+typedef struct PorpoiseProgramDataSymbolIndexEntry {
+    const char *name;
+    const PorpoiseSourceFile *file;
+    const PorpoiseDataObject *object;
+} PorpoiseProgramDataSymbolIndexEntry;
 
 typedef struct PorpoiseProgram {
     PorpoiseSourceFile *files;
@@ -90,6 +176,12 @@ typedef struct PorpoiseProgram {
     PorpoiseProgramLabelIndexEntry *label_index;
     size_t label_index_count;
     size_t label_index_capacity;
+    PorpoiseProgramDataSymbolIndexEntry *data_symbol_index;
+    size_t data_symbol_index_count;
+    size_t data_symbol_index_capacity;
+    PorpoiseDataSpan *data_spans;
+    size_t data_span_count;
+    size_t data_span_capacity;
 } PorpoiseProgram;
 
 void porpoise_program_init(PorpoiseProgram *program);
@@ -145,6 +237,16 @@ bool porpoise_program_resolve_unique_label(
     const PorpoiseFunction **function_out,
     uint32_t *address_out,
     size_t *instruction_item_index_out);
+/*
+ * Resolve an exact assembly address for data fixups. Unlike translation
+ * lookups, this includes skipped functions and honors file/object locality.
+ */
+bool porpoise_program_resolve_raw_address(
+    const PorpoiseProgram *program,
+    const PorpoiseSourceFile *scope_file,
+    const PorpoiseDataObject *scope_object,
+    const char *name,
+    uint32_t *address_out);
 size_t porpoise_program_count_named_function(
     const PorpoiseProgram *program,
     const char *name);

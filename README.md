@@ -1,6 +1,6 @@
 # Porpoise Tool
 
-Porpoise Tool is an annotated PowerPC assembly-to-C frontend for main/DOL-style GameCube title code. It emits lifted C functions, a small PPC execution-state shim, a Meson static library, and—when an entry point is available—a `DolphinMain` adapter for use with `libPorpoise`.
+Porpoise Tool is an annotated PowerPC assembly-to-C frontend for main/DOL-style GameCube title code. It emits lifted C functions, a small PPC execution-state shim, a Meson static library, and, when an entry point is available, a `DolphinMain` adapter for use with `libPorpoise`.
 
 This project does **not** claim complete PowerPC ISA support, 100% correctness, or production readiness. Every accepted instruction receives a measured status in `porpoise-report.json`; an instruction being lowered is not evidence that all of its hardware semantics have been verified.
 
@@ -16,11 +16,13 @@ Current scope:
 - Windows through MSYS2/MinGW-w64 and Linux through GCC;
 - Meson for Porpoise Tool and generated projects;
 - generated static libraries and an optional title executable;
+- linked object/data directives compiled into generated C initializers;
 - explicit typed import/export declarations through a versioned ABI manifest.
 
 Out of scope:
 
 - reading a `.dol` binary directly;
+- embedding an ELF/DOL as a generated runtime payload;
 - REL or native-module generation;
 - a standalone SDK/CRT implementation or a second console-memory runtime;
 - automatic guessing of external SDK function signatures;
@@ -38,14 +40,46 @@ meson test -C build --print-errorlogs
 
 The executable is `build/porpoise` on Linux and `build/porpoise.exe` on Windows.
 
-To smoke-test generated output against a local, consumer-supplied `libPorpoise` checkout, opt in at configure time:
+To check a local, consumer-supplied `libPorpoise` checkout against the generated
+runtime's compile-time contracts, opt in at configure time:
 
 ```sh
 meson setup build -Dlibporpoise_compat_path=/path/to/libPorpoise
 meson test -C build --print-errorlogs
 ```
 
-The default test suite uses an in-repository contract stub and does not require or modify a working `libPorpoise` checkout.
+The same check can be run directly without reconfiguring Porpoise Tool:
+
+```sh
+python tools/check_libporpoise_compat.py /path/to/libPorpoise
+```
+
+This is a read-only compile-time contract probe. It writes C probes only to a
+temporary sibling-independent directory; it never configures, builds, copies,
+or writes inside the supplied checkout. With `-std=c99`, strict warnings, and
+the generated project's current Linux or Win64 consumer defines, it reports
+each gate separately: public-header usability, canonical GX texture/copy enum
+values, distinct `GX_CTF_YUVA8`/`GX_CTF_A8`, canonical FIFO-byte API version
+and signature, the canonical sized host-array API, the advertised version and
+declaration for each GX copy guest-address endpoint, and the advertised exact
+guest-address VI next-framebuffer endpoint. A missing declaration or version
+gate produces
+a named `FAIL` and a nonzero result instead of being hidden by a later build
+failure.
+
+The checker does not link or execute `libPorpoise`. A `COMPILE-COMPATIBLE`
+result is therefore not evidence of full-span validation, canonical XFB
+materialization, VI latching or presentation, exactly-once clearing, or any
+other runtime semantic conformance. Those properties require `libPorpoise`
+runtime and integration tests. Exit status `0` means every compile-interface
+gate passed, `1` means the checkout is compile-incompatible with the generated
+consumer, and `2` means the probe itself could not run (for example, an unusable
+compiler environment). `--target linux` and `--target win64` select the
+corresponding generated-consumer defines; the default selects the current host.
+
+The default test suite self-tests this checker against in-repository positive
+and negative contract fixtures. It does not require or inspect a working
+`libPorpoise` checkout; probing one remains explicitly opt in.
 
 ## Command line
 
@@ -120,22 +154,181 @@ On Windows, invoke `build/porpoise.exe` from the MinGW64 environment. See [INPUT
 Generated projects resolve this Meson dependency:
 
 ```meson
-dependency('libPorpoise', fallback: ['libPorpoise', 'libporpoise_dep'])
+libporpoise_raw_dep = dependency('libPorpoise', fallback: ['libPorpoise','libporpoise_dep'])
+libporpoise_dep = libporpoise_raw_dep.partial_dependency(
+  compile_args: false,
+  includes: true,
+  link_args: true,
+  links: true,
+  sources: true,
+).as_system('system')
 ```
 
 Provide either an installed `libPorpoise` dependency or a checkout at `generated/title/subprojects/libPorpoise` that exports `libporpoise_dep`. Porpoise Tool deliberately creates no wrap file and chooses no library revision.
 
-The reusable static library needs no startup-register provider. The optional executable additionally requires `dependency('porpoise-title-host', fallback: ['porpoise-title-host', 'porpoise_title_host_dep'])`, supplied by the consumer as an installed dependency or subproject without a generated wrap or pin. That dependency implements the versioned primitive-C contract from `porpoise_title_host.h`:
+The filtered dependency preserves libPorpoise's headers, sources, and link contract while deliberately excluding its consumer compile arguments. Its headers are system headers for generated targets, so warnings in the evolving dependency do not disable or contaminate the generated project's `-Werror` policy. Porpoise supplies the required consumer ABI defines directly: `LIBPORPOISE_PORT` and `LIBPORPOISE_BUILD_WIN64` on Windows, or `LIBPORPOISE_PORT`, `LIBPORPOISE_BUILD_LINUX`, and `_POSIX_C_SOURCE=200112L` on Linux. Generated Meson projects reject other host systems.
+
+The reusable static library needs no title-host provider. The optional executable additionally requires `dependency('porpoise-title-host', fallback: ['porpoise-title-host', 'porpoise_title_host_dep'])`, supplied by the consumer as an installed dependency or subproject without a generated wrap or pin. That dependency implements both versioned hooks from `porpoise_title_host.h`:
 
 ```c
-int PorpoiseHostPrepareTitleEntryV1(
+int PorpoiseHostPrepareRuntimeV1(
     uint32_t entry_address,
-    uint32_t gpr_out[32]);
+    PorpoiseTitleRuntimeConfigV1 *config_out);
+
+int PorpoiseHostPrepareTitleEntryV3(
+    uint32_t entry_address,
+    PorpoiseTitleEntryStateV3 *state_out);
 ```
 
-It runs after `OSInit`, receives a caller-zeroed GPR image, and returns zero only after providing a valid guest stack plus the title-specific TOC/SDA bases. A missing provider fails Meson configuration/linking rather than allowing `DolphinMain` to run with guessed zero registers.
+`PorpoiseHostPrepareRuntimeV1` runs first, before `libPorpoise` or guest memory is initialized, and receives a caller-zeroed `PorpoiseTitleRuntimeConfigV1`. Set `PORPOISE_TITLE_RUNTIME_INITIALIZE_DVD` to request native DVD/FST startup. `dvd_root_directory` may name an explicit host directory only when that flag is set; leaving it `NULL` retains the consumer's `libPorpoise` default. This is a runtime host path, not a translation-config path: Porpoise Tool does not rebase it, and the current `libPorpoise` resolves a relative value from the host process's working directory. Unknown flags, an empty root, and a root without the bootstrap flag are rejected. The root string must remain valid until `porpoise_libporpoise_adapter_init_for_title` returns.
+
+The adapter applies an explicit DVD root before `OSInit()`, calls `OSInit()` once, and then calls native `DVDInit()` when requested. This ordering also remains safe if a future `libPorpoise` performs DVD startup from `OSInit()`. Native DVD/FST initialization is one-shot process state: a later configured adapter may request DVD only with the same explicit/default root, and changing the root after the FST has been built is not supported. A wrong root requires a fresh process rather than an attempted in-process rebuild.
+
+`PorpoiseHostPrepareTitleEntryV3` runs after host initialization and generated title-data initialization. Its caller-zeroed state supplies the direct-entry GPR image, optional linked arena bounds, up to 16 explicit startup words, and up to eight ordered lifted guest-only initializers. A title can therefore establish guest mirrors omitted by native `OSInit` (such as its low-memory/default-thread state) before running `__init_user`. Mark that initializer with `PORPOISE_TITLE_STARTUP_ESTABLISH_GUEST_MAIN_THREAD_AFTER`; the adapter validates and binds the resulting guest main-thread identity before the next initializer runs. Every initializer starts from the direct-entry GPR image; memory effects are retained and register clobbers are discarded between calls. Null addresses, unknown flags, and excess entries fail before lifted startup begins. A valid entry state requires an aligned guest `r1` plus nonzero title-specific `r2` (TOC/SDA2) and `r13` (SDA). Porpoise Tool neither derives these values nor runs a transpiled console `__start`.
+
+Nonzero title arena bounds initialize a private guest-address mirror and its
+corresponding native libPorpoise bounds. The canonical arena get/set/allocate
+adapters return only 32-bit guest addresses, preserve the title's upward/downward
+alignment arithmetic, reject invalid alignment, overflow, root escape, and
+crossing before mutation, and fault if native arena state diverges. A zero/zero
+title pair retains native defaults but deliberately leaves these guest arena
+imports unavailable because no strict guest-address pair is known. The root is
+fixed for one adapter lifetime; shutdown restores the native bounds that were
+active before title configuration so a later host session cannot inherit a
+title's allocations.
+
+Because the direct entry begins after native `OSInit`, title preparation enables guest MSR[EE] as well as MSR[FP]. Keep `OSDisableInterrupts`, `OSEnableInterrupts`, and `OSRestoreInterrupts` together in lifted code; importing only part of that family would split guest interrupt state from libPorpoise's native scheduler state.
+
+Both hooks are title-specific integration points. Host paths and extracted title content remain consumer-supplied: Porpoise Tool does not discover, copy, embed, or choose a DVD content directory. A missing provider fails Meson configuration or linking rather than allowing `DolphinMain` to guess runtime configuration.
 
 The currently evolving checkout also defaults its own `build_target` option to `gc`. When using that version as a host subproject, select the host explicitly during setup, for example `-DlibPorpoise:build_target=linux` or `-DlibPorpoise:build_target=win64`. Treat that option as version-sensitive integration surface; an installed dependency may expose a different contract.
+
+Lifted direct writes to the GX FIFO require a byte-exact host boundary. The
+adapter enables them only when the consumer's header advertises
+`SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION >= 1` and provides
+`GXBool SIM_GX_CommandProcessor_SendCanonicalBytes(const u8 *, u32)`. Older
+checkouts still build, but those writes fault as unsupported MMIO rather than
+being passed through endian-unsafe numeric FIFO calls. FIFO reads, offset
+writes, and access widths other than 1, 2, 4, or 8 bytes are also rejected.
+
+Reviewed GX SDK imports use dedicated state-signature adapters rather than
+generic pointer wrappers. `GXInit` validates the complete 32-byte-aligned guest
+FIFO span, calls native GX exactly once for the process, and returns its
+`GXFifoObj` only as an adapter-owned opaque token. Native GX has no teardown;
+after the owning adapter shuts down, a fresh adapter faults instead of claiming
+permission to initialize that process-global state again. Every other built-in
+GX adapter requires that exact active owner.
+
+The current frame-buffer boundary covers `GXSetDrawDoneCallback`,
+`GXSetCopyFilter`, `GXSetCopyClear`, `GXSetDispCopyDst`, `GXSetTexCopyDst`,
+`GXCopyDisp`, `GXCopyTex`, and `GXLoadLightObjImm`. Draw-done callbacks remain
+32-bit guest addresses, return the previous guest address, and are queued by a
+native trampoline for non-reentrant delivery through the generated dispatcher
+only when guest MSR[EE] permits it. Copy-filter arrays are read only when their
+enable flag is true (exactly 24 sample bytes and 7 vertical-filter bytes).
+Colors and the exact 0x40-byte big-endian light object are rebuilt in native
+layout. Texture-copy destination geometry is recorded privately and used for a
+preliminary tiled-span check. Display copies validate only that the exact
+32-byte-aligned destination origin is ordinary mapped RAM before entering
+native GX. The Tool deliberately does not size a display copy from
+`GXSetDispCopyDst`: output height comes from native source and y-scale state,
+and raw FIFO writes can change native copy state without updating the Tool's
+mirror.
+
+For display copies, the required native boundary is
+`LIBPORPOISE_GX_COPY_DISP_GUEST_ADDRESS_API_VERSION >= 1` with
+`GXBool GXHostCopyDispGuestAddress(u32, GXBool)`; texture copies use the
+corresponding `LIBPORPOISE_GX_COPY_TEX_GUEST_ADDRESS_API_VERSION` and
+`GXHostCopyTexGuestAddress`. The adapter forwards the original 32-bit address
+without pointer narrowing. Each endpoint must snapshot native copy state,
+derive and validate the complete actual guest-RAM write span, materialize its
+canonical bytes exactly once, and apply a requested clear exactly once only
+after a successful copy. Display output becomes available to VI through guest
+XFB memory; framebuffer selection and presentation remain VI operations. A
+false native result becomes a sticky `PORPOISE_FAULT_HOST_IO` at that
+destination and must have no copy, clear, or presentation side effects. If the
+matching guest-address contract is absent, the adapter faults explicitly before
+native GX. A host-pointer `GXCopyDisp`/`GXCopyTex` API is not a fallback because
+it cannot establish the required 32-bit guest-address and memory-coherency
+contract.
+
+`VISetNextFrameBuffer` uses a separate required boundary,
+`LIBPORPOISE_VI_SET_NEXT_FRAME_BUFFER_GUEST_ADDRESS_API_VERSION >= 1` with
+`BOOL VIHostSetNextFrameBufferGuestAddress(u32)`. The Tool validates the exact
+aligned RAM origin and forwards it unchanged. The native endpoint updates only
+pending VI selection; it must validate the complete final-mode XFB span when
+selection is latched or presented. Copying never selects a buffer, and
+selection is valid both before and after that buffer is copied.
+
+The built-in `ARQPostRequest` adapter currently supports only high-priority
+requests backed by synchronous `ARStartDMAEx`. It preserves the 32-byte guest
+request layout and defers non-null guest callbacks until the submitting lifted
+frame returns with MSR[EE] enabled. Low-priority native scheduling is not
+guessed. Null callbacks require an input symbol named `__ARQCallbackHack`; its
+resolved guest address is generated into the project rather than hard-coded.
+
+The protected `ARInit`, `ARAlloc`, `ARFree`, `ARReset`, and `ARGetSize`
+adapters keep the SDK stack allocator in one boundary. `ARInit` validates and
+write-preflights the complete guest block table, then gives native
+`libPorpoise` a separate adapter-owned host-endian shadow. Successful
+allocations mirror each length back as a big-endian guest word; `ARFree`
+preflights its nullable output and publishes the popped length only after the
+native result matches the private LIFO mirror. Changed reinitialization,
+external native/guest mutation, and partial native transitions fail closed;
+the exact owner must call `ARReset`, and adapter shutdown resets native AR
+before freeing its shadow. While owned, callers must not invoke the native AR
+allocator family around the adapter. Protected ABI names enforce that for
+generated lifted calls. The current native API has no nonmutating stack-position
+snapshot, so an out-of-contract native `ARFree` that leaves shadow words intact
+is detected by the next mutating boundary; that boundary rolls back its guest
+word and poisons instead of returning a mismatched address. Immediate detection
+would require a future versioned native snapshot/generation contract. No AR
+adapter touches DSP MMIO.
+
+The built-in `DSPAddTask` adapter likewise mirrors the exact 0x50-byte guest
+task into stable native storage and routes guest callback addresses back
+through the lifted dispatcher. This is a task-structure and callback boundary,
+not a claim that every DSP microcode or audio path is implemented by the
+consumer's current `libPorpoise`.
+
+The built-in `AIInit` adapter supports only a null guest callback-stack
+argument. It calls native `AIInit(NULL)` without decoding, tokenizing, or
+casting `r3`; a non-null guest stack faults before native initialization
+because its callback-stack semantics are not implemented. This initializes
+the current host AI control approximation and does not claim audio output.
+
+The built-in `CARDProbeEx` adapter treats `r4` and `r5` as nullable guest
+addresses, validates and preloads both complete big-endian `s32` outputs, then
+write-preflights them by restoring the same bytes and calls native CARD code
+with local host values. Invalid, read-only, or MMIO addresses fault before
+native CARD/EXI execution, and a native no-write result preserves the caller's
+existing guest values.
+
+Guest message queues support initialization and ready/nonblocking operations
+on their exact big-endian layout. Operations that would block or wake a guest
+thread fail closed. Guest `OSThread` resume, suspend, and exit boundaries also
+avoid native structure casts, but full thread execution remains unsupported
+until `libPorpoise` supplies a transactional, joinable host-carrier contract.
+The protected `OSGetCurrentThread` boundary returns only the Tool-owned guest
+thread address associated with the calling carrier. It never narrows or
+tokenizes libPorpoise's native thread pointer, and it fails closed until an
+explicit carrier identity or canonical guest main-thread mirror is bound.
+The required lifecycle and serialization guarantees are described in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#guest-os-object-containment) and
+the versioned [host-thread carrier contract](docs/LIBPORPOISE_THREAD_CARRIER.md).
+
+Variadic guest `OSReport` calls use the built-in canonical
+`porpoise_libporpoise_os_report_adapter`. It consumes PPC EABI register and
+big-endian stack arguments from `PorpoisePpcState`, bounds guest strings and
+output, rejects unsafe format features (including NUL-producing `%c`), and
+sends only a sanitized string to native `OSReport`.
+
+SDK callables backed by these dedicated adapters are protected ABI names. A
+manifest cannot bypass their marshalling by selecting the corresponding native
+function as a typed wrapper or by attaching another adapter to the exact guest
+symbol. Canonical built-in entries must name the generated private header
+`porpoise_libporpoise_builtins_private.h`; the public lifecycle header is not a
+valid built-in adapter contract.
 
 Then build the generated project:
 
@@ -144,18 +337,20 @@ meson setup generated/title/build generated/title -DlibPorpoise:build_target=lin
 meson compile -C generated/title/build
 ```
 
-Every successful generation provides the `porpoise_lifted` static library and the Meson dependency override `porpoise-generated`. An executable named `porpoise_title` is added only when:
+Every successful generation provides the `porpoise_lifted` static library and the Meson dependency override `porpoise-generated`. Library consumers include `porpoise_generated.h`, initialize their host adapter, and call `porpoise_generated_bind()` before entering lifted code through `porpoise_libporpoise_run_guest()`. Raw address dispatch, state-signature import bridges, built-in ABI adapter declarations, data bootstrap, and individual lifted-function declarations are private under the generated `src/` tree and are not exported through the Meson dependency.
+
+An executable named `porpoise_title` is added only when:
 
 - `--entry` names a translated, unskipped input function; or
 - exactly one unskipped function is declared as `.fn main, global`.
 
-The executable exports `DolphinMain`, initializes the `libPorpoise` adapter once, requests the explicit title-entry register state above, and invokes the lifted entry. It never runs a transpiled console `__start`. Without an entry, the generated static library remains usable by another host target.
+The executable exports `DolphinMain` and performs a fixed fail-fast sequence: request the pre-start runtime configuration; initialize the `libPorpoise` adapter and optional native DVD/FST; initialize generated title data; request the title-entry state; apply its arena and startup writes; run its optional lifted initializer; and invoke the direct lifted entry. It never runs a transpiled console `__start`. Without an entry, the generated static library remains usable by another host target.
 
 Generation happens in a sibling staging directory. Failed parsing, lowering, or writing leaves the requested destination untouched. With `--force`, the previous destination is moved to a backup only during publication and restored if publication fails.
 
 ## Measured instruction report
 
-`porpoise-report.json` is deterministic for the same inputs and options. It records input-to-generated file mappings, functions, annotated data words, every translated instruction, approximations, diagnostics, and summary counts.
+`porpoise-report.json` is deterministic for the same inputs and options. It records input-to-generated file mappings, functions, assembly-derived data objects/fixups/spans, every translated instruction, approximations, diagnostics, and summary counts.
 
 | Status | Meaning |
 | --- | --- |
@@ -174,4 +369,4 @@ Each instruction also has a `semantic_test` boolean. `false` means the registry 
 - [Gekko/Broadway architecture reference](docs/Gecko_Broadway_CPU_Architecture.md)
 - [Gekko/Broadway instruction reference](docs/Gecko_Broadway_CPU_Instruction_Set.md)
 
-The two hardware reference documents are background material, not Porpoise Tool implementation or coverage claims. Use the generated report and tests—not an opcode count—to assess a particular translation.
+The two hardware reference documents are background material, not Porpoise Tool implementation or coverage claims. Use the generated report and tests, not an opcode count, to assess a particular translation.

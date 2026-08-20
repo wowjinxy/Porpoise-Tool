@@ -32,7 +32,7 @@
     },
     {
       "kind": "import",
-      "symbol": "OSReport",
+      "symbol": "PorpoiseStubReport",
       "header": "porpoise/stub.h",
       "adapter": "PorpoiseStubReportAdapter",
       "return": {"type": "void"},

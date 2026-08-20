@@ -1,0 +1,4 @@
+#ifndef TEST_LIBPORPOISE_DOLPHIN_GX_LIGHTING_H
+#define TEST_LIBPORPOISE_DOLPHIN_GX_LIGHTING_H
+#include <dolphin/gx/GXSplitStub.h>
+#endif

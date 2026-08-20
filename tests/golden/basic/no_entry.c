@@ -1,9 +1,9 @@
 #include <math.h>
 #include <stdint.h>
 
-#include "porpoise/generated/no_entry.h"
-#include "porpoise_dispatch.h"
-#include "porpoise_imports.h"
+#include "generated/no_entry.h"
+#include "porpoise_dispatch_private.h"
+#include "porpoise_imports_private.h"
 
 void porpoise_lifted_add_one(PorpoisePpcState *state)
 {

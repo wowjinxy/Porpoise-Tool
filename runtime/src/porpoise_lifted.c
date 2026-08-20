@@ -6,6 +6,12 @@
 #include <stdio.h>
 #include <string.h>
 
+static int porpoise_finish_host_event(
+    PorpoisePpcState *state,
+    PorpoiseExecutionStatus status_before,
+    uint32_t instruction_address,
+    const char *event_name);
+
 #if !defined(__CPPCHECK__) && \
     (FLT_RADIX != 2 || FLT_MANT_DIG != 24 || FLT_MAX_EXP != 128 || \
      DBL_MANT_DIG != 53 || DBL_MAX_EXP != 1024)
@@ -125,7 +131,9 @@ int porpoise_state_prepare_title_entry(PorpoisePpcState *state)
         return 0;
     }
 
-    state->msr |= PORPOISE_MSR_FP;
+    /* DolphinMain begins after native OSInit, where external interrupts are
+     * enabled. The lifted title deliberately does not execute console __start. */
+    state->msr |= PORPOISE_MSR_EE | PORPOISE_MSR_FP;
     state->hid2 |= PORPOISE_HID2_PSE | PORPOISE_HID2_LSQE;
     return 1;
 }
@@ -2001,6 +2009,63 @@ static int porpoise_write_bytes(
     return 1;
 }
 
+int porpoise_store_bytes(
+    PorpoisePpcState *state,
+    uint32_t guest_address,
+    const uint8_t *source,
+    size_t size)
+{
+    if (state == NULL || state->fault != PORPOISE_FAULT_NONE) {
+        return 0;
+    }
+    if (size == 0U) {
+        return 1;
+    }
+    if (source == NULL) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_ARGUMENT,
+            guest_address,
+            "raw guest-memory source is NULL");
+        return 0;
+    }
+    return porpoise_write_bytes(state, guest_address, source, size);
+}
+
+int porpoise_zero_bytes(
+    PorpoisePpcState *state,
+    uint32_t guest_address,
+    size_t size)
+{
+    static const uint8_t zeros[4096] = {0};
+    size_t remaining = size;
+    uint32_t cursor = guest_address;
+
+    if (state == NULL || state->fault != PORPOISE_FAULT_NONE) {
+        return 0;
+    }
+    if (size == 0U) {
+        return 1;
+    }
+    if (size - 1U > (size_t)(UINT32_MAX - guest_address)) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_ADDRESS_OVERFLOW,
+            guest_address,
+            "guest-memory zero fill crosses the 32-bit address boundary");
+        return 0;
+    }
+    while (remaining != 0U) {
+        size_t amount = remaining < sizeof(zeros) ? remaining : sizeof(zeros);
+        if (!porpoise_write_bytes(state, cursor, zeros, amount)) {
+            return 0;
+        }
+        cursor += (uint32_t)amount;
+        remaining -= amount;
+    }
+    return 1;
+}
+
 int porpoise_require_supervisor(
     PorpoisePpcState *state,
     uint32_t instruction_address)
@@ -2024,11 +2089,56 @@ int porpoise_write_msr(
     uint32_t instruction_address,
     uint32_t value)
 {
+    uint32_t previous_value;
+
     if (!porpoise_require_supervisor(state, instruction_address)) {
         return 0;
     }
+    previous_value = state->msr;
     state->msr = value;
+    if ((previous_value & PORPOISE_MSR_EE) == 0U &&
+        (value & PORPOISE_MSR_EE) != 0U) {
+        return porpoise_poll_host_events(state, instruction_address);
+    }
     return 1;
+}
+
+int porpoise_poll_host_events(
+    PorpoisePpcState *state,
+    uint32_t instruction_address)
+{
+    PorpoiseHostResult result;
+    PorpoiseExecutionStatus status_before;
+
+    if (porpoise_state_should_stop(state)) {
+        return 0;
+    }
+    if (state->host == NULL || state->host->poll_events == NULL) {
+        return 1;
+    }
+    if (state->host_event_delivery_depth != 0U) {
+        return 1;
+    }
+
+    status_before = state->status;
+    state->host_event_delivery_depth = 1U;
+    result = state->host->poll_events(state->host->context, state);
+    state->host_event_delivery_depth = 0U;
+    if (result != PORPOISE_HOST_OK) {
+        if (state->fault == PORPOISE_FAULT_NONE) {
+            porpoise_state_set_fault(
+                state,
+                porpoise_fault_from_host_result(result),
+                instruction_address,
+                porpoise_host_result_string(result));
+        }
+        return 0;
+    }
+    return porpoise_finish_host_event(
+        state,
+        status_before,
+        instruction_address,
+        "host event poll");
 }
 
 static int porpoise_read_raw_time_base(

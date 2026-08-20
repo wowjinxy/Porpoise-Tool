@@ -473,7 +473,7 @@ static void test_special_resolution_and_emission(void)
         "rfi", "", x_word(19U, 0U, 0U, 0U, 50U));
     emit_text(&instruction, UINT32_C(0x8000102C), text, sizeof(text));
     check_before(text, "porpoise_require_supervisor", "porpoise_dispatch_available");
-    check_before(text, "porpoise_dispatch_available", "state->msr =");
+    check_before(text, "porpoise_dispatch_available", "porpoise_write_msr");
     CHECK(strstr(text, "0x87C0FF73") != NULL);
     CHECK(strstr(text, "0x00040000") != NULL);
     CHECK(strstr(text, "porpoise_call_address") != NULL);

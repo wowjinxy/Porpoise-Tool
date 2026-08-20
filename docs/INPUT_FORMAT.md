@@ -6,7 +6,7 @@ Porpoise Tool reads a deliberately small annotated assembly dialect. It is not a
 
 `INPUT` may be one `.s`/`.S` file or a directory. Directories are scanned recursively, and matching relative paths are sorted before parsing so output and reports are deterministic.
 
-Nested paths are preserved beneath `src/lifted` and `include/porpoise/generated` after each path component is sanitized as a portable C/output name. Inputs are rejected if two paths collide after case-insensitive sanitization. Function symbols must also be unique after sanitization, apart from the proven exact-duplicate records described below.
+Nested paths are preserved beneath `src/lifted` and the private declaration tree `src/generated` after each path component is sanitized as a portable C/output name. Inputs are rejected if two paths collide after case-insensitive sanitization. Function symbols must also be unique after sanitization, apart from the proven exact-duplicate records described below.
 
 ## Minimal example
 
@@ -137,7 +137,55 @@ The current `blr` lowering returns through the host C call stack. It cannot repr
 
 ## Directives and data
 
-Most dot-prefixed assembler directives other than `.fn`, `.endfn`, and `.sym` are tolerated but not interpreted. In `.data`, `.rodata`, `.sdata`, `.sdata2`, `.bss`, `.sbss`, `.sbss2`, and equivalent `.section` regions, annotated four-byte records are preserved:
+Porpoise materializes static title data from decomp-toolkit contribution and
+object metadata. A contribution starts with an exact linked range followed by
+its section directive:
+
+```asm
+# 0x80300000..0x80300018 | size: 0x18
+.section .rodata, "a"
+.balign 8
+
+# .rodata:0x0 | 0x80300000 | size: 0x18
+.obj sample_data, global
+    .4byte other_object
+    .float 1.0
+    .double -2.0
+    .string "hello\n"
+.endobj sample_data
+```
+
+Every `.obj` needs fresh metadata of the form
+`# SECTION:0xOFFSET | 0xADDRESS | size: 0xSIZE`. Its `.endobj` name must match,
+and its directives must emit exactly the declared size. `global` and `weak`
+objects participate in global resolution. `local` objects and labels are
+resolved in their source file first, so two files may legitimately contain the
+same local name.
+
+The interpreted byte emitters are:
+
+- `.byte`, `.2byte`, and `.4byte`, with comma-separated integer literals;
+- `.4byte SYMBOL` and `.4byte SYMBOL+ADDEND` absolute-address fixups;
+- `.float` and `.double` encoded as big-endian IEEE-754 values;
+- `.string` and `.string16`, including the supported C-style, octal, and quote
+  escapes and their terminating zero;
+- `.rel BASE, TARGET`, whose existing dialect contract stores the resolved
+  absolute target address;
+- `.skip SIZE` for explicit zero-fill storage; and
+- `.balign ALIGNMENT[, FILL]` inside an object.
+
+Decomp-toolkit also emits explicit padding directly between objects. Such a
+byte emitter is accepted only while an authoritative linked contribution range
+is active and its address can be derived exactly from that contribution's
+cursor. The report retains it as anonymous contribution provenance. The same
+directive without a usable linked range is an error.
+
+Symbolic data expressions are resolved after every input has been parsed. The
+resolver checks object-local labels, same-file objects/functions/aliases and
+labels, then unique global definitions. An unresolved, ambiguous, overflowing,
+or out-of-object fixup fails translation.
+
+Legacy address-annotated four-byte records remain accepted in data sections:
 
 ```asm
 .section .rodata
@@ -145,9 +193,21 @@ sample_data:
 /* 80300000 00000000  12 34 56 78 */ .4byte 0x12345678
 ```
 
-The four encoded bytes in the annotation are authoritative. Successful projects expose `porpoise_initialize_data(PorpoisePpcState *)`, which writes each word to its 32-bit guest address through the same endian-safe host adapter used by lifted loads and stores. `DolphinMain` calls this initializer after host memory setup and before the lifted entry. This does not allocate memory or compete with `libPorpoise`.
+The annotation's linked address and encoded bytes are authoritative. Synthetic
+`gap_SS_AAAAAAAA_section` function records described below are handled through
+that same legacy path.
 
-Unannotated data directives, BSS sizing, unresolved relocations, macros, and linker metadata are not emitted. Overlapping annotated words and words crossing the 32-bit address boundary are rejected rather than guessed.
+Successful projects generate C byte arrays under `src/data/` and a private
+`porpoise_initialize_data(PorpoisePpcState *)` helper. It writes initialized
+spans and zeroes BSS/padding through the endian-safe host adapter after
+libPorpoise memory setup and before the lifted entry. Porpoise allocates no
+console-memory buffer and embeds no ELF/DOL image.
+
+Linker-synthesized tables or sentinels that do not appear in the disassembly
+must be supplied explicitly as annotated assembly. Porpoise never guesses them
+or recovers them from a linked executable. Known but unsupported byte emitters
+such as `.incbin`, malformed metadata, overlapping spans, and spans crossing
+the 32-bit address boundary fail translation rather than being ignored.
 
 decomp-toolkit may wrap otherwise unclaimed section bytes in a synthetic function record named `gap_SS_AAAAAAAA_section`, for example `gap_03_80004000_text`. Porpoise recognizes that exact naming shape as dialect metadata only when `AAAAAAAA` equals the first annotated address: every annotated word in the record is preserved as guest data, the record is excluded from lifting and address dispatch, and its function-report status is `data`. This prevents strings, vector tables, and padding that happen to decode as valid opcodes from being reported as executable code. Similar-looking names and records whose embedded address does not match remain ordinary functions. If an exact duplicate has both a synthetic gap name and an ordinary function name, the ordinary declaration is retained as the canonical lifted function regardless of input-file order.
 
