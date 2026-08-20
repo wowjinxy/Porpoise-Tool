@@ -404,6 +404,7 @@ static bool object_append_integer(
     PorpoiseDiagnostics *diagnostics) {
     uint8_t bytes[8];
     unsigned int index;
+    if (width == 0U || width > sizeof(bytes)) return false;
     for (index = 0U; index < width; index++) {
         bytes[width - index - 1U] = (uint8_t)(value & UINT64_C(0xFF));
         value >>= 8U;
@@ -485,11 +486,19 @@ static bool parse_width_integer(
     unsigned int width,
     uint64_t *value_out) {
     char *end = NULL;
-    uint64_t maximum = (UINT64_C(1) << (width * 8U)) - UINT64_C(1);
+    unsigned int bits;
+    uint64_t maximum;
+    if (width == 0U || width > sizeof(uint64_t)) return false;
+    bits = width * CHAR_BIT;
+    maximum = width == sizeof(uint64_t)
+                  ? UINT64_MAX
+                  : (UINT64_C(1) << bits) - UINT64_C(1);
     text = skip_space(text);
     if (*text == '-') {
         long long value;
-        int64_t minimum = -(INT64_C(1) << (width * 8U - 1U));
+        int64_t minimum = width == sizeof(uint64_t)
+                              ? INT64_MIN
+                              : -(INT64_C(1) << (bits - 1U));
         errno = 0;
         value = strtoll(text, &end, 0);
         if (errno == ERANGE || end == text ||
@@ -812,6 +821,7 @@ static PorpoiseAsmDataLineResult parse_string_directive(
     const PorpoiseSourceFile *file,
     char *operands_text,
     bool utf16,
+    bool terminated,
     size_t source_line,
     PorpoiseDiagnostics *diagnostics) {
     char *operands[256];
@@ -840,9 +850,12 @@ static PorpoiseAsmDataLineResult parse_string_directive(
         if (*cursor != '"' || *skip_space(cursor + 1U) != '\0') {
             goto malformed;
         }
-        if (!object_append_integer(
+        if (terminated &&
+            !object_append_integer(
                 parser, file, 0U, utf16 ? 2U : 1U, true, source_line,
-                diagnostics)) return PORPOISE_ASM_DATA_ERROR;
+                diagnostics)) {
+            return PORPOISE_ASM_DATA_ERROR;
+        }
     }
     return PORPOISE_ASM_DATA_HANDLED;
 
@@ -1002,7 +1015,7 @@ static PorpoiseAsmDataLineResult add_data_label(
 static bool is_known_byte_emitter(const char *line) {
     static const char *const directives[] = {
         ".string", ".string16", ".ascii", ".asciz", ".byte",
-        ".2byte", ".4byte", ".8byte", ".short", ".word", ".long",
+        ".2byte", ".4byte", ".8byte", ".short", ".int", ".word", ".long",
         ".quad", ".float", ".double", ".skip", ".space", ".zero",
         ".rel", ".incbin", ".fill"
     };
@@ -1122,13 +1135,22 @@ static PorpoiseAsmDataLineResult parse_object_body_line(
         return parse_integer_directive(
             parser, file, operands, 1U, source_line, diagnostics);
     }
-    if (strcmp(directive, ".2byte") == 0) {
+    if (strcmp(directive, ".2byte") == 0 ||
+        strcmp(directive, ".short") == 0) {
         return parse_integer_directive(
             parser, file, operands, 2U, source_line, diagnostics);
     }
-    if (strcmp(directive, ".4byte") == 0) {
+    if (strcmp(directive, ".4byte") == 0 ||
+        strcmp(directive, ".int") == 0 ||
+        strcmp(directive, ".word") == 0 ||
+        strcmp(directive, ".long") == 0) {
         return parse_integer_directive(
             parser, file, operands, 4U, source_line, diagnostics);
+    }
+    if (strcmp(directive, ".8byte") == 0 ||
+        strcmp(directive, ".quad") == 0) {
+        return parse_integer_directive(
+            parser, file, operands, 8U, source_line, diagnostics);
     }
     if (strcmp(directive, ".float") == 0) {
         return parse_float_directive(
@@ -1140,13 +1162,23 @@ static PorpoiseAsmDataLineResult parse_object_body_line(
     }
     if (strcmp(directive, ".string") == 0) {
         return parse_string_directive(
-            parser, file, operands, false, source_line, diagnostics);
+            parser, file, operands, false, true, source_line, diagnostics);
     }
     if (strcmp(directive, ".string16") == 0) {
         return parse_string_directive(
-            parser, file, operands, true, source_line, diagnostics);
+            parser, file, operands, true, true, source_line, diagnostics);
     }
-    if (strcmp(directive, ".skip") == 0) {
+    if (strcmp(directive, ".ascii") == 0) {
+        return parse_string_directive(
+            parser, file, operands, false, false, source_line, diagnostics);
+    }
+    if (strcmp(directive, ".asciz") == 0) {
+        return parse_string_directive(
+            parser, file, operands, false, true, source_line, diagnostics);
+    }
+    if (strcmp(directive, ".skip") == 0 ||
+        strcmp(directive, ".space") == 0 ||
+        strcmp(directive, ".zero") == 0) {
         return parse_skip_directive(
             parser, file, operands, source_line, diagnostics);
     }

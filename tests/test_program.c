@@ -563,6 +563,49 @@ static void test_multiline_comments(const char *source_root) {
     porpoise_program_free(&program);
 }
 
+static void test_dtk_data_directives(const char *source_root) {
+    static const uint8_t expected[] = {
+        0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU,
+        0x80U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x01U, 0x23U, 0x45U, 0x67U, 0x89U, 0xABU, 0xCDU, 0xEFU,
+        0xFFU, 0xFFU, 0xFFU, 0xFFU, 0x80U, 0x00U, 0x00U, 0x00U,
+        0xFFU, 0xFFU, 0x80U, 0x00U, 0x11U, 0x22U, 0x33U, 0x44U,
+        0x55U, 0x66U, 0x77U, 0x88U, 0x41U, 0x42U, 0x0AU, 0x43U,
+        0x00U, 0x7FU, 0x12U, 0x34U, 0x9AU, 0xBCU, 0xDEU, 0xF0U,
+        0x5AU, 0x00U, 0xEEU, 0xEEU, 0x00U, 0x00U, 0xDDU
+    };
+    char path[PORPOISE_PATH_CAPACITY];
+    PorpoiseProgram program;
+    PorpoiseDiagnostics diagnostics;
+    const PorpoiseDataObject *object;
+    size_t index;
+    int result;
+
+    CHECK(make_fixture_path(
+        path, sizeof(path), source_root, "data_directives_dtk.s"));
+    porpoise_program_init(&program);
+    porpoise_diagnostics_init(&diagnostics);
+    result = porpoise_program_load(&program, path, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    CHECK(!porpoise_diagnostics_have_errors(&diagnostics));
+    CHECK(program.file_count == 1U);
+    CHECK(program.files[0].data_object_count == 1U);
+    object = program.files[0].data_object_count == 1U
+                 ? &program.files[0].data_objects[0]
+                 : NULL;
+    CHECK(object != NULL);
+    if (object != NULL) {
+        CHECK(object->size == sizeof(expected));
+        CHECK(memcmp(object->bytes, expected, sizeof(expected)) == 0);
+        for (index = 0U; index < sizeof(expected); index++) {
+            CHECK(object->initialized[index] ==
+                  ((index == 60U || index == 61U) ? 0U : 1U));
+        }
+    }
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_program_free(&program);
+}
+
 static void test_exact_duplicate_functions(const char *source_root) {
     char path[PORPOISE_PATH_CAPACITY];
     char skip_path[PORPOISE_PATH_CAPACITY];
@@ -753,6 +796,7 @@ int main(int argc, char **argv) {
     test_unique_label_resolution(argv[1]);
     test_weak_function_scope(argv[1]);
     test_multiline_comments(argv[1]);
+    test_dtk_data_directives(argv[1]);
     test_exact_duplicate_functions(argv[1]);
     test_coalesced_alias_diagnostic_provenance(argv[1]);
     test_gap_duplicate_precedence(argv[1]);
@@ -801,7 +845,13 @@ int main(int argc, char **argv) {
     test_invalid_program(argv[1], "validation_filename_collision",
                          "filenames collide");
     test_invalid_program(argv[1], "unterminated_block_comment.s",
-                         "unterminated block comment");
+                          "unterminated block comment");
+    test_invalid_program(
+        argv[1], "data_directives_dtk_overflow_unsigned.s",
+        "overflowing 8-byte data operand");
+    test_invalid_program(
+        argv[1], "data_directives_dtk_overflow_signed.s",
+        "overflowing 8-byte data operand");
     if (failures != 0U) {
         fprintf(stderr, "%u parser test(s) failed\n", failures);
         return 1;
