@@ -14,7 +14,10 @@ typedef struct PorpoiseProjectOptions {
     const char *entry_symbol;
     bool force;
     bool strict;
+    const PorpoiseOperationCallbacks *operation;
 } PorpoiseProjectOptions;
+
+void porpoise_project_options_init(PorpoiseProjectOptions *options);
 
 /*
  * Generate from a validated immutable translation plan. The plan controls all

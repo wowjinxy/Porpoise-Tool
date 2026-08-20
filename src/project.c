@@ -44,6 +44,7 @@ typedef struct ProjectContext {
     ProjectDataChunk *data_chunks;
     size_t data_chunk_count;
     size_t data_chunk_capacity;
+    bool cancellation_reported;
 } ProjectContext;
 
 enum {
@@ -55,6 +56,7 @@ typedef struct PorpoiseRegistryEntry {
     uint32_t address;
     const PorpoiseFunction *function;
     const PorpoiseAbiFunction *import;
+    bool trap;
 } PorpoiseRegistryEntry;
 
 static void record_failure(ProjectContext *context, int failure_code) {
@@ -64,6 +66,28 @@ static void record_failure(ProjectContext *context, int failure_code) {
         (failure_code == PORPOISE_EXIT_IO && context->failure_code == PORPOISE_EXIT_TRANSLATION)) {
         context->failure_code = failure_code;
     }
+}
+
+void porpoise_project_options_init(PorpoiseProjectOptions *options) {
+    if (options != NULL) memset(options, 0, sizeof(*options));
+}
+
+static bool project_cancelled(ProjectContext *context) {
+    if (!porpoise_operation_cancelled(context->options->operation)) {
+        return false;
+    }
+    if (!context->cancellation_reported) {
+        porpoise_diagnostics_add(
+            context->diagnostics,
+            PORPOISE_SEVERITY_INFO,
+            context->options->output_path,
+            0U,
+            0U,
+            "project generation was cancelled before publication");
+        context->cancellation_reported = true;
+    }
+    context->failure_code = PORPOISE_EXIT_CANCELLED;
+    return true;
 }
 
 static bool checked_close(FILE *file, const char *path, PorpoiseDiagnostics *diagnostics) {
@@ -125,6 +149,21 @@ static PorpoisePlanAction function_action(
         }
     }
     return PORPOISE_PLAN_ACTION_OMIT;
+}
+
+static const PorpoiseAbiFunction *function_import_binding(
+    const ProjectContext *context,
+    const PorpoiseFunction *function) {
+    size_t index;
+    if (context->analysis == NULL) return NULL;
+    for (index = 0U;
+         index < context->analysis->import_binding_count;
+         index++) {
+        if (context->analysis->import_bindings[index].owner == function) {
+            return context->analysis->import_bindings[index].import;
+        }
+    }
+    return NULL;
 }
 
 static size_t translated_function_count(const ProjectContext *context) {
@@ -265,7 +304,8 @@ static bool write_dispatch_declaration(ProjectContext *context) {
         "enum porpoise_dispatch_kind {\n"
         "    PORPOISE_DISPATCH_NONE = 0,\n"
         "    PORPOISE_DISPATCH_LIFTED,\n"
-        "    PORPOISE_DISPATCH_IMPORT\n"
+        "    PORPOISE_DISPATCH_IMPORT,\n"
+        "    PORPOISE_DISPATCH_TRAP\n"
         "};\n\n"
         "struct porpoise_dispatch_target {\n"
         "    PorpoiseLiftedFunction function;\n"
@@ -348,7 +388,8 @@ static bool append_registry_entry(
     size_t *entry_capacity,
     uint32_t address,
     const PorpoiseFunction *function,
-    const PorpoiseAbiFunction *import)
+    const PorpoiseAbiFunction *import,
+    bool trap)
 {
     PorpoiseRegistryEntry *entry;
 
@@ -364,6 +405,7 @@ static bool append_registry_entry(
     entry->address = address;
     entry->function = function;
     entry->import = import;
+    entry->trap = trap;
     return true;
 }
 
@@ -396,7 +438,8 @@ static bool collect_registry_entries(
                     entry_capacity,
                     function->start_address,
                     function,
-                    NULL)) {
+                    NULL,
+                    false)) {
                 return false;
             }
             for (alias_index = 0U;
@@ -422,7 +465,8 @@ static bool collect_registry_entries(
                         entry_capacity,
                         alias->address,
                         function,
-                        NULL)) {
+                        NULL,
+                        false)) {
                     return false;
                 }
             }
@@ -443,7 +487,8 @@ static bool collect_registry_entries(
                         entry_capacity,
                         item->address,
                         function,
-                        NULL)) {
+                        NULL,
+                        false)) {
                     return false;
                 }
             }
@@ -461,6 +506,33 @@ static bool collect_import_registry_entries(
     const PorpoiseAnalysis *analysis = context->analysis;
     size_t binding_index;
 
+    if (context->plan != NULL) {
+        for (binding_index = 0U;
+             binding_index < porpoise_plan_function_count(context->plan);
+             binding_index++) {
+            const PorpoiseFunctionPlanView *view =
+                porpoise_plan_function_at(context->plan, binding_index);
+            bool trap;
+            if (view == NULL) return false;
+            trap = view->action == PORPOISE_PLAN_ACTION_OMIT &&
+                   (view->origin == PORPOISE_PLAN_ORIGIN_SDK_POLICY ||
+                    view->origin == PORPOISE_PLAN_ORIGIN_MANUAL_OVERRIDE);
+            if (view->action != PORPOISE_PLAN_ACTION_IMPORT && !trap) {
+                continue;
+            }
+            if (!append_registry_entry(
+                    entries,
+                    entry_count,
+                    entry_capacity,
+                    view->binding_address,
+                    NULL,
+                    view->binding,
+                    trap)) {
+                return false;
+            }
+        }
+        return true;
+    }
     if (analysis == NULL) return false;
     for (binding_index = 0U;
          binding_index < analysis->import_binding_count;
@@ -479,7 +551,8 @@ static bool collect_import_registry_entries(
                 entry_capacity,
                 binding->guest_address,
                 NULL,
-                binding->import)) {
+                binding->import,
+                false)) {
             return false;
         }
     }
@@ -548,6 +621,13 @@ static bool write_function_registry_shard(
                 "PORPOISE_DISPATCH_LIFTED};\n",
                 (unsigned long)entry->address,
                 entry->function->c_name);
+        } else if (entry->trap) {
+            fprintf(
+                output,
+                "    case UINT32_C(0x%08lX): return "
+                "(struct porpoise_dispatch_target){porpoise_omitted_sdk_trap, "
+                "PORPOISE_DISPATCH_TRAP};\n",
+                (unsigned long)entry->address);
         } else {
             char c_name[PORPOISE_NAME_CAPACITY];
 
@@ -716,12 +796,14 @@ static bool write_function_registry(ProjectContext *context) {
         "        return 0;\n"
         "    }\n"
         "    if (target.kind != PORPOISE_DISPATCH_LIFTED &&\n"
-        "        target.kind != PORPOISE_DISPATCH_IMPORT) {\n"
+        "        target.kind != PORPOISE_DISPATCH_IMPORT &&\n"
+        "        target.kind != PORPOISE_DISPATCH_TRAP) {\n"
         "        porpoise_state_set_fault(state, PORPOISE_FAULT_INVALID_STATE, address, \"invalid generated dispatch kind\");\n"
         "        return 0;\n"
         "    }\n"
         "    state->pc = address;\n"
-        "    if (target.kind == PORPOISE_DISPATCH_IMPORT) {\n"
+        "    if (target.kind == PORPOISE_DISPATCH_IMPORT ||\n"
+        "        target.kind == PORPOISE_DISPATCH_TRAP) {\n"
         "        target.function(state);\n"
         "        return !porpoise_state_should_stop(state);\n"
         "    }\n"
@@ -1050,6 +1132,9 @@ static bool write_imports(ProjectContext *context) {
     size_t index;
     if (header == NULL) return false;
     fputs("#ifndef PORPOISE_IMPORTS_PRIVATE_H\n#define PORPOISE_IMPORTS_PRIVATE_H\n\n#include \"porpoise_lifted.h\"\n\n", header);
+    fputs(
+        "void porpoise_omitted_sdk_trap(PorpoisePpcState *state);\n",
+        header);
     for (index = 0U; index < context->abi->function_count; index++) {
         const PorpoiseAbiFunction *function = &context->abi->functions[index];
         char c_name[PORPOISE_NAME_CAPACITY];
@@ -1082,6 +1167,15 @@ static bool write_imports(ProjectContext *context) {
         if (!seen) fprintf(source, "#include <%s>\n", function->header);
     }
     fputc('\n', source);
+    fputs(
+        "void porpoise_omitted_sdk_trap(PorpoisePpcState *state)\n"
+        "{\n"
+        "    if (porpoise_state_should_stop(state)) return;\n"
+        "    porpoise_state_set_fault(\n"
+        "        state, PORPOISE_FAULT_UNSUPPORTED_OPERATION, state->pc,\n"
+        "        \"verified SDK function was omitted without a host contract\");\n"
+        "}\n\n",
+        source);
     for (index = 0U; index < context->abi->function_count; index++) {
         const PorpoiseAbiFunction *function = &context->abi->functions[index];
         char c_name[PORPOISE_NAME_CAPACITY];
@@ -1511,6 +1605,11 @@ static void write_data_fixups(
     fputc(']', output);
 }
 
+static void write_json_nullable_string(FILE *output, const char *value) {
+    if (value == NULL || value[0] == '\0') fputs("null", output);
+    else porpoise_json_write_string(output, value);
+}
+
 static bool write_report(ProjectContext *context) {
     char full[PORPOISE_PATH_CAPACITY];
     FILE *output = open_generated_file(context, "porpoise-report.json", full);
@@ -1570,7 +1669,37 @@ static bool write_report(ProjectContext *context) {
 
     fprintf(
         output,
-        "{\n  \"schema_version\": 2,\n"
+        "{\n  \"schema_version\": 3,\n"
+        "  \"target\": {\"id\": ");
+    write_json_nullable_string(
+        output,
+        context->plan != NULL
+            ? porpoise_plan_target_id(context->plan)
+            : NULL);
+    fputs(", \"module\": ", output);
+    write_json_nullable_string(
+        output,
+        context->plan != NULL ? porpoise_plan_module(context->plan) : NULL);
+    fputs(", \"plan_digest\": ", output);
+    write_json_nullable_string(
+        output,
+        context->plan != NULL &&
+                (porpoise_plan_target_id(context->plan) != NULL ||
+                 porpoise_plan_module(context->plan) != NULL ||
+                 porpoise_plan_sdk_policy(context->plan) !=
+                     PORPOISE_SDK_POLICY_KEEP)
+            ? porpoise_plan_digest(context->plan)
+            : NULL);
+    fputs(", \"sdk_policy\": ", output);
+    porpoise_json_write_string(
+        output,
+        context->plan != NULL
+            ? porpoise_sdk_policy_name(
+                  porpoise_plan_sdk_policy(context->plan))
+            : "keep");
+    fprintf(
+        output,
+        "},\n"
         "  \"data_model\": {\"source\": \"annotated_assembly\", "
         "\"chunks\": %lu},\n"
         "  \"files\": [\n",
@@ -1593,8 +1722,36 @@ static bool write_report(ProjectContext *context) {
         const PorpoiseSourceFile *file = &context->program->files[file_index];
         for (function_index = 0U; function_index < file->function_count; function_index++) {
             const PorpoiseFunction *function = &file->functions[function_index];
+            const PorpoiseFunctionPlanView *view =
+                find_function_plan(context, function);
             PorpoisePlanAction action = function_action(context, function);
+            PorpoisePlanAction requested_action =
+                view != NULL ? view->requested_action : action;
+            PorpoisePlanOrigin origin;
+            const PorpoiseAbiFunction *fallback_binding = NULL;
+            PorpoiseFunctionSignature fallback_signature;
+            const PorpoiseFunctionSignature *signature;
             const char *status;
+            memset(&fallback_signature, 0, sizeof(fallback_signature));
+            if (view != NULL) {
+                origin = view->origin;
+                signature = &view->signature;
+            } else {
+                if (action == PORPOISE_PLAN_ACTION_DATA) {
+                    origin = PORPOISE_PLAN_ORIGIN_INPUT_DATA;
+                } else if (action == PORPOISE_PLAN_ACTION_IMPORT) {
+                    origin = PORPOISE_PLAN_ORIGIN_ABI_IMPORT;
+                    fallback_binding =
+                        function_import_binding(context, function);
+                } else if (action == PORPOISE_PLAN_ACTION_OMIT) {
+                    origin = PORPOISE_PLAN_ORIGIN_SKIP_LIST;
+                } else {
+                    origin = PORPOISE_PLAN_ORIGIN_DEFAULT;
+                }
+                (void)porpoise_signature_compute(
+                    context->program, function, &fallback_signature);
+                signature = &fallback_signature;
+            }
             switch (action) {
                 case PORPOISE_PLAN_ACTION_LIFT: status = "lifted"; break;
                 case PORPOISE_PLAN_ACTION_DATA: status = "data"; break;
@@ -1606,9 +1763,104 @@ static bool write_report(ProjectContext *context) {
             porpoise_json_write_string(output, function->name);
             fputs(", \"c_symbol\": ", output); porpoise_json_write_string(output, function->c_name);
             fputs(", \"file\": ", output); porpoise_json_write_string(output, file->relative_path);
-            fprintf(output, ", \"address\": %lu, \"size\": %lu, \"status\": \"%s\"}",
+            fprintf(output, ", \"address\": %lu, \"size\": %lu, \"status\": \"%s\"",
                     (unsigned long)function->start_address, (unsigned long)function->size,
                     status);
+            fputs(", \"requested_action\": ", output);
+            porpoise_json_write_string(
+                output, porpoise_plan_action_name(requested_action));
+            fputs(", \"resolved_action\": ", output);
+            porpoise_json_write_string(
+                output, porpoise_plan_action_name(action));
+            fputs(", \"origin\": ", output);
+            porpoise_json_write_string(
+                output,
+                porpoise_plan_origin_name(origin));
+            fputs(", \"canonical_sdk_identity\": ", output);
+            write_json_nullable_string(
+                output,
+                view != NULL ? view->canonical_sdk_identity : NULL);
+            fputs(", \"sdk_category\": ", output);
+            if (view == NULL || !view->has_sdk_category) fputs("null", output);
+            else porpoise_json_write_string(
+                output, porpoise_sdk_category_name(view->sdk_category));
+            fputs(", \"confidence\": ", output);
+            porpoise_json_write_string(
+                output,
+                porpoise_match_confidence_name(
+                    view != NULL ? view->confidence
+                                 : PORPOISE_MATCH_CONFIDENCE_NONE));
+            fputs(", \"binding\": ", output);
+            write_json_nullable_string(
+                output,
+                view != NULL
+                    ? (view->contract_name != NULL
+                           ? view->contract_name
+                           : (view->binding != NULL
+                                  ? view->binding->symbol
+                                  : NULL))
+                    : (fallback_binding != NULL
+                           ? fallback_binding->symbol
+                           : NULL));
+            fputs(", \"fingerprint\": ", output);
+            write_json_nullable_string(
+                output,
+                signature->digest_hex);
+            fprintf(
+                output,
+                ", \"evidence_flags\": %u, \"conflict\": %s, "
+                "\"overridden\": %s, \"override_action\": ",
+                view != NULL ? view->evidence_flags : 0U,
+                view != NULL &&
+                        (view->evidence_flags &
+                         PORPOISE_PLAN_EVIDENCE_CONFLICT) != 0U
+                    ? "true" : "false",
+                view != NULL && view->overridden ? "true" : "false");
+            porpoise_json_write_string(
+                output,
+                porpoise_override_action_name(
+                    view != NULL ? view->override_action
+                                 : PORPOISE_OVERRIDE_AUTO));
+            fputs(", \"blocking_reason\": ", output);
+            write_json_nullable_string(
+                output,
+                view != NULL && view->blocked
+                    ? view->blocking_reason
+                    : NULL);
+            fputs(", \"provenance\": {\"map\": ", output);
+            if (view == NULL || view->map_symbol == NULL) {
+                fputs("null", output);
+            } else {
+                fputs("{\"path\": ", output);
+                write_json_nullable_string(
+                    output, view->map_symbol->provenance.path);
+                fprintf(
+                    output,
+                    ", \"line\": %lu, \"library\": ",
+                    (unsigned long)view->map_symbol->provenance.line);
+                write_json_nullable_string(output, view->map_symbol->library);
+                fputs(", \"object\": ", output);
+                write_json_nullable_string(output, view->map_symbol->object);
+                fputc('}', output);
+            }
+            fputs(", \"catalog\": ", output);
+            if (view == NULL || view->sdk_entry == NULL) {
+                fputs("null", output);
+            } else {
+                fputs("{\"source\": ", output);
+                porpoise_json_write_string(
+                    output,
+                    porpoise_sdk_catalog_source_kind_name(
+                        view->sdk_entry->provenance.source_kind));
+                fputs(", \"path\": ", output);
+                write_json_nullable_string(
+                    output, view->sdk_entry->provenance.path);
+                fprintf(
+                    output,
+                    ", \"line\": %lu}",
+                    (unsigned long)view->sdk_entry->provenance.line);
+            }
+            fputs("}}", output);
         }
     }
     fputs("\n  ],\n  \"data_objects\": [\n", output);
@@ -1811,17 +2063,27 @@ static bool generate_stage(ProjectContext *context) {
     bool ok = true;
     context->report->source_count = context->program->file_count;
     context->report->function_count = translated_function_count(context);
-    if (!porpoise_make_directories(context->stage, context->diagnostics) ||
-        !copy_runtime(context) || !write_dispatch_declaration(context) ||
+    porpoise_operation_progress(
+        context->options->operation,
+        PORPOISE_PHASE_GENERATE,
+        0U,
+        context->program->file_count + 1U,
+        context->stage);
+    if (project_cancelled(context) ||
+        !porpoise_make_directories(context->stage, context->diagnostics) ||
+        !copy_runtime(context) || project_cancelled(context) ||
+        !write_dispatch_declaration(context) ||
         !write_generated_facade(context) ||
         !write_generated_facade_source(context) ||
-        !write_function_registry(context) ||
+        !write_function_registry(context) || project_cancelled(context) ||
         !write_data_chunks(context) ||
         !write_data_initializer(context) ||
-        !write_imports(context) || !write_exports(context)) return false;
+        !write_imports(context) || !write_exports(context) ||
+        project_cancelled(context)) return false;
     for (file_index = 0U; file_index < context->program->file_count; file_index++) {
         const PorpoiseSourceFile *source = &context->program->files[file_index];
         int source_result;
+        if (project_cancelled(context)) return false;
         if (!write_generated_header(context, source)) {
             record_failure(context, PORPOISE_EXIT_IO);
             ok = false;
@@ -1832,15 +2094,37 @@ static bool generate_stage(ProjectContext *context) {
             record_failure(context, source_result);
             ok = false;
         }
+        porpoise_operation_progress(
+            context->options->operation,
+            PORPOISE_PHASE_GENERATE,
+            file_index + 1U,
+            context->program->file_count + 1U,
+            source->relative_path);
     }
-    if (!ok || porpoise_diagnostics_have_errors(context->diagnostics)) return false;
-    return write_entry(context) && write_meson(context) && write_report(context) && write_project_readme(context);
+    if (!ok || porpoise_diagnostics_have_errors(context->diagnostics) ||
+        project_cancelled(context)) return false;
+    if (!write_entry(context) || !write_meson(context) ||
+        !write_report(context) || !write_project_readme(context) ||
+        project_cancelled(context)) return false;
+    porpoise_operation_progress(
+        context->options->operation,
+        PORPOISE_PHASE_GENERATE,
+        context->program->file_count + 1U,
+        context->program->file_count + 1U,
+        context->stage);
+    return true;
 }
 
 static bool publish_stage(ProjectContext *context) {
     char backup[PORPOISE_PATH_CAPACITY];
     const char *output = context->options->output_path;
     bool had_output = porpoise_path_exists(output);
+    porpoise_operation_progress(
+        context->options->operation,
+        PORPOISE_PHASE_PUBLISH,
+        0U,
+        1U,
+        output);
     if (had_output) {
         if (!make_unique_sibling(output, "backup", backup, context->diagnostics) ||
             !porpoise_move_path(output, backup, context->diagnostics)) return false;
@@ -1862,6 +2146,12 @@ static bool publish_stage(ProjectContext *context) {
         }
         porpoise_diagnostics_free(&cleanup_diagnostics);
     }
+    porpoise_operation_progress(
+        context->options->operation,
+        PORPOISE_PHASE_PUBLISH,
+        1U,
+        1U,
+        output);
     return true;
 }
 
@@ -1892,6 +2182,7 @@ static int prepare_project_output(ProjectContext *context) {
 
 static int generate_project_context(ProjectContext *context) {
     bool generated;
+    if (project_cancelled(context)) return PORPOISE_EXIT_CANCELLED;
     if (!prepare_data_chunks(context)) {
         int result = context->failure_code != PORPOISE_EXIT_OK
                          ? context->failure_code
@@ -1917,6 +2208,15 @@ static int generate_project_context(ProjectContext *context) {
         return context->failure_code != PORPOISE_EXIT_OK
                    ? context->failure_code
                    : PORPOISE_EXIT_IO;
+    }
+    if (project_cancelled(context)) {
+        free(context->registry_shards);
+        context->registry_shards = NULL;
+        free_data_chunks(context);
+        if (!porpoise_remove_tree(context->stage, context->diagnostics)) {
+            return PORPOISE_EXIT_IO;
+        }
+        return PORPOISE_EXIT_CANCELLED;
     }
     if (!publish_stage(context)) {
         free(context->registry_shards);
@@ -1951,14 +2251,14 @@ int porpoise_project_generate_plan(
     if (result != PORPOISE_EXIT_OK) return result;
     session = porpoise_plan_session(plan);
     if (session == NULL || porpoise_session_program(session) == NULL ||
-        porpoise_session_abi(session) == NULL ||
+        porpoise_plan_effective_abi(plan) == NULL ||
         porpoise_plan_analysis_snapshot(plan) == NULL) {
         return PORPOISE_EXIT_INTERNAL;
     }
 
     memset(&context, 0, sizeof(context));
     context.program = porpoise_session_program(session);
-    context.abi = porpoise_session_abi(session);
+    context.abi = porpoise_plan_effective_abi(plan);
     context.options = options;
     context.report = report;
     context.diagnostics = diagnostics;

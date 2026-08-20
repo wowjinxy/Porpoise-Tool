@@ -9,6 +9,11 @@
 
 static unsigned int failures = 0U;
 
+typedef struct CancellationProbe {
+    bool cancel;
+    size_t progress_count;
+} CancellationProbe;
+
 #define CHECK(condition)                                                        \
     do {                                                                        \
         if (!(condition)) {                                                     \
@@ -42,6 +47,25 @@ static bool diagnostics_contain(
         }
     }
     return false;
+}
+
+static void cancel_at_generation(
+    void *user_data,
+    PorpoiseOperationPhase phase,
+    size_t completed,
+    size_t total,
+    const char *detail) {
+    CancellationProbe *probe = (CancellationProbe *)user_data;
+    (void)total;
+    (void)detail;
+    probe->progress_count++;
+    if (phase == PORPOISE_PHASE_GENERATE && completed == 0U) {
+        probe->cancel = true;
+    }
+}
+
+static bool cancellation_requested(void *user_data) {
+    return ((CancellationProbe *)user_data)->cancel;
 }
 
 static char *read_file_snapshot(const char *path, size_t *size_out) {
@@ -390,6 +414,74 @@ static void test_invalid_inputs(const char *source_root) {
     porpoise_diagnostics_free(&diagnostics);
 }
 
+static void test_generation_cancellation_preserves_output(
+    const char *source_root) {
+    const char *output = ".porpoise-session-plan-cancel";
+    char input[PORPOISE_PATH_CAPACITY];
+    char runtime[PORPOISE_PATH_CAPACITY];
+    char sentinel[PORPOISE_PATH_CAPACITY];
+    PorpoiseSessionOpenOptions session_options;
+    PorpoisePlanOptions plan_options;
+    PorpoiseProjectOptions project_options;
+    PorpoiseOperationCallbacks callbacks;
+    CancellationProbe probe;
+    PorpoiseSession *session = NULL;
+    PorpoiseTranslationPlan *plan = NULL;
+    PorpoiseReport report;
+    PorpoiseDiagnostics diagnostics;
+    FILE *file;
+    int result;
+
+    CHECK(fixture_path(input, sizeof(input), source_root, "input"));
+    CHECK(porpoise_path_join(runtime, sizeof(runtime), source_root, "runtime"));
+    CHECK(porpoise_path_join(sentinel, sizeof(sentinel), output, "sentinel.txt"));
+    porpoise_diagnostics_init(&diagnostics);
+    porpoise_report_init(&report);
+    CHECK(porpoise_remove_tree(output, &diagnostics));
+    CHECK(porpoise_make_directories(output, &diagnostics));
+    file = fopen(sentinel, "wb");
+    CHECK(file != NULL);
+    if (file != NULL) {
+        CHECK(fputs("keep", file) >= 0);
+        CHECK(fclose(file) == 0);
+    }
+
+    porpoise_session_open_options_init(&session_options);
+    session_options.input_path = input;
+    result = porpoise_session_open(
+        &session_options, &session, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    porpoise_plan_options_init(&plan_options);
+    plan_options.entry_symbol = "lift_me";
+    result = porpoise_plan_build(
+        session, &plan_options, &plan, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+
+    memset(&probe, 0, sizeof(probe));
+    porpoise_operation_callbacks_init(&callbacks);
+    callbacks.progress = cancel_at_generation;
+    callbacks.cancelled = cancellation_requested;
+    callbacks.user_data = &probe;
+    porpoise_project_options_init(&project_options);
+    project_options.output_path = output;
+    project_options.runtime_directory = runtime;
+    project_options.entry_symbol = "lift_me";
+    project_options.force = true;
+    project_options.operation = &callbacks;
+    result = porpoise_project_generate_plan(
+        plan, &project_options, &report, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_CANCELLED);
+    CHECK(probe.progress_count != 0U);
+    CHECK(porpoise_path_exists(sentinel));
+    CHECK(diagnostics_contain(&diagnostics, "cancelled before publication"));
+    CHECK(porpoise_remove_tree(output, &diagnostics));
+
+    porpoise_report_free(&report);
+    porpoise_plan_free(plan);
+    porpoise_session_close(session);
+    porpoise_diagnostics_free(&diagnostics);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s SOURCE_ROOT\n", argv[0]);
@@ -399,6 +491,7 @@ int main(int argc, char **argv) {
     test_plan_without_abi(argv[1]);
     test_invalid_inputs(argv[1]);
     test_project_api_parity(argv[1]);
+    test_generation_cancellation_preserves_output(argv[1]);
     if (failures != 0U) {
         fprintf(stderr, "%u session/plan test(s) failed\n", failures);
         return 1;

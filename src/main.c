@@ -6,6 +6,7 @@
 #include "porpoise/util.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #ifndef PORPOISE_RUNTIME_DIR
 #define PORPOISE_RUNTIME_DIR "runtime"
@@ -55,6 +56,9 @@ int main(int argc, char **argv) {
     PorpoiseReport report;
     PorpoiseDiagnostics diagnostics;
     PorpoiseProjectOptions project_options;
+    PorpoiseSessionSymbolSource symbol_sources[2];
+    const char *sdk_catalog_paths[1];
+    size_t symbol_source_count = 0U;
     char normalized_output[PORPOISE_PATH_CAPACITY];
     bool output_contains_working_directory;
     bool paths_overlap;
@@ -110,15 +114,45 @@ int main(int argc, char **argv) {
             }
         }
         porpoise_session_open_options_init(&session_options);
+        memset(symbol_sources, 0, sizeof(symbol_sources));
         session_options.input_path = options.input_path;
         session_options.abi_path = options.abi_path;
         session_options.skip_list_path = options.skip_list_path;
+        if (options.map_path[0] != '\0') {
+            symbol_sources[symbol_source_count].kind =
+                PORPOISE_SYMBOL_SOURCE_CODEWARRIOR_MAP;
+            symbol_sources[symbol_source_count].path = options.map_path;
+            symbol_sources[symbol_source_count].module =
+                options.module[0] != '\0' ? options.module : NULL;
+            symbol_source_count++;
+        }
+        if (options.dtk_symbols_path[0] != '\0') {
+            symbol_sources[symbol_source_count].kind =
+                PORPOISE_SYMBOL_SOURCE_DTK_SYMBOLS;
+            symbol_sources[symbol_source_count].path =
+                options.dtk_symbols_path;
+            symbol_sources[symbol_source_count].auxiliary_path =
+                options.dtk_splits_path;
+            symbol_sources[symbol_source_count].module =
+                options.module[0] != '\0' ? options.module : NULL;
+            symbol_source_count++;
+        }
+        session_options.symbol_sources = symbol_sources;
+        session_options.symbol_source_count = symbol_source_count;
+        if (options.sdk_catalog_path[0] != '\0') {
+            sdk_catalog_paths[0] = options.sdk_catalog_path;
+            session_options.sdk_catalog_paths = sdk_catalog_paths;
+            session_options.sdk_catalog_path_count = 1U;
+        }
         result = porpoise_session_open(
             &session_options, &session, &diagnostics);
     }
     if (result == PORPOISE_EXIT_OK) {
         porpoise_plan_options_init(&plan_options);
         plan_options.entry_symbol = options.entry_symbol;
+        plan_options.module =
+            options.module[0] != '\0' ? options.module : NULL;
+        plan_options.sdk_policy = options.sdk_policy;
         result = porpoise_plan_build(
             session, &plan_options, &plan, &diagnostics);
     }
@@ -126,6 +160,7 @@ int main(int argc, char **argv) {
         result = porpoise_plan_validate(plan, &diagnostics);
     }
     if (result == PORPOISE_EXIT_OK) {
+        porpoise_project_options_init(&project_options);
         project_options.output_path = options.output_path;
         project_options.runtime_directory = select_runtime_directory();
         project_options.entry_symbol = options.entry_symbol;

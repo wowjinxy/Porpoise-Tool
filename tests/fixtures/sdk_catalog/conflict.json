@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "signature_algorithm_version": 1,
+  "entries": [
+    {
+      "canonical_identity": "sdk:OSReport",
+      "category": "runtime",
+      "signature": {
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "function_size": 32,
+        "instruction_count": 8,
+        "fixed_instruction_count": 5,
+        "meaningful_fixed_words": 4,
+        "relocation_count": 2,
+        "internal_branch_count": 1,
+        "external_branch_count": 1,
+        "external_target_count": 2,
+        "issue_flags": 0
+      }
+    }
+  ]
+}

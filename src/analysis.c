@@ -1,616 +1,13 @@
 #include "porpoise/analysis.h"
+#include "porpoise/sdk_contract.h"
 #include "porpoise/util.h"
 
 #include <stdlib.h>
 #include <string.h>
 
 enum {
-    PORPOISE_GENERATED_SYMBOL_CAPACITY = PORPOISE_NAME_CAPACITY + 32,
-    PORPOISE_BUILTIN_ADAPTER_MAX_ARGUMENTS = 8
+    PORPOISE_GENERATED_SYMBOL_CAPACITY = PORPOISE_NAME_CAPACITY + 32
 };
-
-typedef struct PorpoiseBuiltinAbiValue {
-    PorpoiseAbiType type;
-    PorpoiseAbiRegisterClass register_class;
-    unsigned int register_index;
-} PorpoiseBuiltinAbiValue;
-
-typedef struct PorpoiseBuiltinAdapterContract {
-    const char *name;
-    const char *native_callable;
-    PorpoiseBuiltinAbiValue result;
-    size_t argument_count;
-    PorpoiseBuiltinAbiValue
-        arguments[PORPOISE_BUILTIN_ADAPTER_MAX_ARGUMENTS];
-} PorpoiseBuiltinAdapterContract;
-
-#define PORPOISE_BUILTIN_VOID \
-    { PORPOISE_ABI_VOID, PORPOISE_ABI_REGISTER_NONE, 0U }
-#define PORPOISE_BUILTIN_GPR(value_type, index) \
-    { (value_type), PORPOISE_ABI_REGISTER_GPR, (index) }
-#define PORPOISE_BUILTIN_FPR(value_type, index) \
-    { (value_type), PORPOISE_ABI_REGISTER_FPR, (index) }
-#define PORPOISE_BUILTIN_ADAPTER_HEADER \
-    "porpoise_libporpoise_builtins_private.h"
-
-static const PorpoiseBuiltinAdapterContract builtin_adapter_contracts[] = {
-    {
-        "porpoise_libporpoise_ai_init_adapter",
-        "AIInit",
-        PORPOISE_BUILTIN_VOID,
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_ar_alloc_adapter",
-        "ARAlloc",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U)}
-    },
-    {
-        "porpoise_libporpoise_ar_free_adapter",
-        "ARFree",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_ar_get_size_adapter",
-        "ARGetSize",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-        0U,
-        {PORPOISE_BUILTIN_VOID}
-    },
-    {
-        "porpoise_libporpoise_ar_init_adapter",
-        "ARInit",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_ar_reset_adapter",
-        "ARReset",
-        PORPOISE_BUILTIN_VOID,
-        0U,
-        {PORPOISE_BUILTIN_VOID}
-    },
-    {
-        "porpoise_libporpoise_arq_post_request_adapter",
-        "ARQPostRequest",
-        PORPOISE_BUILTIN_VOID,
-        8U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 5U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 6U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 7U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 8U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 9U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 10U)
-        }
-    },
-    {
-        "porpoise_libporpoise_card_probe_ex_adapter",
-        "CARDProbeEx",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-        3U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 5U)
-        }
-    },
-    {
-        "porpoise_libporpoise_dsp_add_task_adapter",
-        "DSPAddTask",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_gx_init_adapter",
-        "GXInit",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_draw_done_callback_adapter",
-        "GXSetDrawDoneCallback",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_gx_set_copy_filter_adapter",
-        "GXSetCopyFilter",
-        PORPOISE_BUILTIN_VOID,
-        4U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U8, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U8, 5U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 6U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_copy_clear_adapter",
-        "GXSetCopyClear",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_disp_copy_dst_adapter",
-        "GXSetDispCopyDst",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U16, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U16, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_tex_copy_dst_adapter",
-        "GXSetTexCopyDst",
-        PORPOISE_BUILTIN_VOID,
-        4U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U16, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U16, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 5U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U8, 6U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_copy_disp_adapter",
-        "GXCopyDisp",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U8, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_copy_tex_adapter",
-        "GXCopyTex",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U8, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_load_light_obj_imm_adapter",
-        "GXLoadLightObjImm",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_array_adapter",
-        "GXSetArray",
-        PORPOISE_BUILTIN_VOID,
-        3U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U8, 5U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_load_tex_obj_adapter",
-        "GXLoadTexObj",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_load_tlut_adapter",
-        "GXLoadTlut",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_chan_amb_color_adapter",
-        "GXSetChanAmbColor",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_chan_mat_color_adapter",
-        "GXSetChanMatColor",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_call_display_list_adapter",
-        "GXCallDisplayList",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_projection_adapter",
-        "GXSetProjection",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_get_projectionv_adapter",
-        "GXGetProjectionv",
-        PORPOISE_BUILTIN_VOID,
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_gx_load_pos_mtx_imm_adapter",
-        "GXLoadPosMtxImm",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_load_nrm_mtx_imm_adapter",
-        "GXLoadNrmMtxImm",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_load_tex_mtx_imm_adapter",
-        "GXLoadTexMtxImm",
-        PORPOISE_BUILTIN_VOID,
-        3U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 5U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_get_viewportv_adapter",
-        "GXGetViewportv",
-        PORPOISE_BUILTIN_VOID,
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_gx_set_ind_tex_mtx_adapter",
-        "GXSetIndTexMtx",
-        PORPOISE_BUILTIN_VOID,
-        3U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S8, 5U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_tev_color_adapter",
-        "GXSetTevColor",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_tev_color_s10_adapter",
-        "GXSetTevColorS10",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_tev_kcolor_adapter",
-        "GXSetTevKColor",
-        PORPOISE_BUILTIN_VOID,
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_fog_adapter",
-        "GXSetFog",
-        PORPOISE_BUILTIN_VOID,
-        6U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-            PORPOISE_BUILTIN_FPR(PORPOISE_ABI_F32, 1U),
-            PORPOISE_BUILTIN_FPR(PORPOISE_ABI_F32, 2U),
-            PORPOISE_BUILTIN_FPR(PORPOISE_ABI_F32, 3U),
-            PORPOISE_BUILTIN_FPR(PORPOISE_ABI_F32, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_fog_range_adj_adapter",
-        "GXSetFogRangeAdj",
-        PORPOISE_BUILTIN_VOID,
-        3U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U8, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U16, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 5U)
-        }
-    },
-    {
-        "porpoise_libporpoise_gx_set_tev_indirect_adapter",
-        "GXSetTevIndirect",
-        PORPOISE_BUILTIN_VOID,
-        8U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 5U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 6U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 7U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 8U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 9U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U8, 10U)
-        }
-    },
-    {
-        "porpoise_libporpoise_dvd_cancel_adapter",
-        "DVDCancel",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_dvd_close_adapter",
-        "DVDClose",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_dvd_convert_path_to_entry_adapter",
-        "DVDConvertPathToEntrynum",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_dvd_fast_open_adapter",
-        "DVDFastOpen",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_dvd_get_command_block_status_adapter",
-        "DVDGetCommandBlockStatus",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_dvd_open_adapter",
-        "DVDOpen",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_dvd_read_prio_adapter",
-        "DVDReadPrio",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-        5U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 5U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 6U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 7U)
-        }
-    },
-    {
-        "porpoise_libporpoise_os_alloc_from_arena_hi_adapter",
-        "OSAllocFromArenaHi",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_os_alloc_from_arena_lo_adapter",
-        "OSAllocFromArenaLo",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-        2U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_U32, 4U)
-        }
-    },
-    {
-        "porpoise_libporpoise_os_exit_thread_adapter",
-        "OSExitThread",
-        PORPOISE_BUILTIN_VOID,
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_os_get_arena_hi_adapter",
-        "OSGetArenaHi",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-        0U,
-        {PORPOISE_BUILTIN_VOID}
-    },
-    {
-        "porpoise_libporpoise_os_get_arena_lo_adapter",
-        "OSGetArenaLo",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-        0U,
-        {PORPOISE_BUILTIN_VOID}
-    },
-    {
-        "porpoise_libporpoise_os_get_current_thread_adapter",
-        "OSGetCurrentThread",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-        0U,
-        {PORPOISE_BUILTIN_VOID}
-    },
-    {
-        "porpoise_libporpoise_os_init_message_queue_adapter",
-        "OSInitMessageQueue",
-        PORPOISE_BUILTIN_VOID,
-        3U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 5U)
-        }
-    },
-    {
-        "porpoise_libporpoise_os_receive_message_adapter",
-        "OSReceiveMessage",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-        3U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 5U)
-        }
-    },
-    {
-        "porpoise_libporpoise_os_report_adapter",
-        "OSReport",
-        PORPOISE_BUILTIN_VOID,
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_os_resume_thread_adapter",
-        "OSResumeThread",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_os_send_message_adapter",
-        "OSSendMessage",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-        3U,
-        {
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 4U),
-            PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 5U)
-        }
-    },
-    {
-        "porpoise_libporpoise_os_set_arena_hi_adapter",
-        "OSSetArenaHi",
-        PORPOISE_BUILTIN_VOID,
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_os_set_arena_lo_adapter",
-        "OSSetArenaLo",
-        PORPOISE_BUILTIN_VOID,
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_os_sleep_thread_adapter",
-        "OSSleepThread",
-        PORPOISE_BUILTIN_VOID,
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_os_suspend_thread_adapter",
-        "OSSuspendThread",
-        PORPOISE_BUILTIN_GPR(PORPOISE_ABI_S32, 3U),
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_os_wakeup_thread_adapter",
-        "OSWakeupThread",
-        PORPOISE_BUILTIN_VOID,
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_vi_configure_adapter",
-        "VIConfigure",
-        PORPOISE_BUILTIN_VOID,
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    },
-    {
-        "porpoise_libporpoise_vi_set_next_frame_buffer_adapter",
-        "VISetNextFrameBuffer",
-        PORPOISE_BUILTIN_VOID,
-        1U,
-        {PORPOISE_BUILTIN_GPR(PORPOISE_ABI_POINTER, 3U)}
-    }
-};
-
-#undef PORPOISE_BUILTIN_GPR
-#undef PORPOISE_BUILTIN_VOID
 
 static const char *abi_callable_name(const PorpoiseAbiFunction *function) {
     if (function->kind == PORPOISE_ABI_IMPORT && function->adapter != NULL) {
@@ -700,43 +97,19 @@ static bool abi_callable_name_is_reserved(const char *name) {
     return false;
 }
 
-static const PorpoiseBuiltinAdapterContract *builtin_adapter_contract(
+static const PorpoiseSdkContract *builtin_adapter_contract(
     const char *name) {
-    size_t index;
-
-    if (name == NULL) return NULL;
-    for (index = 0U;
-         index < sizeof(builtin_adapter_contracts) /
-                     sizeof(builtin_adapter_contracts[0]);
-         index++) {
-        if (strcmp(name, builtin_adapter_contracts[index].name) == 0) {
-            return &builtin_adapter_contracts[index];
-        }
-    }
-    return NULL;
+    return porpoise_sdk_contract_find_by_host_callable(name);
 }
 
-static const PorpoiseBuiltinAdapterContract *builtin_native_callable_contract(
+static const PorpoiseSdkContract *builtin_native_callable_contract(
     const char *name) {
-    size_t index;
-
-    if (name == NULL) return NULL;
-    for (index = 0U;
-         index < sizeof(builtin_adapter_contracts) /
-                     sizeof(builtin_adapter_contracts[0]);
-         index++) {
-        if (strcmp(
-                name,
-                builtin_adapter_contracts[index].native_callable) == 0) {
-            return &builtin_adapter_contracts[index];
-        }
-    }
-    return NULL;
+    return porpoise_sdk_contract_find_by_canonical_name(name);
 }
 
 static bool abi_value_matches_builtin(
     const PorpoiseAbiValue *value,
-    const PorpoiseBuiltinAbiValue *expected) {
+    const PorpoiseSdkAbiValue *expected) {
     return value->type == expected->type &&
            value->register_class == expected->register_class &&
            value->register_index == expected->register_index;
@@ -752,12 +125,21 @@ static const char *abi_register_class_name(
 static bool validate_builtin_runtime_adapter(
     const PorpoiseAbiFunction *function,
     PorpoiseDiagnostics *diagnostics) {
-    const PorpoiseBuiltinAdapterContract *contract =
+    const PorpoiseSdkContract *contract =
         builtin_adapter_contract(function->adapter);
+    const PorpoiseSdkAbiValue *expected_result;
+    const char *contract_name;
+    const char *contract_header;
+    size_t contract_argument_count;
     bool valid = true;
     size_t argument_index;
 
     if (contract == NULL) return true;
+    contract_name = porpoise_sdk_contract_host_callable(contract);
+    contract_header = porpoise_sdk_contract_host_header(contract);
+    expected_result = porpoise_sdk_contract_result(contract);
+    contract_argument_count =
+        porpoise_sdk_contract_argument_count(contract);
 
     if (function->kind != PORPOISE_ABI_IMPORT) {
         porpoise_diagnostics_add(
@@ -767,12 +149,12 @@ static bool validate_builtin_runtime_adapter(
             0U,
             0U,
             "built-in adapter %s for %s must be an ABI import",
-            contract->name,
+            contract_name,
             function->symbol);
         valid = false;
     }
     if (function->header == NULL ||
-        strcmp(function->header, PORPOISE_BUILTIN_ADAPTER_HEADER) != 0) {
+        strcmp(function->header, contract_header) != 0) {
         porpoise_diagnostics_add(
             diagnostics,
             PORPOISE_SEVERITY_ERROR,
@@ -780,12 +162,12 @@ static bool validate_builtin_runtime_adapter(
             0U,
             0U,
             "built-in adapter %s for %s must use header %s",
-            contract->name,
+            contract_name,
             function->symbol,
-            PORPOISE_BUILTIN_ADAPTER_HEADER);
+            contract_header);
         valid = false;
     }
-    if (!abi_value_matches_builtin(&function->result, &contract->result)) {
+    if (!abi_value_matches_builtin(&function->result, expected_result)) {
         porpoise_diagnostics_add(
             diagnostics,
             PORPOISE_SEVERITY_ERROR,
@@ -793,17 +175,17 @@ static bool validate_builtin_runtime_adapter(
             0U,
             0U,
             "built-in adapter %s for %s has return mapping %s %s%u; expected %s %s%u",
-            contract->name,
+            contract_name,
             function->symbol,
             porpoise_abi_type_name(function->result.type),
             abi_register_class_name(function->result.register_class),
             function->result.register_index,
-            porpoise_abi_type_name(contract->result.type),
-            abi_register_class_name(contract->result.register_class),
-            contract->result.register_index);
+            porpoise_abi_type_name(expected_result->type),
+            abi_register_class_name(expected_result->register_class),
+            expected_result->register_index);
         valid = false;
     }
-    if (function->argument_count != contract->argument_count) {
+    if (function->argument_count != contract_argument_count) {
         porpoise_diagnostics_add(
             diagnostics,
             PORPOISE_SEVERITY_ERROR,
@@ -811,21 +193,21 @@ static bool validate_builtin_runtime_adapter(
             0U,
             0U,
             "built-in adapter %s for %s has %lu ABI arguments; expected %lu",
-            contract->name,
+            contract_name,
             function->symbol,
             (unsigned long)function->argument_count,
-            (unsigned long)contract->argument_count);
+            (unsigned long)contract_argument_count);
         valid = false;
     }
 
     for (argument_index = 0U;
          argument_index < function->argument_count &&
-         argument_index < contract->argument_count;
+         argument_index < contract_argument_count;
          argument_index++) {
         const PorpoiseAbiValue *argument =
             &function->arguments[argument_index];
-        const PorpoiseBuiltinAbiValue *expected =
-            &contract->arguments[argument_index];
+        const PorpoiseSdkAbiValue *expected =
+            porpoise_sdk_contract_argument_at(contract, argument_index);
 
         if (abi_value_matches_builtin(argument, expected)) continue;
         porpoise_diagnostics_add(
@@ -835,7 +217,7 @@ static bool validate_builtin_runtime_adapter(
             0U,
             0U,
             "built-in adapter %s for %s has argument %lu mapping %s %s%u; expected %s %s%u",
-            contract->name,
+            contract_name,
             function->symbol,
             (unsigned long)(argument_index + 1U),
             porpoise_abi_type_name(argument->type),
@@ -852,7 +234,7 @@ static bool validate_builtin_runtime_adapter(
 static bool validate_builtin_runtime_containment(
     const PorpoiseAbiFunction *function,
     PorpoiseDiagnostics *diagnostics) {
-    const PorpoiseBuiltinAdapterContract *contract;
+    const PorpoiseSdkContract *contract;
     const char *callable;
     const char *callable_role;
 
@@ -861,7 +243,9 @@ static bool validate_builtin_runtime_containment(
     contract = builtin_native_callable_contract(function->symbol);
     if (contract != NULL) {
         if (function->adapter != NULL &&
-            strcmp(function->adapter, contract->name) == 0) {
+            strcmp(
+                function->adapter,
+                porpoise_sdk_contract_host_callable(contract)) == 0) {
             return true;
         }
         porpoise_diagnostics_add(
@@ -872,7 +256,7 @@ static bool validate_builtin_runtime_containment(
             0U,
             "ABI import %s must use built-in adapter %s; typed wrappers and other adapters bypass required guest ABI marshalling",
             function->symbol,
-            contract->name);
+            porpoise_sdk_contract_host_callable(contract));
         return false;
     }
 
@@ -891,9 +275,9 @@ static bool validate_builtin_runtime_containment(
         0U,
         "ABI import %s cannot use protected native callable %s as its %s; use built-in adapter %s",
         function->symbol,
-        contract->native_callable,
+        porpoise_sdk_contract_canonical_name(contract),
         callable_role,
-        contract->name);
+        porpoise_sdk_contract_host_callable(contract));
     return false;
 }
 

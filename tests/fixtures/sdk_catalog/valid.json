@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "signature_algorithm_version": 1,
+  "entries": [
+    {
+      "canonical_identity": "sdk:OSReport",
+      "category": "nintendo_dolphin",
+      "contract": "OSReport",
+      "signature": {
+        "sha256": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "function_size": 32,
+        "instruction_count": 8,
+        "fixed_instruction_count": 5,
+        "meaningful_fixed_words": 4,
+        "relocation_count": 2,
+        "internal_branch_count": 1,
+        "external_branch_count": 1,
+        "external_target_count": 2,
+        "issue_flags": 0
+      }
+    },
+    {
+      "canonical_identity": "sdk:OSReport",
+      "category": "nintendo_dolphin",
+      "contract": "OSReport",
+      "signature": {
+        "sha256": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "function_size": 32,
+        "instruction_count": 8,
+        "fixed_instruction_count": 5,
+        "meaningful_fixed_words": 4,
+        "relocation_count": 2,
+        "internal_branch_count": 1,
+        "external_branch_count": 1,
+        "external_target_count": 2,
+        "issue_flags": 0
+      }
+    },
+    {
+      "canonical_identity": "sdk:DEMOInit",
+      "category": "demo",
+      "signature": {
+        "sha256": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+        "function_size": 40,
+        "instruction_count": 10,
+        "fixed_instruction_count": 7,
+        "meaningful_fixed_words": 5,
+        "relocation_count": 2,
+        "internal_branch_count": 1,
+        "external_branch_count": 1,
+        "external_target_count": 2,
+        "issue_flags": 0
+      }
+    }
+  ]
+}

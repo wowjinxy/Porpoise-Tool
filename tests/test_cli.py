@@ -73,6 +73,24 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     assert "0.2.0" in run(TOOL, "--version").stdout
     run(TOOL, expected=2)
     run(TOOL, FIXTURES / "inputs" / "basic", expected=2)
+    run(
+        TOOL,
+        FIXTURES / "inputs" / "basic",
+        "--output",
+        temporary / "invalid-sdk-policy",
+        "--sdk-policy",
+        "fuzzy",
+        expected=2,
+    )
+    run(
+        TOOL,
+        FIXTURES / "inputs" / "basic",
+        "--output",
+        temporary / "unpaired-dtk-splits",
+        "--dtk-splits",
+        temporary / "splits.txt",
+        expected=2,
+    )
     run(TOOL, FIXTURES / "inputs" / "basic", "extra", "--output", temporary / "extra-output", expected=2)
     run(
         TOOL,

@@ -7,6 +7,7 @@
 #define PORPOISE_OPTIONS_H
 
 #include "porpoise/common.h"
+#include "porpoise/plan.h"
 
 #include <stdio.h>
 
@@ -41,7 +42,13 @@ typedef struct PorpoiseOptions {
     char config_path[PORPOISE_PATH_CAPACITY];
     char abi_path[PORPOISE_PATH_CAPACITY];
     char skip_list_path[PORPOISE_PATH_CAPACITY];
+    char map_path[PORPOISE_PATH_CAPACITY];
+    char dtk_symbols_path[PORPOISE_PATH_CAPACITY];
+    char dtk_splits_path[PORPOISE_PATH_CAPACITY];
+    char sdk_catalog_path[PORPOISE_PATH_CAPACITY];
+    char module[PORPOISE_NAME_CAPACITY];
     char entry_symbol[PORPOISE_SYMBOL_CAPACITY];
+    PorpoiseSdkPolicy sdk_policy;
     PorpoiseVerbosity verbosity;
     bool force;
     bool strict;

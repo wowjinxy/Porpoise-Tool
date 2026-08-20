@@ -1,11 +1,12 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
+  "target": {"id": null, "module": null, "plan_digest": null, "sdk_policy": "keep"},
   "data_model": {"source": "annotated_assembly", "chunks": 0},
   "files": [
     {"input": "no_entry.s", "generated": "src/lifted/no_entry.c"}
   ],
   "functions": [
-    {"symbol": "add_one", "c_symbol": "add_one", "file": "no_entry.s", "address": 2147487744, "size": 8, "status": "lifted"}
+    {"symbol": "add_one", "c_symbol": "add_one", "file": "no_entry.s", "address": 2147487744, "size": 8, "status": "lifted", "requested_action": "lift", "resolved_action": "lift", "origin": "default", "canonical_sdk_identity": null, "sdk_category": null, "confidence": "none", "binding": null, "fingerprint": "34b432f4f672632408b5c2f69285e0bf9bd737a92c873068d63c95afb5d83914", "evidence_flags": 0, "conflict": false, "overridden": false, "override_action": "auto", "blocking_reason": null, "provenance": {"map": null, "catalog": null}}
   ],
   "data_objects": [
 

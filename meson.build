@@ -28,6 +28,7 @@ porpoise_core_sources = files(
   'src/abi.c',
   'src/asm_data.c',
   'src/lower.c',
+  'src/operation.c',
   'src/options.c',
   'src/program.c',
   'src/project.c',
@@ -36,6 +37,8 @@ porpoise_core_sources = files(
   'src/report.c',
   'src/session.c',
   'src/sha256.c',
+  'src/sdk_contract.c',
+  'src/sdk_catalog.c',
   'src/signature.c',
   'src/symbol_map.c',
   'src/plan.c',
@@ -59,6 +62,13 @@ porpoise = executable(
   link_with: porpoise_core,
   c_args: porpoise_compile_args,
   install: true,
+)
+
+install_data(
+  'tools/porpoise_sdk_catalog.py',
+  install_dir: get_option('bindir'),
+  rename: 'porpoise-sdk-catalog',
+  install_mode: 'rwxr-xr-x',
 )
 
 install_data(
@@ -781,6 +791,48 @@ signature_test = executable(
   c_args: ['-Werror'],
 )
 test('function-signature', signature_test)
+
+sdk_contract_test = executable(
+  'test_sdk_contract',
+  'tests/test_sdk_contract.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test('sdk-contract', sdk_contract_test)
+
+sdk_catalog_test = executable(
+  'test_sdk_catalog',
+  'tests/test_sdk_catalog.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test(
+  'sdk-catalog',
+  sdk_catalog_test,
+  args: [meson.project_source_root()],
+)
+
+test(
+  'sdk-catalog-tool',
+  python,
+  args: [files('tests/test_sdk_catalog_tool.py')],
+  timeout: 180,
+)
+
+sdk_policy_test = executable(
+  'test_sdk_policy',
+  'tests/test_sdk_policy.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test(
+  'sdk-policy',
+  sdk_policy_test,
+  args: [meson.project_source_root()],
+)
 
 symbol_map_test = executable(
   'test_symbol_map',

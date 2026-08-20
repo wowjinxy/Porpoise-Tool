@@ -7,14 +7,23 @@
 struct PorpoiseTranslationPlan {
     const PorpoiseSession *session;
     PorpoiseSdkPolicy sdk_policy;
+    char *target_id;
+    char *module;
+    char digest_hex[PORPOISE_SHA256_HEX_SIZE];
     PorpoiseAnalysis analysis;
+    PorpoiseAbiManifest effective_abi;
+    size_t effective_abi_capacity;
     PorpoiseFunctionPlanView *functions;
     size_t function_count;
     const PorpoiseFunctionPlanView *entry;
+    bool blocked;
+    const char *blocking_reason;
 };
 
 /* Internal bridge for the legacy project generator. */
 const PorpoiseAnalysis *porpoise_plan_analysis_snapshot(
+    const PorpoiseTranslationPlan *plan);
+const PorpoiseAbiManifest *porpoise_plan_effective_abi(
     const PorpoiseTranslationPlan *plan);
 
 #endif

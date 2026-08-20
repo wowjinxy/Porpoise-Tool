@@ -1,7 +1,24 @@
 #include "plan_internal.h"
 
+#include "porpoise/sdk_contract.h"
+#include "porpoise/sha256.h"
+#include "porpoise/util.h"
+
+#include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static const char *const BLOCK_CONFLICT =
+    "map and exact signature evidence conflict";
+static const char *const BLOCK_OVERRIDE_CONFLICT =
+    "manual action must explicitly acknowledge conflicting evidence";
+static const char *const BLOCK_IMPORT_CONTRACT =
+    "selected import has no valid host contract";
+static const char *const BLOCK_INPUT_DATA =
+    "an assembly data region cannot be reclassified as code";
+static const char *const BLOCK_SKIPPED_LIFT =
+    "a skip-list function cannot be lifted by an override";
 
 void porpoise_plan_options_init(PorpoisePlanOptions *options) {
     if (options == NULL) return;
@@ -13,6 +30,14 @@ static bool sdk_policy_valid(PorpoiseSdkPolicy policy) {
     return policy == PORPOISE_SDK_POLICY_KEEP ||
            policy == PORPOISE_SDK_POLICY_IMPORTED ||
            policy == PORPOISE_SDK_POLICY_OMIT;
+}
+
+static bool override_action_valid(PorpoiseOverrideAction action) {
+    return action == PORPOISE_OVERRIDE_AUTO ||
+           action == PORPOISE_OVERRIDE_LIFT ||
+           action == PORPOISE_OVERRIDE_IMPORT ||
+           action == PORPOISE_OVERRIDE_OMIT ||
+           action == PORPOISE_OVERRIDE_TREAT_AS_DATA;
 }
 
 static int plan_error(
@@ -30,6 +55,17 @@ static int plan_error(
             message);
     }
     return result;
+}
+
+static int plan_cancelled(PorpoiseDiagnostics *diagnostics) {
+    porpoise_diagnostics_add(
+        diagnostics,
+        PORPOISE_SEVERITY_INFO,
+        NULL,
+        0U,
+        0U,
+        "translation planning was cancelled");
+    return PORPOISE_EXIT_CANCELLED;
 }
 
 static const PorpoiseImportBinding *find_import_binding(
@@ -58,19 +94,344 @@ static bool count_program_functions(
     return true;
 }
 
-static void populate_function_view(
+static void free_abi_value(PorpoiseAbiValue *value) {
+    if (value == NULL) return;
+    free(value->name);
+    memset(value, 0, sizeof(*value));
+}
+
+static void free_abi_function(PorpoiseAbiFunction *function) {
+    size_t index;
+    if (function == NULL) return;
+    free(function->symbol);
+    free(function->wrapper);
+    free(function->header);
+    free(function->adapter);
+    free_abi_value(&function->result);
+    for (index = 0U; index < function->argument_count; index++) {
+        free_abi_value(&function->arguments[index]);
+    }
+    free(function->arguments);
+    memset(function, 0, sizeof(*function));
+}
+
+static bool clone_optional_string(char **output, const char *value) {
+    *output = value == NULL ? NULL : porpoise_strdup(value);
+    return value == NULL || *output != NULL;
+}
+
+static bool clone_abi_value(
+    PorpoiseAbiValue *output,
+    const PorpoiseAbiValue *input) {
+    memset(output, 0, sizeof(*output));
+    output->type = input->type;
+    output->register_class = input->register_class;
+    output->register_index = input->register_index;
+    return clone_optional_string(&output->name, input->name);
+}
+
+static bool clone_abi_function(
+    PorpoiseAbiFunction *output,
+    const PorpoiseAbiFunction *input) {
+    size_t index;
+    memset(output, 0, sizeof(*output));
+    output->kind = input->kind;
+    if (!clone_optional_string(&output->symbol, input->symbol) ||
+        !clone_optional_string(&output->wrapper, input->wrapper) ||
+        !clone_optional_string(&output->header, input->header) ||
+        !clone_optional_string(&output->adapter, input->adapter) ||
+        !clone_abi_value(&output->result, &input->result)) {
+        free_abi_function(output);
+        return false;
+    }
+    if (input->argument_count != 0U) {
+        if (input->argument_count > SIZE_MAX / sizeof(*output->arguments)) {
+            free_abi_function(output);
+            return false;
+        }
+        output->arguments = (PorpoiseAbiValue *)calloc(
+            input->argument_count, sizeof(*output->arguments));
+        if (output->arguments == NULL) {
+            free_abi_function(output);
+            return false;
+        }
+    }
+    for (index = 0U; index < input->argument_count; index++) {
+        if (!clone_abi_value(
+                &output->arguments[index], &input->arguments[index])) {
+            output->argument_count = index + 1U;
+            free_abi_function(output);
+            return false;
+        }
+        output->argument_count++;
+    }
+    return true;
+}
+
+static bool initialize_effective_abi(
+    PorpoiseTranslationPlan *plan,
+    const PorpoiseAbiManifest *source) {
+    size_t index;
+    size_t capacity;
+    porpoise_abi_init(&plan->effective_abi);
+    if (source->function_count > SIZE_MAX - plan->function_count) {
+        return false;
+    }
+    capacity = source->function_count + plan->function_count;
+    if (capacity != 0U) {
+        plan->effective_abi.functions = (PorpoiseAbiFunction *)calloc(
+            capacity, sizeof(*plan->effective_abi.functions));
+        if (plan->effective_abi.functions == NULL) return false;
+    }
+    plan->effective_abi_capacity = capacity;
+    for (index = 0U; index < source->function_count; index++) {
+        PorpoiseAbiFunction *target =
+            &plan->effective_abi.functions[plan->effective_abi.function_count];
+        if (!clone_abi_function(target, &source->functions[index])) {
+            return false;
+        }
+        plan->effective_abi.function_count++;
+    }
+    return true;
+}
+
+static const PorpoiseAbiFunction *find_effective_import(
+    const PorpoiseTranslationPlan *plan,
+    const char *symbol) {
+    return porpoise_abi_find_import(&plan->effective_abi, symbol);
+}
+
+static const PorpoiseAbiFunction *append_contract_import(
+    PorpoiseTranslationPlan *plan,
+    const PorpoiseSdkContract *contract,
+    const char *symbol) {
+    PorpoiseAbiFunction *function;
+    const PorpoiseSdkAbiValue *sdk_value;
+    const PorpoiseAbiFunction *existing;
+    size_t index;
+    existing = find_effective_import(plan, symbol);
+    if (existing != NULL) {
+        return porpoise_sdk_contract_binding_matches(contract, existing)
+                   ? existing
+                   : NULL;
+    }
+    if (contract == NULL || symbol == NULL || symbol[0] == '\0' ||
+        plan->effective_abi.function_count >= plan->effective_abi_capacity) {
+        return NULL;
+    }
+    function = &plan->effective_abi.functions[
+        plan->effective_abi.function_count];
+    memset(function, 0, sizeof(*function));
+    function->kind = PORPOISE_ABI_IMPORT;
+    function->symbol = porpoise_strdup(symbol);
+    function->wrapper = porpoise_strdup(symbol);
+    function->header = porpoise_strdup(
+        porpoise_sdk_contract_host_header(contract));
+    if (porpoise_sdk_contract_host_binding_kind(contract) ==
+        PORPOISE_SDK_HOST_BINDING_SPECIALIZED_ADAPTER) {
+        function->adapter = porpoise_strdup(
+            porpoise_sdk_contract_host_callable(contract));
+    } else if (porpoise_sdk_contract_host_binding_kind(contract) ==
+               PORPOISE_SDK_HOST_BINDING_DIRECT_CALL) {
+        free(function->wrapper);
+        function->wrapper = porpoise_strdup(
+            porpoise_sdk_contract_host_callable(contract));
+    }
+    if (function->symbol == NULL || function->wrapper == NULL ||
+        (porpoise_sdk_contract_host_header(contract) != NULL &&
+         function->header == NULL) ||
+        (porpoise_sdk_contract_host_binding_kind(contract) ==
+             PORPOISE_SDK_HOST_BINDING_SPECIALIZED_ADAPTER &&
+         function->adapter == NULL)) {
+        free_abi_function(function);
+        return NULL;
+    }
+    sdk_value = porpoise_sdk_contract_result(contract);
+    if (sdk_value == NULL) {
+        free_abi_function(function);
+        return NULL;
+    }
+    function->result.type = sdk_value->type;
+    function->result.register_class = sdk_value->register_class;
+    function->result.register_index = sdk_value->register_index;
+    function->argument_count = porpoise_sdk_contract_argument_count(contract);
+    if (function->argument_count != 0U) {
+        function->arguments = (PorpoiseAbiValue *)calloc(
+            function->argument_count, sizeof(*function->arguments));
+        if (function->arguments == NULL) {
+            free_abi_function(function);
+            return NULL;
+        }
+    }
+    for (index = 0U; index < function->argument_count; index++) {
+        char name[32];
+        sdk_value = porpoise_sdk_contract_argument_at(contract, index);
+        if (sdk_value == NULL ||
+            !porpoise_format(
+                name, sizeof(name), "argument_%lu", (unsigned long)index)) {
+            free_abi_function(function);
+            return NULL;
+        }
+        function->arguments[index].type = sdk_value->type;
+        function->arguments[index].register_class = sdk_value->register_class;
+        function->arguments[index].register_index = sdk_value->register_index;
+        function->arguments[index].name = porpoise_strdup(name);
+        if (function->arguments[index].name == NULL) {
+            free_abi_function(function);
+            return NULL;
+        }
+    }
+    plan->effective_abi.function_count++;
+    return function;
+}
+
+static int ascii_case_compare(const char *left, const char *right) {
+    while (*left != '\0' && *right != '\0') {
+        int a = tolower((unsigned char)*left++);
+        int b = tolower((unsigned char)*right++);
+        if (a != b) return a - b;
+    }
+    return (unsigned char)*left - (unsigned char)*right;
+}
+
+static bool string_in_list(
+    const char *value,
+    const char *const *values,
+    size_t count) {
+    size_t index;
+    if (value == NULL) return false;
+    for (index = 0U; index < count; index++) {
+        if (ascii_case_compare(value, values[index]) == 0) return true;
+    }
+    return false;
+}
+
+static bool map_library_category(
+    const char *library,
+    PorpoiseSdkCategory *category_out) {
+    static const char *const nintendo[] = {
+        "ai.a", "base.a", "dvd.a", "exi.a", "gx.a", "mtx.a",
+        "os.a", "pad.a", "si.a", "vi.a", "ar.a", "card.a",
+        "dsp.a", "thp.a", "db.a"
+    };
+    static const char *const crt_msl[] = {
+        "MSL_C.PPCEABI.bare.H.a", "MSL_C.PPCEABI.H.a"
+    };
+    static const char *const runtime[] = {
+        "Runtime.PPCEABI.H.a", "Runtime.PPCEABI.a"
+    };
+    static const char *const trk[] = {
+        "TRK_MINNOW_DOLPHIN.a", "MetroTRK.a"
+    };
+    static const char *const stubs[] = {"amcstubs.a", "odemustubs.a"};
+    if (library == NULL || category_out == NULL) return false;
+    if (ascii_case_compare(library, "demo.a") == 0) {
+        *category_out = PORPOISE_SDK_CATEGORY_DEMO;
+    } else if (string_in_list(
+                   library, nintendo,
+                   sizeof(nintendo) / sizeof(nintendo[0]))) {
+        *category_out = PORPOISE_SDK_CATEGORY_NINTENDO_DOLPHIN;
+    } else if (string_in_list(
+                   library, crt_msl, sizeof(crt_msl) / sizeof(crt_msl[0]))) {
+        *category_out = PORPOISE_SDK_CATEGORY_CRT_MSL;
+    } else if (string_in_list(
+                   library, runtime,
+                   sizeof(runtime) / sizeof(runtime[0]))) {
+        *category_out = PORPOISE_SDK_CATEGORY_RUNTIME;
+    } else if (string_in_list(
+                   library, trk, sizeof(trk) / sizeof(trk[0]))) {
+        *category_out = PORPOISE_SDK_CATEGORY_METROTRK;
+    } else if (string_in_list(
+                   library, stubs, sizeof(stubs) / sizeof(stubs[0]))) {
+        *category_out = PORPOISE_SDK_CATEGORY_STUB;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool optional_string_equal(const char *left, const char *right) {
+    if (left == NULL || left[0] == '\0') left = NULL;
+    if (right == NULL || right[0] == '\0') right = NULL;
+    return left == right ||
+           (left != NULL && right != NULL && strcmp(left, right) == 0);
+}
+
+static bool symbol_matches_function_address(
+    const PorpoiseSymbol *symbol,
+    const char *module,
+    const PorpoiseFunction *function) {
+    return symbol->used && symbol->has_address &&
+           symbol->address == function->start_address &&
+           (module == NULL || module[0] == '\0' ||
+            optional_string_equal(symbol->module, module)) &&
+           (symbol->kind == PORPOISE_SYMBOL_KIND_FUNCTION ||
+            symbol->kind == PORPOISE_SYMBOL_KIND_UNKNOWN ||
+            symbol->kind == PORPOISE_SYMBOL_KIND_LABEL);
+}
+
+static const PorpoiseSymbol *select_map_symbol(
+    const PorpoiseSymbolCatalog *catalog,
+    const char *module,
+    const PorpoiseFunction *function,
+    const PorpoiseSdkCatalogEntry *sdk_entry,
+    bool *has_map_evidence,
+    bool *canonical_name_seen) {
+    const PorpoiseSymbol *best = NULL;
+    unsigned int best_score = 0U;
+    size_t index;
+    *has_map_evidence = false;
+    *canonical_name_seen = false;
+    if (catalog == NULL) return NULL;
+    for (index = 0U; index < catalog->symbol_count; index++) {
+        const PorpoiseSymbol *symbol = &catalog->symbols[index];
+        unsigned int score = 1U;
+        if (!symbol_matches_function_address(symbol, module, function)) {
+            continue;
+        }
+        *has_map_evidence = true;
+        if (sdk_entry != NULL &&
+            strcmp(symbol->name, sdk_entry->canonical_identity) == 0) {
+            *canonical_name_seen = true;
+            score += 100U;
+        }
+        if (strcmp(symbol->name, function->name) == 0) score += 80U;
+        if (symbol->kind == PORPOISE_SYMBOL_KIND_FUNCTION) score += 20U;
+        if (symbol->has_size && symbol->size == function->size) score += 10U;
+        if (symbol->library != NULL) score += 5U;
+        if (best == NULL || score > best_score) {
+            best = symbol;
+            best_score = score;
+        }
+    }
+    return best;
+}
+
+static const PorpoiseSdkContract *contract_for_entry(
+    const PorpoiseSdkCatalogEntry *entry,
+    const char *override_name) {
+    const char *name = override_name;
+    if ((name == NULL || name[0] == '\0') && entry != NULL) {
+        name = entry->contract_name != NULL
+                   ? entry->contract_name
+                   : entry->canonical_identity;
+    }
+    return porpoise_sdk_contract_find_by_canonical_name(name);
+}
+
+static void populate_legacy_action(
     PorpoiseFunctionPlanView *view,
     const PorpoiseSourceFile *source,
     const PorpoiseFunction *function,
-    const PorpoiseAnalysis *analysis) {
+    const PorpoiseAnalysis *analysis,
+    const PorpoiseTranslationPlan *plan) {
     const PorpoiseImportBinding *binding =
         find_import_binding(analysis, function);
-
     memset(view, 0, sizeof(*view));
     view->source = source;
     view->function = function;
     view->binding_address = function->start_address;
-
+    view->override_action = PORPOISE_OVERRIDE_AUTO;
     if (function->data_region) {
         view->action = PORPOISE_PLAN_ACTION_DATA;
         view->origin = PORPOISE_PLAN_ORIGIN_INPUT_DATA;
@@ -80,13 +441,304 @@ static void populate_function_view(
     } else if (binding != NULL) {
         view->action = PORPOISE_PLAN_ACTION_IMPORT;
         view->origin = PORPOISE_PLAN_ORIGIN_ABI_IMPORT;
-        view->binding = binding->import;
+        view->binding = find_effective_import(plan, binding->import->symbol);
         view->binding_alias = binding->alias;
         view->binding_address = binding->guest_address;
+        view->contract_name = binding->import->symbol;
     } else {
         view->action = PORPOISE_PLAN_ACTION_OMIT;
         view->origin = PORPOISE_PLAN_ORIGIN_SKIP_LIST;
     }
+    view->requested_action = view->action;
+}
+
+static void mark_view_blocked(
+    PorpoiseTranslationPlan *plan,
+    PorpoiseFunctionPlanView *view,
+    const char *reason) {
+    view->blocked = true;
+    view->blocking_reason = reason;
+    plan->blocked = true;
+    if (plan->blocking_reason == NULL) plan->blocking_reason = reason;
+}
+
+static void populate_sdk_evidence(
+    PorpoiseTranslationPlan *plan,
+    PorpoiseFunctionPlanView *view,
+    const PorpoisePlanOptions *options,
+    PorpoiseDiagnostics *diagnostics) {
+    const PorpoiseSdkCatalog *sdk_catalog =
+        porpoise_session_sdk_catalog(plan->session);
+    const PorpoiseSymbolCatalog *symbols =
+        porpoise_session_symbols(plan->session);
+    PorpoiseSdkCatalogMatch match;
+    const PorpoiseSdkContract *contract = NULL;
+    bool signature_eligible;
+    bool has_map_evidence;
+    bool canonical_name_seen;
+    bool conflict = false;
+    PorpoiseSdkCategory map_category;
+    bool has_map_category = false;
+
+    if (!porpoise_signature_compute(
+            porpoise_session_program(plan->session),
+            view->function,
+            &view->signature)) {
+        return;
+    }
+    signature_eligible =
+        porpoise_signature_is_automatic_match_eligible(&view->signature);
+    match = porpoise_sdk_catalog_lookup_exact(
+        sdk_catalog, &view->signature);
+    if (match.status == PORPOISE_SDK_CATALOG_MATCH_UNIQUE) {
+        view->sdk_entry = match.entry;
+        view->canonical_sdk_identity = match.entry->canonical_identity;
+        view->sdk_category = match.entry->category;
+        view->has_sdk_category = true;
+        view->evidence_flags |= PORPOISE_PLAN_EVIDENCE_SIGNATURE;
+        if (signature_eligible) {
+            view->confidence = PORPOISE_MATCH_CONFIDENCE_EXACT;
+        }
+    } else if (match.status == PORPOISE_SDK_CATALOG_MATCH_AMBIGUOUS) {
+        view->evidence_flags |=
+            PORPOISE_PLAN_EVIDENCE_AMBIGUOUS_SIGNATURE;
+    }
+    view->map_symbol = select_map_symbol(
+        symbols,
+        options->module,
+        view->function,
+        view->sdk_entry,
+        &has_map_evidence,
+        &canonical_name_seen);
+    if (has_map_evidence) {
+        view->evidence_flags |= PORPOISE_PLAN_EVIDENCE_MAP;
+        if (view->confidence == PORPOISE_MATCH_CONFIDENCE_NONE) {
+            view->confidence = PORPOISE_MATCH_CONFIDENCE_MAP_ONLY;
+        }
+    }
+    if (view->map_symbol != NULL) {
+        has_map_category = map_library_category(
+            view->map_symbol->library, &map_category);
+        if (!view->has_sdk_category && has_map_category) {
+            view->sdk_category = map_category;
+            view->has_sdk_category = true;
+            view->canonical_sdk_identity = view->map_symbol->name;
+        }
+        if (view->map_symbol->has_size && view->map_symbol->size != 0U &&
+            view->map_symbol->size != view->function->size) {
+            conflict = true;
+        }
+    }
+    if (view->sdk_entry != NULL && has_map_evidence &&
+        !canonical_name_seen) {
+        conflict = true;
+    }
+    if (view->sdk_entry != NULL && has_map_category &&
+        map_category != view->sdk_entry->category) {
+        conflict = true;
+    }
+    if (conflict) {
+        view->evidence_flags |= PORPOISE_PLAN_EVIDENCE_CONFLICT;
+        if (options->sdk_policy == PORPOISE_SDK_POLICY_KEEP) {
+            porpoise_diagnostics_add(
+                diagnostics,
+                PORPOISE_SEVERITY_WARNING,
+                view->source->path,
+                0U,
+                view->function->start_address,
+                "map and exact signature evidence disagree for %s; keeping its body",
+                view->function->name);
+        }
+    }
+
+    if (view->action != PORPOISE_PLAN_ACTION_LIFT ||
+        view->sdk_entry == NULL || !signature_eligible ||
+        !porpoise_sdk_category_is_automatic(view->sdk_entry->category)) {
+        return;
+    }
+    contract = contract_for_entry(view->sdk_entry, NULL);
+    if (contract != NULL &&
+        !porpoise_sdk_contract_allows_automatic_import(contract)) {
+        contract = NULL;
+    }
+    if (options->sdk_policy == PORPOISE_SDK_POLICY_IMPORTED &&
+        contract != NULL && !conflict) {
+        view->requested_action = PORPOISE_PLAN_ACTION_IMPORT;
+    } else if (options->sdk_policy == PORPOISE_SDK_POLICY_OMIT &&
+               !conflict) {
+        view->requested_action = contract != NULL
+                                     ? PORPOISE_PLAN_ACTION_IMPORT
+                                     : PORPOISE_PLAN_ACTION_OMIT;
+    }
+    if (conflict && options->sdk_policy != PORPOISE_SDK_POLICY_KEEP) {
+        mark_view_blocked(plan, view, BLOCK_CONFLICT);
+        return;
+    }
+    if (view->requested_action == PORPOISE_PLAN_ACTION_IMPORT) {
+        const PorpoiseAbiFunction *binding = append_contract_import(
+            plan, contract, view->function->name);
+        if (binding == NULL) {
+            mark_view_blocked(plan, view, BLOCK_IMPORT_CONTRACT);
+            return;
+        }
+        view->action = PORPOISE_PLAN_ACTION_IMPORT;
+        view->origin = PORPOISE_PLAN_ORIGIN_SDK_POLICY;
+        view->binding = binding;
+        view->contract_name =
+            porpoise_sdk_contract_canonical_name(contract);
+    } else if (view->requested_action == PORPOISE_PLAN_ACTION_OMIT) {
+        view->action = PORPOISE_PLAN_ACTION_OMIT;
+        view->origin = PORPOISE_PLAN_ORIGIN_SDK_POLICY;
+    }
+}
+
+static bool override_module_matches(
+    const PorpoiseFunctionOverride *override,
+    const char *module) {
+    return override->module == NULL || override->module[0] == '\0' ||
+           optional_string_equal(override->module, module);
+}
+
+static bool override_fingerprint_valid(const char *fingerprint) {
+    size_t index;
+    if (fingerprint == NULL ||
+        strlen(fingerprint) != PORPOISE_SHA256_DIGEST_SIZE * 2U) {
+        return false;
+    }
+    for (index = 0U; fingerprint[index] != '\0'; index++) {
+        if (!isdigit((unsigned char)fingerprint[index]) &&
+            !(fingerprint[index] >= 'a' && fingerprint[index] <= 'f')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool override_locator_matches(
+    const PorpoiseFunctionOverride *override,
+    const char *module,
+    const PorpoiseFunctionPlanView *view) {
+    return override_module_matches(override, module) &&
+           override->address == view->function->start_address &&
+           override->size == view->function->size &&
+           override_fingerprint_valid(override->normalized_fingerprint) &&
+           strcmp(
+               override->normalized_fingerprint,
+               view->signature.digest_hex) == 0;
+}
+
+static void apply_override(
+    PorpoiseTranslationPlan *plan,
+    PorpoiseFunctionPlanView *view,
+    const PorpoiseFunctionOverride *override) {
+    const PorpoiseSdkContract *contract;
+    const PorpoiseAbiFunction *binding;
+    view->overridden = true;
+    view->override_action = override->action;
+    view->evidence_flags |= PORPOISE_PLAN_EVIDENCE_OVERRIDE;
+    if ((view->evidence_flags & PORPOISE_PLAN_EVIDENCE_CONFLICT) != 0U &&
+        override->action != PORPOISE_OVERRIDE_AUTO &&
+        !override->acknowledge_conflict) {
+        mark_view_blocked(plan, view, BLOCK_OVERRIDE_CONFLICT);
+        return;
+    }
+    if ((view->evidence_flags & PORPOISE_PLAN_EVIDENCE_CONFLICT) != 0U &&
+        override->action != PORPOISE_OVERRIDE_AUTO &&
+        override->acknowledge_conflict &&
+        view->blocking_reason == BLOCK_CONFLICT) {
+        view->blocked = false;
+        view->blocking_reason = NULL;
+    }
+    if (override->action == PORPOISE_OVERRIDE_AUTO) return;
+    view->binding = NULL;
+    view->binding_alias = NULL;
+    view->contract_name = NULL;
+    view->origin = PORPOISE_PLAN_ORIGIN_MANUAL_OVERRIDE;
+    switch (override->action) {
+        case PORPOISE_OVERRIDE_LIFT:
+            if (view->function->data_region) {
+                mark_view_blocked(plan, view, BLOCK_INPUT_DATA);
+            } else if (view->function->skipped) {
+                mark_view_blocked(plan, view, BLOCK_SKIPPED_LIFT);
+            } else {
+                view->action = PORPOISE_PLAN_ACTION_LIFT;
+            }
+            break;
+        case PORPOISE_OVERRIDE_IMPORT:
+            contract = contract_for_entry(
+                view->sdk_entry, override->contract_name);
+            binding = append_contract_import(
+                plan, contract, view->function->name);
+            if (contract == NULL || binding == NULL) {
+                mark_view_blocked(plan, view, BLOCK_IMPORT_CONTRACT);
+            } else {
+                view->action = PORPOISE_PLAN_ACTION_IMPORT;
+                view->binding = binding;
+                view->contract_name =
+                    porpoise_sdk_contract_canonical_name(contract);
+            }
+            break;
+        case PORPOISE_OVERRIDE_OMIT:
+            if (view->function->data_region) {
+                mark_view_blocked(plan, view, BLOCK_INPUT_DATA);
+            } else {
+                view->action = PORPOISE_PLAN_ACTION_OMIT;
+            }
+            break;
+        case PORPOISE_OVERRIDE_TREAT_AS_DATA:
+            if (view->function->data_region) {
+                view->action = PORPOISE_PLAN_ACTION_DATA;
+            } else {
+                view->action = PORPOISE_PLAN_ACTION_DATA;
+            }
+            break;
+        case PORPOISE_OVERRIDE_AUTO:
+        default:
+            break;
+    }
+}
+
+static void hash_u32(PorpoiseSha256Context *hash, uint32_t value) {
+    uint8_t bytes[4];
+    bytes[0] = (uint8_t)(value >> 24U);
+    bytes[1] = (uint8_t)(value >> 16U);
+    bytes[2] = (uint8_t)(value >> 8U);
+    bytes[3] = (uint8_t)value;
+    porpoise_sha256_update(hash, bytes, sizeof(bytes));
+}
+
+static void hash_string(PorpoiseSha256Context *hash, const char *value) {
+    size_t length = value == NULL ? 0U : strlen(value);
+    hash_u32(hash, (uint32_t)length);
+    if (length != 0U) porpoise_sha256_update(hash, value, length);
+}
+
+static void compute_plan_digest(PorpoiseTranslationPlan *plan) {
+    PorpoiseSha256Context hash;
+    uint8_t digest[PORPOISE_SHA256_DIGEST_SIZE];
+    size_t index;
+    porpoise_sha256_init(&hash);
+    hash_string(&hash, "porpoise-translation-plan-v1");
+    hash_string(&hash, plan->target_id);
+    hash_string(&hash, plan->module);
+    hash_u32(&hash, (uint32_t)plan->sdk_policy);
+    for (index = 0U; index < plan->function_count; index++) {
+        const PorpoiseFunctionPlanView *view = &plan->functions[index];
+        hash_string(&hash, view->source->relative_path);
+        hash_string(&hash, view->function->name);
+        hash_u32(&hash, view->function->start_address);
+        hash_u32(&hash, view->function->size);
+        hash_u32(&hash, (uint32_t)view->requested_action);
+        hash_u32(&hash, (uint32_t)view->action);
+        hash_u32(&hash, view->evidence_flags);
+        porpoise_sha256_update(
+            &hash, view->signature.digest,
+            sizeof(view->signature.digest));
+        hash_string(&hash, view->canonical_sdk_identity);
+        hash_string(&hash, view->contract_name);
+    }
+    porpoise_sha256_final(&hash, digest);
+    porpoise_sha256_hex(digest, plan->digest_hex);
 }
 
 int porpoise_plan_build(
@@ -98,18 +750,17 @@ int porpoise_plan_build(
     PorpoiseTranslationPlan *plan;
     const PorpoiseProgram *program;
     const PorpoiseAbiManifest *abi;
+    bool *matched_overrides = NULL;
     size_t file_index;
     size_t view_index = 0U;
+    size_t override_index;
     int result;
 
-    if (plan_out == NULL || diagnostics == NULL) {
-        return PORPOISE_EXIT_INTERNAL;
-    }
+    if (plan_out == NULL || diagnostics == NULL) return PORPOISE_EXIT_INTERNAL;
     *plan_out = NULL;
     if (session == NULL) {
         return plan_error(
-            diagnostics,
-            PORPOISE_EXIT_INTERNAL,
+            diagnostics, PORPOISE_EXIT_INTERNAL,
             "recovery session is required to build a translation plan");
     }
     if (options == NULL) {
@@ -118,49 +769,71 @@ int porpoise_plan_build(
     }
     if (!sdk_policy_valid(options->sdk_policy)) {
         return plan_error(
-            diagnostics,
-            PORPOISE_EXIT_USAGE,
+            diagnostics, PORPOISE_EXIT_USAGE,
             "translation plan contains an invalid SDK policy");
     }
-
+    if (options->override_count != 0U && options->overrides == NULL) {
+        return plan_error(
+            diagnostics, PORPOISE_EXIT_USAGE,
+            "translation plan override array is inconsistent");
+    }
+    for (override_index = 0U;
+         override_index < options->override_count;
+         override_index++) {
+        if (!override_action_valid(options->overrides[override_index].action) ||
+            !override_fingerprint_valid(
+                options->overrides[override_index].normalized_fingerprint)) {
+            return plan_error(
+                diagnostics, PORPOISE_EXIT_USAGE,
+                "translation plan contains an invalid override record");
+        }
+    }
+    if (porpoise_operation_cancelled(options->operation)) {
+        return plan_cancelled(diagnostics);
+    }
     program = porpoise_session_program(session);
     abi = porpoise_session_abi(session);
     if (program == NULL || abi == NULL) {
         return plan_error(
-            diagnostics,
-            PORPOISE_EXIT_INTERNAL,
+            diagnostics, PORPOISE_EXIT_INTERNAL,
             "recovery session is incomplete");
     }
-
     plan = (PorpoiseTranslationPlan *)calloc(1U, sizeof(*plan));
     if (plan == NULL) {
         return plan_error(
-            diagnostics,
-            PORPOISE_EXIT_INTERNAL,
+            diagnostics, PORPOISE_EXIT_INTERNAL,
             "out of memory while creating translation plan");
     }
     plan->session = session;
     plan->sdk_policy = options->sdk_policy;
-    porpoise_analysis_init(&plan->analysis);
-
-    result = porpoise_analyze_program(
-        program,
-        abi,
-        options->entry_symbol,
-        &plan->analysis,
-        diagnostics);
-    if (result != PORPOISE_EXIT_OK) {
+    plan->target_id = options->target_id == NULL
+                          ? NULL
+                          : porpoise_strdup(options->target_id);
+    plan->module = options->module == NULL
+                       ? NULL
+                       : porpoise_strdup(options->module);
+    if ((options->target_id != NULL && plan->target_id == NULL) ||
+        (options->module != NULL && plan->module == NULL)) {
         porpoise_plan_free(plan);
-        return result;
+        return plan_error(
+            diagnostics, PORPOISE_EXIT_INTERNAL,
+            "out of memory while copying plan identity");
     }
+    porpoise_analysis_init(&plan->analysis);
+    porpoise_abi_init(&plan->effective_abi);
     if (!count_program_functions(program, &plan->function_count) ||
         (plan->function_count != 0U &&
          plan->function_count > SIZE_MAX / sizeof(*plan->functions))) {
         porpoise_plan_free(plan);
         return plan_error(
-            diagnostics,
-            PORPOISE_EXIT_INTERNAL,
+            diagnostics, PORPOISE_EXIT_INTERNAL,
             "too many functions in translation plan");
+    }
+    if (!initialize_effective_abi(plan, abi)) {
+        porpoise_plan_free(plan);
+        return plan_error(
+            diagnostics, PORPOISE_EXIT_INTERNAL,
+            "out of memory while snapshotting the effective ABI");
     }
     if (plan->function_count != 0U) {
         plan->functions = (PorpoiseFunctionPlanView *)calloc(
@@ -168,12 +841,31 @@ int porpoise_plan_build(
         if (plan->functions == NULL) {
             porpoise_plan_free(plan);
             return plan_error(
-                diagnostics,
-                PORPOISE_EXIT_INTERNAL,
+                diagnostics, PORPOISE_EXIT_INTERNAL,
                 "out of memory while snapshotting translation plan");
         }
     }
+    if (options->override_count != 0U) {
+        matched_overrides = (bool *)calloc(
+            options->override_count, sizeof(*matched_overrides));
+        if (matched_overrides == NULL) {
+            porpoise_plan_free(plan);
+            return plan_error(
+                diagnostics, PORPOISE_EXIT_INTERNAL,
+                "out of memory while matching overrides");
+        }
+    }
 
+    porpoise_operation_progress(
+        options->operation, PORPOISE_PHASE_PLAN, 0U,
+        plan->function_count, "analyzing recovery input");
+    result = porpoise_analyze_program(
+        program, abi, options->entry_symbol, &plan->analysis, diagnostics);
+    if (result != PORPOISE_EXIT_OK) {
+        free(matched_overrides);
+        porpoise_plan_free(plan);
+        return result;
+    }
     for (file_index = 0U; file_index < program->file_count; file_index++) {
         const PorpoiseSourceFile *source = &program->files[file_index];
         size_t function_index;
@@ -182,78 +874,135 @@ int porpoise_plan_build(
              function_index++) {
             const PorpoiseFunction *function =
                 &source->functions[function_index];
-            PorpoiseFunctionPlanView *view = &plan->functions[view_index++];
-            populate_function_view(view, source, function, &plan->analysis);
+            PorpoiseFunctionPlanView *view = &plan->functions[view_index];
+            populate_legacy_action(
+                view, source, function, &plan->analysis, plan);
+            populate_sdk_evidence(plan, view, options, diagnostics);
+            for (override_index = 0U;
+                 override_index < options->override_count;
+                 override_index++) {
+                if (!override_locator_matches(
+                        &options->overrides[override_index],
+                        options->module,
+                        view)) {
+                    continue;
+                }
+                if (matched_overrides[override_index]) {
+                    mark_view_blocked(
+                        plan, view,
+                        "override locator matches more than one function");
+                    continue;
+                }
+                matched_overrides[override_index] = true;
+                apply_override(
+                    plan, view, &options->overrides[override_index]);
+            }
             if (function == plan->analysis.entry) plan->entry = view;
+            view_index++;
+            porpoise_operation_progress(
+                options->operation,
+                PORPOISE_PHASE_SIGNATURES,
+                view_index,
+                plan->function_count,
+                function->name);
+            if (porpoise_operation_cancelled(options->operation)) {
+                free(matched_overrides);
+                porpoise_plan_free(plan);
+                return plan_cancelled(diagnostics);
+            }
         }
     }
-
-    result = porpoise_plan_validate(plan, diagnostics);
-    if (result != PORPOISE_EXIT_OK) {
-        porpoise_plan_free(plan);
-        return result;
+    plan->blocked = false;
+    plan->blocking_reason = NULL;
+    for (view_index = 0U; view_index < plan->function_count; view_index++) {
+        if (plan->functions[view_index].blocked) {
+            plan->blocked = true;
+            if (plan->blocking_reason == NULL) {
+                plan->blocking_reason =
+                    plan->functions[view_index].blocking_reason;
+            }
+        }
     }
+    for (override_index = 0U;
+         override_index < options->override_count;
+         override_index++) {
+        if (!matched_overrides[override_index]) {
+            plan->blocked = true;
+            plan->blocking_reason =
+                "one or more override locators are stale";
+            porpoise_diagnostics_add(
+                diagnostics,
+                PORPOISE_SEVERITY_WARNING,
+                NULL,
+                0U,
+                options->overrides[override_index].address,
+                "override locator is stale or no longer identifies an exact function");
+        }
+    }
+    free(matched_overrides);
+    compute_plan_digest(plan);
+    porpoise_operation_progress(
+        options->operation, PORPOISE_PHASE_PLAN,
+        plan->function_count, plan->function_count,
+        "translation plan ready");
     *plan_out = plan;
     return PORPOISE_EXIT_OK;
 }
 
 void porpoise_plan_free(PorpoiseTranslationPlan *plan) {
     if (plan == NULL) return;
+    free(plan->target_id);
+    free(plan->module);
     free(plan->functions);
+    porpoise_abi_free(&plan->effective_abi);
     porpoise_analysis_free(&plan->analysis);
     free(plan);
-}
-
-static bool binding_matches_view(
-    const PorpoiseAnalysis *analysis,
-    const PorpoiseFunctionPlanView *view) {
-    size_t index;
-    for (index = 0U; index < analysis->import_binding_count; index++) {
-        const PorpoiseImportBinding *binding =
-            &analysis->import_bindings[index];
-        if (binding->owner == view->function &&
-            binding->import == view->binding &&
-            binding->alias == view->binding_alias &&
-            binding->guest_address == view->binding_address) {
-            return true;
-        }
-    }
-    return false;
 }
 
 int porpoise_plan_validate(
     const PorpoiseTranslationPlan *plan,
     PorpoiseDiagnostics *diagnostics) {
     const PorpoiseProgram *program;
+    const PorpoiseAbiManifest *session_abi;
     size_t expected_count;
     size_t file_index;
     size_t view_index = 0U;
     size_t lifted_count = 0U;
-
+    bool valid = true;
     if (diagnostics == NULL) return PORPOISE_EXIT_INTERNAL;
     if (plan == NULL || plan->session == NULL) {
         return plan_error(
-            diagnostics,
-            PORPOISE_EXIT_INTERNAL,
+            diagnostics, PORPOISE_EXIT_INTERNAL,
             "translation plan is not initialized");
     }
     if (!sdk_policy_valid(plan->sdk_policy)) {
         return plan_error(
-            diagnostics,
-            PORPOISE_EXIT_INTERNAL,
+            diagnostics, PORPOISE_EXIT_INTERNAL,
             "translation plan SDK policy is corrupt");
     }
     program = porpoise_session_program(plan->session);
-    if (program == NULL ||
+    session_abi = porpoise_session_abi(plan->session);
+    if (program == NULL || session_abi == NULL ||
         !count_program_functions(program, &expected_count) ||
         expected_count != plan->function_count ||
         (expected_count != 0U && plan->functions == NULL)) {
         return plan_error(
-            diagnostics,
-            PORPOISE_EXIT_INTERNAL,
+            diagnostics, PORPOISE_EXIT_INTERNAL,
             "translation plan function snapshot is inconsistent");
     }
-
+    if (plan->blocked) {
+        porpoise_diagnostics_add(
+            diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            NULL,
+            0U,
+            0U,
+            "%s",
+            plan->blocking_reason != NULL
+                ? plan->blocking_reason
+                : "translation plan contains blocking diagnostics");
+        valid = false;
+    }
     for (file_index = 0U; file_index < program->file_count; file_index++) {
         const PorpoiseSourceFile *source = &program->files[file_index];
         size_t function_index;
@@ -264,78 +1013,90 @@ int porpoise_plan_validate(
                 &source->functions[function_index];
             const PorpoiseFunctionPlanView *view =
                 &plan->functions[view_index++];
-            bool valid = false;
-
-            if (view->source != source || view->function != function) {
+            bool action_valid = true;
+            if (view->source != source || view->function != function ||
+                view->binding_address != function->start_address) {
                 return plan_error(
-                    diagnostics,
-                    PORPOISE_EXIT_INTERNAL,
+                    diagnostics, PORPOISE_EXIT_INTERNAL,
                     "translation plan function order is inconsistent");
             }
             switch (view->action) {
                 case PORPOISE_PLAN_ACTION_LIFT:
-                    valid = !function->skipped && !function->data_region &&
-                            view->origin == PORPOISE_PLAN_ORIGIN_DEFAULT &&
-                            view->binding == NULL &&
-                            view->binding_alias == NULL &&
-                            view->binding_address == function->start_address;
-                    if (valid) lifted_count++;
+                    action_valid = !function->data_region &&
+                                   view->binding == NULL;
+                    if (action_valid) lifted_count++;
                     break;
                 case PORPOISE_PLAN_ACTION_DATA:
-                    valid = function->data_region &&
-                            view->origin == PORPOISE_PLAN_ORIGIN_INPUT_DATA &&
-                            view->binding == NULL &&
-                            view->binding_alias == NULL &&
-                            view->binding_address == function->start_address;
+                    action_valid = view->binding == NULL;
                     break;
                 case PORPOISE_PLAN_ACTION_OMIT:
-                    valid = function->skipped && !function->data_region &&
-                            view->origin == PORPOISE_PLAN_ORIGIN_SKIP_LIST &&
-                            view->binding == NULL &&
-                            view->binding_alias == NULL &&
-                            view->binding_address == function->start_address &&
-                            find_import_binding(&plan->analysis, function) == NULL;
+                    action_valid = !function->data_region &&
+                                   view->binding == NULL;
                     break;
                 case PORPOISE_PLAN_ACTION_IMPORT:
-                    valid = function->skipped && !function->data_region &&
-                            view->origin == PORPOISE_PLAN_ORIGIN_ABI_IMPORT &&
-                            view->binding != NULL &&
-                            binding_matches_view(&plan->analysis, view);
+                    action_valid = !function->data_region &&
+                                   view->binding != NULL &&
+                                   view->binding->kind == PORPOISE_ABI_IMPORT;
                     break;
                 default:
-                    valid = false;
+                    action_valid = false;
                     break;
             }
-            if (!valid) {
+            if (view->blocked || !action_valid) {
                 porpoise_diagnostics_add(
                     diagnostics,
                     PORPOISE_SEVERITY_ERROR,
                     source->path,
                     0U,
                     function->start_address,
-                    "translation plan action for %s is inconsistent with its input state",
-                    function->name);
-                return PORPOISE_EXIT_INTERNAL;
+                    "translation plan action for %s is blocked: %s",
+                    function->name,
+                    view->blocking_reason != NULL
+                        ? view->blocking_reason
+                        : "structurally inconsistent action");
+                valid = false;
             }
         }
     }
-
-    if (lifted_count != plan->analysis.translated_function_count) {
-        return plan_error(
-            diagnostics,
-            PORPOISE_EXIT_INTERNAL,
-            "translation plan and analysis function counts disagree");
+    if (lifted_count == 0U) {
+        porpoise_diagnostics_add(
+            diagnostics, PORPOISE_SEVERITY_ERROR,
+            NULL, 0U, 0U, "no functions remain to translate");
+        valid = false;
     }
-    if ((plan->analysis.entry == NULL) != (plan->entry == NULL) ||
-        (plan->entry != NULL &&
-         (plan->entry->function != plan->analysis.entry ||
-          plan->entry->action != PORPOISE_PLAN_ACTION_LIFT))) {
-        return plan_error(
+    if (plan->entry != NULL &&
+        plan->entry->action != PORPOISE_PLAN_ACTION_LIFT) {
+        porpoise_diagnostics_add(
             diagnostics,
-            PORPOISE_EXIT_INTERNAL,
-            "translation plan entry is inconsistent with its analysis");
+            PORPOISE_SEVERITY_ERROR,
+            plan->entry->source->path,
+            0U,
+            plan->entry->function->start_address,
+            "entry point %s must remain lifted",
+            plan->entry->function->name);
+        valid = false;
     }
-    return PORPOISE_EXIT_OK;
+    for (view_index = 0U;
+         view_index < session_abi->function_count;
+         view_index++) {
+        const PorpoiseAbiFunction *abi_function =
+            &session_abi->functions[view_index];
+        const PorpoiseFunctionPlanView *view;
+        if (abi_function->kind != PORPOISE_ABI_EXPORT) continue;
+        view = porpoise_plan_find_function(plan, abi_function->symbol);
+        if (view == NULL || view->action != PORPOISE_PLAN_ACTION_LIFT) {
+            porpoise_diagnostics_add(
+                diagnostics,
+                PORPOISE_SEVERITY_ERROR,
+                NULL,
+                0U,
+                0U,
+                "ABI export %s does not resolve to a lifted function",
+                abi_function->symbol);
+            valid = false;
+        }
+    }
+    return valid ? PORPOISE_EXIT_OK : PORPOISE_EXIT_TRANSLATION;
 }
 
 const PorpoiseSession *porpoise_plan_session(
@@ -378,9 +1139,29 @@ const PorpoiseFunctionPlanView *porpoise_plan_entry(
     return plan == NULL ? NULL : plan->entry;
 }
 
+const char *porpoise_plan_target_id(
+    const PorpoiseTranslationPlan *plan) {
+    return plan == NULL ? NULL : plan->target_id;
+}
+
+const char *porpoise_plan_module(
+    const PorpoiseTranslationPlan *plan) {
+    return plan == NULL ? NULL : plan->module;
+}
+
+const char *porpoise_plan_digest(
+    const PorpoiseTranslationPlan *plan) {
+    return plan == NULL ? NULL : plan->digest_hex;
+}
+
 const PorpoiseAnalysis *porpoise_plan_analysis_snapshot(
     const PorpoiseTranslationPlan *plan) {
     return plan == NULL ? NULL : &plan->analysis;
+}
+
+const PorpoiseAbiManifest *porpoise_plan_effective_abi(
+    const PorpoiseTranslationPlan *plan) {
+    return plan == NULL ? NULL : &plan->effective_abi;
 }
 
 const char *porpoise_sdk_policy_name(PorpoiseSdkPolicy policy) {
@@ -408,6 +1189,29 @@ const char *porpoise_plan_origin_name(PorpoisePlanOrigin origin) {
         case PORPOISE_PLAN_ORIGIN_INPUT_DATA: return "input-data";
         case PORPOISE_PLAN_ORIGIN_SKIP_LIST: return "skip-list";
         case PORPOISE_PLAN_ORIGIN_ABI_IMPORT: return "abi-import";
+        case PORPOISE_PLAN_ORIGIN_SDK_POLICY: return "sdk-policy";
+        case PORPOISE_PLAN_ORIGIN_MANUAL_OVERRIDE: return "manual-override";
+        default: return "unknown";
+    }
+}
+
+const char *porpoise_override_action_name(PorpoiseOverrideAction action) {
+    switch (action) {
+        case PORPOISE_OVERRIDE_AUTO: return "auto";
+        case PORPOISE_OVERRIDE_LIFT: return "lift";
+        case PORPOISE_OVERRIDE_IMPORT: return "import";
+        case PORPOISE_OVERRIDE_OMIT: return "omit";
+        case PORPOISE_OVERRIDE_TREAT_AS_DATA: return "data";
+        default: return "unknown";
+    }
+}
+
+const char *porpoise_match_confidence_name(
+    PorpoiseMatchConfidence confidence) {
+    switch (confidence) {
+        case PORPOISE_MATCH_CONFIDENCE_NONE: return "none";
+        case PORPOISE_MATCH_CONFIDENCE_MAP_ONLY: return "map-only";
+        case PORPOISE_MATCH_CONFIDENCE_EXACT: return "exact";
         default: return "unknown";
     }
 }
