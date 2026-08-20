@@ -518,7 +518,11 @@ libporpoise_gx_objects_adapter_test = executable(
     'tests/fixtures/libporpoise_stub/private',
   ),
   dependencies: [math_dep, threads_dep],
-  c_args: ['-Werror', '-DLIBPORPOISE_PORT'],
+  c_args: [
+    '-Werror',
+    '-DLIBPORPOISE_PORT',
+    '-DPORPOISE_LIBPORPOISE_FORCE_UMBRELLA_GX_HEADERS=1',
+  ],
 )
 test(
   'libporpoise-gx-objects-adapter',

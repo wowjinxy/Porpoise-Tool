@@ -11,7 +11,8 @@
  * The fallback preserves compatibility with the deliberately small contract
  * stubs (and older libPorpoise layouts) that expose only the umbrella header.
  */
-#if defined(__has_include)
+#if !defined(PORPOISE_LIBPORPOISE_FORCE_UMBRELLA_GX_HEADERS) && \
+    defined(__has_include)
 #if __has_include(<dolphin/gx/GXFrameBuffer.h>)
 #define PORPOISE_LIBPORPOISE_HAS_SPLIT_GX_HEADERS 1
 #endif
