@@ -2582,9 +2582,11 @@ static bool build_spans(
                     false)) goto internal_failure;
         }
     }
-    qsort(
-        program->data_spans, program->data_span_count,
-        sizeof(*program->data_spans), compare_spans);
+    if (program->data_span_count > 1U) {
+        qsort(
+            program->data_spans, program->data_span_count,
+            sizeof(*program->data_spans), compare_spans);
+    }
     for (file_index = 1U; file_index < program->data_span_count; file_index++) {
         const PorpoiseDataSpan *prior = &program->data_spans[file_index - 1U];
         const PorpoiseDataSpan *current = &program->data_spans[file_index];

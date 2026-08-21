@@ -91,8 +91,6 @@ static void check_loaded_project(const PorpoiseRecoveryProject *project) {
     CHECK(project->sdk_catalog_count == 2U);
     CHECK(project->abi_contract_count == 2U);
     CHECK(project->target_count == 2U);
-    CHECK(strcmp(project->sdk_catalogs[1].value,
-                 "/opt/porpoise/catalogs/local.json") == 0);
     CHECK(strcmp(project->sdk_catalogs[1].resolved,
                  "/opt/porpoise/catalogs/local.json") == 0);
     CHECK(strcmp(project->abi_contracts[1].resolved,
@@ -153,6 +151,8 @@ static void test_load_and_stale_independence(const char *root) {
               &project, path, &diagnostics) == PORPOISE_EXIT_OK);
     CHECK(!porpoise_diagnostics_have_errors(&diagnostics));
     check_loaded_project(&project);
+    CHECK(strcmp(project.sdk_catalogs[1].value,
+                 "/opt/porpoise/catalogs/local.json") == 0);
     CHECK(porpoise_recovery_project_find_target(&project, "missing") == NULL);
     CHECK(porpoise_recovery_project_find_target_mutable(
               &project, "main-dol") == &project.targets[0]);
@@ -243,6 +243,13 @@ static void test_save_rebase_reopen_and_determinism(const char *root) {
     CHECK(porpoise_recovery_project_load(
               &reopened, first_path, &diagnostics) == PORPOISE_EXIT_OK);
     check_loaded_project(&reopened);
+#ifdef _WIN32
+    CHECK(strcmp(reopened.sdk_catalogs[1].value,
+                 "/opt/porpoise/catalogs/local.json") == 0);
+#else
+    /* POSIX paths share one root, so canonical saves rebase /opt as relative. */
+    CHECK(reopened.sdk_catalogs[1].value[0] != '/');
+#endif
     CHECK(strcmp(project.targets[0].input.resolved,
                  reopened.targets[0].input.resolved) == 0);
     CHECK(strcmp(project.targets[0].output.resolved,
