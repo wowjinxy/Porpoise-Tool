@@ -44,6 +44,7 @@ typedef enum PorpoiseVerbosity {
  */
 typedef struct PorpoiseOptions {
     char project_path[PORPOISE_PATH_CAPACITY];
+    char dtk_path[PORPOISE_PATH_CAPACITY];
     char target_ids[PORPOISE_TARGET_SELECTOR_LIMIT][PORPOISE_NAME_CAPACITY];
     size_t target_id_count;
     char report_path[PORPOISE_PATH_CAPACITY];

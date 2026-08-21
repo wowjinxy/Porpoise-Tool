@@ -42,8 +42,14 @@ typedef struct PorpoiseDtkImportOptions {
     PorpoiseDtkSourceKind source_kind;
     const char *input_path;
 
-    /* Required for MANAGED_ELF and ignored for PREPARED_ASM. */
+    /* Cache destination required for MANAGED_ELF; ignored for PREPARED_ASM. */
     const char *cache_path;
+
+    /*
+     * Optional explicit executable selection. When empty, managed imports use
+     * PORPOISE_DTK and then search PATH for dtk. Explicit and environment
+     * selections are authoritative: a bad selection is not silently replaced.
+     */
     const char *dtk_path;
 
     /* Exact canonical settings text supplied by the project layer. */

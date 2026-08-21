@@ -1,4 +1,5 @@
 #include "porpoise/lower.h"
+#include "lower_internal.h"
 #include "porpoise/raw_word.h"
 #include "porpoise/relocation.h"
 #include "porpoise/system_lower.h"
@@ -10,196 +11,6 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-
-typedef enum LoweringOperation {
-    OP_NOP = 0,
-    OP_LI,
-    OP_LIS,
-    OP_ADDI,
-    OP_ADDIS,
-    OP_SUB_IMMEDIATE,
-    OP_ADD,
-    OP_SUBF,
-    OP_MULLI,
-    OP_MULLW,
-    OP_DIVIDE_WORD,
-    OP_MULTIPLY_HIGH,
-    OP_CARRY_ARITHMETIC,
-    OP_SUBFZE,
-    OP_AND,
-    OP_OR,
-    OP_XOR,
-    OP_LOGICAL_COMPLEMENT,
-    OP_ORI,
-    OP_ORIS,
-    OP_XORI,
-    OP_XORIS,
-    OP_ANDI,
-    OP_ANDIS,
-    OP_SLW,
-    OP_SRW,
-    OP_SRAW,
-    OP_SRAWI,
-    OP_RLWINM,
-    OP_RLWIMI,
-    OP_RLWNM,
-    OP_ROTLW,
-    OP_ROTATE_ALIAS,
-    OP_INTEGER_UNARY,
-    OP_LOAD,
-    OP_STORE,
-    OP_INDEXED_LOAD,
-    OP_INDEXED_STORE,
-    OP_BYTE_REVERSE_LOAD,
-    OP_BYTE_REVERSE_STORE,
-    OP_PSQ_DFORM,
-    OP_PSQ_INDEXED,
-    OP_LOAD_MULTIPLE,
-    OP_STORE_MULTIPLE,
-    OP_B,
-    OP_BL,
-    OP_BLR,
-    OP_BLRL,
-    OP_BCTR,
-    OP_BCTRL,
-    OP_CONDITIONAL_BRANCH,
-    OP_CONDITIONAL_RETURN,
-    OP_BDNZ,
-    OP_BDZ,
-    OP_MFLR,
-    OP_MTLR,
-    OP_MFCTR,
-    OP_MTCTR,
-    OP_MFCR,
-    OP_CR_LOGIC,
-    OP_COMPARE,
-    OP_FLOAT_BINARY,
-    OP_FLOAT_UNARY,
-    OP_FLOAT_COMPARE,
-    OP_FLOAT_SELECT,
-    OP_FRSP,
-    OP_FCTIW,
-    OP_FCTIWZ,
-    OP_MFFS,
-    OP_MTFSF,
-    OP_MTFSB1,
-    OP_FLOAT_FMA,
-    OP_PAIRED_BINARY,
-    OP_PAIRED_TERNARY,
-    OP_PAIRED_SCALAR_MADD,
-    OP_PAIRED_SCALAR_MULTIPLY,
-    OP_PAIRED_SUM,
-    OP_PAIRED_MERGE,
-    OP_PAIRED_UNARY,
-    OP_PAIRED_COMPARE,
-    OP_PAIRED_SELECT,
-    OP_HOST_NOOP,
-    OP_RECIPROCAL_APPROX
-} LoweringOperation;
-
-typedef struct OpcodeSpec {
-    const char *mnemonic;
-    LoweringOperation operation;
-    PorpoiseLoweringStatus status;
-    bool semantic_test;
-    int detail;
-} OpcodeSpec;
-
-enum {
-    MEMORY_U8 = 1,
-    MEMORY_U16,
-    MEMORY_S16,
-    MEMORY_U32,
-    MEMORY_F32,
-    MEMORY_F64,
-    MEMORY_FPR_U32
-};
-
-enum {
-    PSQ_STORE = 1,
-    PSQ_UPDATE = 2
-};
-
-enum {
-    CARRY_ADD_IMMEDIATE = 1,
-    CARRY_SUBF_IMMEDIATE,
-    CARRY_ADD,
-    CARRY_ADD_EXTENDED,
-    CARRY_ADD_ZERO_EXTENDED,
-    CARRY_SUBF,
-    CARRY_SUBF_EXTENDED
-};
-
-enum {
-    LOGICAL_AND_COMPLEMENT = 1,
-    LOGICAL_EQUIVALENT,
-    LOGICAL_NOR,
-    LOGICAL_NOT,
-    LOGICAL_OR_COMPLEMENT
-};
-
-enum {
-    INTEGER_EXTEND_BYTE = 1,
-    INTEGER_EXTEND_HALFWORD,
-    INTEGER_COUNT_LEADING_ZEROS,
-    INTEGER_NEGATE
-};
-
-enum {
-    ROTATE_SHIFT_LEFT_IMMEDIATE = 1,
-    ROTATE_SHIFT_RIGHT_IMMEDIATE,
-    ROTATE_CLEAR_LEFT_IMMEDIATE,
-    ROTATE_CLEAR_RIGHT_IMMEDIATE,
-    ROTATE_CLEAR_LEFT_SHIFT_LEFT_IMMEDIATE,
-    ROTATE_EXTRACT_LEFT_IMMEDIATE,
-    ROTATE_EXTRACT_RIGHT_IMMEDIATE,
-    ROTATE_LEFT_IMMEDIATE,
-    ROTATE_RIGHT_IMMEDIATE
-};
-
-enum {
-    CR_LOGICAL_OR = 1,
-    CR_LOGICAL_CLEAR,
-    CR_LOGICAL_SET
-};
-
-enum {
-    FLOAT_ADD = 1,
-    FLOAT_SUB,
-    FLOAT_MUL,
-    FLOAT_DIV,
-    FLOAT_MOVE,
-    FLOAT_NEG,
-    FLOAT_ABS,
-    FLOAT_NABS
-};
-
-enum {
-    PAIRED_MADD = 1,
-    PAIRED_MSUB,
-    PAIRED_NMADD,
-    PAIRED_NMSUB
-};
-
-enum {
-    PAIRED_MERGE_00 = 1,
-    PAIRED_MERGE_01,
-    PAIRED_MERGE_10,
-    PAIRED_MERGE_11
-};
-
-enum {
-    PAIRED_MOVE = 1,
-    PAIRED_NEGATE
-};
-
-enum {
-    SCALAR_FMA_MADD = 0,
-    SCALAR_FMA_MSUB,
-    SCALAR_FMA_NMADD,
-    SCALAR_FMA_NMSUB,
-    SCALAR_FMA_SINGLE = 0x100
-};
 
 /*
  * This table is deliberately conservative. An opcode is only marked lowered
@@ -481,12 +292,6 @@ static const OpcodeSpec OPCODES[] = {
     {"frsqrte", OP_RECIPROCAL_APPROX, PORPOISE_APPROXIMATE, false, 1}
 };
 
-typedef struct OperandList {
-    char storage[1024];
-    char *values[8];
-    size_t count;
-} OperandList;
-
 static const OpcodeSpec *find_opcode(const char *mnemonic) {
     size_t index;
     for (index = 0U; index < sizeof(OPCODES) / sizeof(OPCODES[0]); index++) {
@@ -563,7 +368,7 @@ static bool normalize_branch_target(const char *text, char *target, size_t capac
     return true;
 }
 
-static bool parse_register(const char *text, char prefix, unsigned int *index) {
+bool parse_register(const char *text, char prefix, unsigned int *index) {
     char *end;
     unsigned long value;
     if (text == NULL || text[0] != prefix || !isdigit((unsigned char)text[1])) return false;
@@ -574,12 +379,12 @@ static bool parse_register(const char *text, char prefix, unsigned int *index) {
     return true;
 }
 
-static bool parse_gqr_register(const char *text, unsigned int *index) {
+bool parse_gqr_register(const char *text, unsigned int *index) {
     return text != NULL && text[0] == 'q' &&
            parse_register(text + 1, 'r', index) && *index < 8U;
 }
 
-static bool parse_unsigned(const char *text, uint32_t *value) {
+bool parse_unsigned(const char *text, uint32_t *value) {
     char *end;
     unsigned long parsed;
     if (text == NULL || *text == '\0' || *text == '-') return false;
@@ -593,7 +398,7 @@ static bool parse_unsigned(const char *text, uint32_t *value) {
     return true;
 }
 
-static bool parse_signed(const char *text, int32_t *value) {
+bool parse_signed(const char *text, int32_t *value) {
     char *end;
     long parsed;
     if (text == NULL || *text == '\0') return false;
@@ -621,7 +426,7 @@ static int32_t decode_psq_displacement(uint32_t word) {
         : (int32_t)bits - INT32_C(4096);
 }
 
-static bool parse_signed_or_relocated(
+bool parse_signed_or_relocated(
     const char *text,
     uint32_t word,
     unsigned int allowed_relocations,
@@ -640,7 +445,7 @@ static bool parse_signed_or_relocated(
     return true;
 }
 
-static bool parse_unsigned_or_relocated(
+bool parse_unsigned_or_relocated(
     const char *text,
     uint32_t word,
     unsigned int allowed_relocations,
@@ -654,7 +459,7 @@ static bool parse_unsigned_or_relocated(
     return true;
 }
 
-static bool parse_memory_operand(
+bool parse_memory_operand(
     const char *text,
     uint32_t word,
     int32_t *offset,
@@ -692,7 +497,7 @@ static bool parse_memory_operand(
     return true;
 }
 
-static bool parse_psq_memory_operand(
+bool parse_psq_memory_operand(
     const char *text,
     int32_t *offset,
     unsigned int *base) {
@@ -715,7 +520,7 @@ static bool parse_psq_memory_operand(
     return parse_register(open + 1, 'r', base);
 }
 
-static bool psq_dform_operands_match_word(
+bool psq_dform_operands_match_word(
     uint32_t word,
     unsigned int expected_opcode,
     unsigned int fpr,
@@ -731,7 +536,7 @@ static bool psq_dform_operands_match_word(
            ((word >> 12U) & 7U) == gqr;
 }
 
-static bool psq_indexed_operands_match_word(
+bool psq_indexed_operands_match_word(
     uint32_t word,
     unsigned int expected_xo,
     unsigned int fpr,
@@ -748,7 +553,7 @@ static bool psq_indexed_operands_match_word(
            (word & UINT32_C(0x7F)) == (uint32_t)(expected_xo << 1U);
 }
 
-static bool parse_cr_bit(const char *text, unsigned int *bit_index) {
+bool parse_cr_bit(const char *text, unsigned int *bit_index) {
     const char *suffix = text;
     uint32_t numeric;
     unsigned int field = 0U;
@@ -777,7 +582,7 @@ static bool parse_cr_bit(const char *text, unsigned int *bit_index) {
     return true;
 }
 
-static bool file_printf(FILE *output, const char *format, ...) {
+bool file_printf(FILE *output, const char *format, ...) {
     int result;
     va_list arguments;
     va_start(arguments, format);
@@ -791,7 +596,7 @@ static bool opcode_records(const char *mnemonic) {
     return length != 0U && mnemonic[length - 1U] == '.';
 }
 
-static bool emit_record_update(FILE *output, bool record, unsigned int destination) {
+bool emit_record_update(FILE *output, bool record, unsigned int destination) {
     return !record || file_printf(
         output,
         "    porpoise_set_cr0_result(state, state->gpr[%u]);\n",
@@ -894,7 +699,7 @@ static bool emit_function_entry_dispatch(
     return file_printf(output, "        default: break;\n    }\n");
 }
 
-static bool emit_branch_target(
+bool emit_branch_target(
     FILE *output,
     const PorpoiseProgram *program,
     const PorpoiseFunction *function,
@@ -964,7 +769,7 @@ static bool emit_branch_target(
     return false;
 }
 
-static bool emit_conditional_target(
+bool emit_conditional_target(
     FILE *output,
     const PorpoiseProgram *program,
     const PorpoiseFunction *function,
@@ -1028,984 +833,36 @@ static bool emit_instruction(
     const PorpoiseAsmItem *item,
     const PorpoiseAbiManifest *abi,
     PorpoiseDiagnostics *diagnostics) {
-    OperandList operands;
-    unsigned int rd, ra, rb, rc;
-    int32_t immediate;
-    uint32_t unsigned_value;
-    bool record = opcode_records(item->mnemonic);
-    if (!split_operands(item->operands, &operands)) return false;
-    switch (spec->operation) {
-        case OP_NOP:
-            if (operands.count != 0U) return false;
-            return file_printf(output, "    /* %s: architectural no-op. */\n", item->mnemonic);
-        case OP_HOST_NOOP:
-            if (spec->detail == 0) {
-                if (operands.count != 0U) return false;
-            } else if (operands.count != 2U ||
-                       !parse_register(operands.values[0], 'r', &ra) ||
-                       !parse_register(operands.values[1], 'r', &rb)) {
-                return false;
-            }
-            return file_printf(output, "    /* %s: host-equivalent no state change. */\n", item->mnemonic);
-        case OP_LI:
-        case OP_LIS: {
-            PorpoiseRelocationKind relocation;
-            unsigned int allowed_relocations = spec->operation == OP_LIS
-                ? PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_HIGH) |
-                      PORPOISE_RELOCATION_MASK(
-                          PORPOISE_RELOCATION_HIGH_ADJUSTED)
-                : PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_LOW) |
-                      PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_SDA21);
-            if (operands.count != 2U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_signed_or_relocated(operands.values[1], item->word,
-                                           allowed_relocations, &immediate,
-                                           &relocation) ||
-                immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
-            if (spec->operation == OP_LIS) {
-                return file_printf(output,
-                    "    state->gpr[%u] = ((uint32_t)UINT16_C(0x%04lX)) << 16U;\n",
-                    rd, (unsigned long)(uint16_t)immediate);
-            }
-            if (relocation == PORPOISE_RELOCATION_SDA21) {
-                ra = (item->word >> 16U) & 31U;
-                if (ra != 0U) {
-                    return file_printf(output,
-                        "    state->gpr[%u] = state->gpr[%u] + porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
-                        rd, ra, (unsigned long)(uint16_t)immediate);
-                }
-            }
-            return file_printf(output,
-                "    state->gpr[%u] = porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
-                rd, (unsigned long)(uint16_t)immediate);
-        }
-        case OP_ADDI:
-        case OP_ADDIS: {
-            PorpoiseRelocationKind relocation;
-            unsigned int allowed_relocations = spec->operation == OP_ADDIS
-                ? PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_HIGH) |
-                      PORPOISE_RELOCATION_MASK(
-                          PORPOISE_RELOCATION_HIGH_ADJUSTED)
-                : PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_LOW) |
-                      PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_SDA21);
-            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_signed_or_relocated(operands.values[2], item->word,
-                                           allowed_relocations, &immediate,
-                                           &relocation) ||
-                immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
-            if (relocation == PORPOISE_RELOCATION_SDA21)
-                ra = (item->word >> 16U) & 31U;
-            if (ra == 0U) {
-                if (spec->operation == OP_ADDIS)
-                    return file_printf(output, "    state->gpr[%u] = ((uint32_t)UINT16_C(0x%04lX)) << 16U;\n",
-                                       rd, (unsigned long)(uint16_t)immediate);
-                return file_printf(output,
-                    "    state->gpr[%u] = porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
-                    rd, (unsigned long)(uint16_t)immediate);
-            }
-            if (spec->operation == OP_ADDIS)
-                return file_printf(output,
-                    "    state->gpr[%u] = state->gpr[%u] + (((uint32_t)UINT16_C(0x%04lX)) << 16U);\n",
-                    rd, ra, (unsigned long)(uint16_t)immediate);
-            return file_printf(output,
-                "    state->gpr[%u] = state->gpr[%u] + porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
-                rd, ra, (unsigned long)(uint16_t)immediate);
-        }
-        case OP_SUB_IMMEDIATE: {
-            int64_t negated;
-            uint16_t encoded;
-            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_signed(operands.values[2], &immediate)) return false;
-            negated = -(int64_t)immediate;
-            if (negated < INT16_MIN || negated > INT16_MAX) return false;
-            encoded = (uint16_t)(int16_t)negated;
-            if (ra == 0U) {
-                if (spec->detail != 0)
-                    return file_printf(output,
-                        "    state->gpr[%u] = ((uint32_t)UINT16_C(0x%04lX)) << 16U;\n",
-                        rd, (unsigned long)encoded);
-                return file_printf(output,
-                    "    state->gpr[%u] = porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
-                    rd, (unsigned long)encoded);
-            }
-            if (spec->detail != 0)
-                return file_printf(output,
-                    "    state->gpr[%u] = state->gpr[%u] + (((uint32_t)UINT16_C(0x%04lX)) << 16U);\n",
-                    rd, ra, (unsigned long)encoded);
-            return file_printf(output,
-                "    state->gpr[%u] = state->gpr[%u] + porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
-                rd, ra, (unsigned long)encoded);
-        }
-        case OP_ADD:
-        case OP_SUBF:
-        case OP_AND:
-        case OP_OR:
-        case OP_XOR:
-            if (spec->detail == 1) {
-                if (operands.count != 2U || !parse_register(operands.values[0], 'r', &rd) ||
-                    !parse_register(operands.values[1], 'r', &ra)) return false;
-                rb = ra;
-            } else if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                       !parse_register(operands.values[1], 'r', &ra) ||
-                       !parse_register(operands.values[2], 'r', &rb)) return false;
-            if (spec->operation == OP_ADD &&
-                !file_printf(output, "    state->gpr[%u] = state->gpr[%u] + state->gpr[%u];\n", rd, ra, rb)) return false;
-            if (spec->operation == OP_SUBF &&
-                !file_printf(output, "    state->gpr[%u] = state->gpr[%u] - state->gpr[%u];\n", rd, rb, ra)) return false;
-            if (spec->operation == OP_AND &&
-                !file_printf(output, "    state->gpr[%u] = state->gpr[%u] & state->gpr[%u];\n", rd, ra, rb)) return false;
-            if (spec->operation == OP_OR &&
-                !file_printf(output, "    state->gpr[%u] = state->gpr[%u] | state->gpr[%u];\n", rd, ra, rb)) return false;
-            if (spec->operation == OP_XOR &&
-                !file_printf(output, "    state->gpr[%u] = state->gpr[%u] ^ state->gpr[%u];\n", rd, ra, rb)) return false;
-            return emit_record_update(output, record, rd);
-        case OP_MULLI:
-            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_signed(operands.values[2], &immediate) ||
-                immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
-            return file_printf(output,
-                "    state->gpr[%u] = state->gpr[%u] * porpoise_sign_extend16(UINT32_C(0x%04lX));\n",
-                rd, ra, (unsigned long)(uint16_t)immediate);
-        case OP_MULLW:
-            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_register(operands.values[2], 'r', &rb) ||
-                !file_printf(output,
-                    "    state->gpr[%u] = state->gpr[%u] * state->gpr[%u];\n",
-                    rd, ra, rb)) return false;
-            return emit_record_update(output, record, rd);
-        case OP_DIVIDE_WORD:
-            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_register(operands.values[2], 'r', &rb)) return false;
-            if (spec->detail != 0) {
-                if (!file_printf(output,
-                    "    { uint32_t dividend = state->gpr[%u]; uint32_t divisor = state->gpr[%u]; "
-                    "int64_t signed_dividend = (dividend & UINT32_C(0x80000000)) != 0U ? (int64_t)dividend - INT64_C(4294967296) : (int64_t)dividend; "
-                    "int64_t signed_divisor = (divisor & UINT32_C(0x80000000)) != 0U ? (int64_t)divisor - INT64_C(4294967296) : (int64_t)divisor; "
-                    "if (divisor == 0U || (dividend == UINT32_C(0x80000000) && divisor == UINT32_MAX)) "
-                    "state->gpr[%u] = signed_dividend < 0 ? UINT32_MAX : 0U; "
-                    "else state->gpr[%u] = (uint32_t)(signed_dividend / signed_divisor); }\n",
-                    ra, rb, rd, rd)) return false;
-            } else if (!file_printf(output,
-                "    { uint32_t divisor = state->gpr[%u]; state->gpr[%u] = divisor == 0U ? 0U : state->gpr[%u] / divisor; }\n",
-                rb, rd, ra)) return false;
-            return emit_record_update(output, record, rd);
-        case OP_MULTIPLY_HIGH:
-            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_register(operands.values[2], 'r', &rb)) return false;
-            if (spec->detail != 0) {
-                if (!file_printf(output,
-                    "    { uint32_t left = state->gpr[%u]; uint32_t right = state->gpr[%u]; "
-                    "uint32_t high = (uint32_t)(((uint64_t)left * (uint64_t)right) >> 32U); "
-                    "if ((left & UINT32_C(0x80000000)) != 0U) high -= right; "
-                    "if ((right & UINT32_C(0x80000000)) != 0U) high -= left; state->gpr[%u] = high; }\n",
-                    ra, rb, rd)) return false;
-            } else if (!file_printf(output,
-                "    state->gpr[%u] = (uint32_t)(((uint64_t)state->gpr[%u] * (uint64_t)state->gpr[%u]) >> 32U);\n",
-                rd, ra, rb)) return false;
-            return emit_record_update(output, record, rd);
-        case OP_CARRY_ARITHMETIC: {
-            int kind = spec->detail < 0 ? -spec->detail : spec->detail;
-            if (kind == CARRY_ADD_IMMEDIATE || kind == CARRY_SUBF_IMMEDIATE) {
-                uint16_t encoded;
-                PorpoiseRelocationKind relocation =
-                    PORPOISE_RELOCATION_NONE;
-                if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                    !parse_register(operands.values[1], 'r', &ra)) return false;
-                if (spec->detail < 0) {
-                    int64_t negated;
-                    if (!parse_signed(operands.values[2], &immediate)) return false;
-                    negated = -(int64_t)immediate;
-                    if (negated < INT16_MIN || negated > INT16_MAX) return false;
-                    encoded = (uint16_t)(int16_t)negated;
-                } else {
-                    if (!parse_signed_or_relocated(
-                            operands.values[2], item->word,
-                            PORPOISE_RELOCATION_MASK(
-                                PORPOISE_RELOCATION_LOW),
-                            &immediate,
-                            &relocation)) return false;
-                    if (immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
-                    encoded = (uint16_t)immediate;
-                }
-                if (kind == CARRY_ADD_IMMEDIATE) {
-                    if (!file_printf(output,
-                        "    state->gpr[%u] = porpoise_add_with_carry32(state, state->gpr[%u], porpoise_sign_extend16(UINT32_C(0x%04lX)), 0U);\n",
-                        rd, ra, (unsigned long)encoded)) return false;
-                } else if (!file_printf(output,
-                    "    state->gpr[%u] = porpoise_add_with_carry32(state, ~state->gpr[%u], porpoise_sign_extend16(UINT32_C(0x%04lX)), 1U);\n",
-                    rd, ra, (unsigned long)encoded)) return false;
-            } else if (kind == CARRY_ADD_ZERO_EXTENDED) {
-                if (operands.count != 2U || !parse_register(operands.values[0], 'r', &rd) ||
-                    !parse_register(operands.values[1], 'r', &ra) ||
-                    !file_printf(output,
-                        "    state->gpr[%u] = porpoise_add_with_carry32(state, state->gpr[%u], 0U, (state->xer >> 29U) & 1U);\n",
-                        rd, ra)) return false;
-            } else {
-                const char *left_prefix = kind == CARRY_SUBF || kind == CARRY_SUBF_EXTENDED ? "~" : "";
-                const char *carry = kind == CARRY_ADD_EXTENDED || kind == CARRY_SUBF_EXTENDED
-                    ? "(state->xer >> 29U) & 1U"
-                    : kind == CARRY_SUBF ? "1U" : "0U";
-                if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                    !parse_register(operands.values[1], 'r', &ra) ||
-                    !parse_register(operands.values[2], 'r', &rb) ||
-                    !file_printf(output,
-                        "    state->gpr[%u] = porpoise_add_with_carry32(state, %sstate->gpr[%u], state->gpr[%u], %s);\n",
-                        rd, left_prefix, ra, rb, carry)) return false;
-            }
-            return emit_record_update(output, record, rd);
-        }
-        case OP_SUBFZE:
-            if (operands.count != 2U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !file_printf(output,
-                    "    state->gpr[%u] = porpoise_add_with_carry32(state, ~state->gpr[%u], 0U, (state->xer >> 29U) & 1U);\n",
-                    rd, ra)) return false;
-            return emit_record_update(output, record, rd);
-        case OP_LOGICAL_COMPLEMENT:
-            if (spec->detail == LOGICAL_NOT) {
-                if (operands.count != 2U || !parse_register(operands.values[0], 'r', &rd) ||
-                    !parse_register(operands.values[1], 'r', &ra) ||
-                    !file_printf(output, "    state->gpr[%u] = ~state->gpr[%u];\n", rd, ra)) return false;
-            } else {
-                if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                    !parse_register(operands.values[1], 'r', &ra) ||
-                    !parse_register(operands.values[2], 'r', &rb)) return false;
-                if (spec->detail == LOGICAL_AND_COMPLEMENT &&
-                    !file_printf(output, "    state->gpr[%u] = state->gpr[%u] & ~state->gpr[%u];\n", rd, ra, rb)) return false;
-                if (spec->detail == LOGICAL_OR_COMPLEMENT &&
-                    !file_printf(output, "    state->gpr[%u] = state->gpr[%u] | ~state->gpr[%u];\n", rd, ra, rb)) return false;
-                if (spec->detail == LOGICAL_EQUIVALENT &&
-                    !file_printf(output, "    state->gpr[%u] = ~(state->gpr[%u] ^ state->gpr[%u]);\n", rd, ra, rb)) return false;
-                if (spec->detail == LOGICAL_NOR &&
-                    !file_printf(output, "    state->gpr[%u] = ~(state->gpr[%u] | state->gpr[%u]);\n", rd, ra, rb)) return false;
-            }
-            return emit_record_update(output, record, rd);
-        case OP_ORI:
-        case OP_ORIS:
-        case OP_XORI:
-        case OP_XORIS:
-        case OP_ANDI:
-        case OP_ANDIS: {
-            const char *operator_text = spec->operation == OP_ORI || spec->operation == OP_ORIS ? "|" :
-                                        spec->operation == OP_XORI || spec->operation == OP_XORIS ? "^" : "&";
-            bool shifted = spec->operation == OP_ORIS || spec->operation == OP_XORIS || spec->operation == OP_ANDIS;
-            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_unsigned_or_relocated(
-                    operands.values[2], item->word,
-                    spec->operation == OP_ORI
-                        ? PORPOISE_RELOCATION_MASK(PORPOISE_RELOCATION_LOW)
-                        : 0U,
-                    &unsigned_value) || unsigned_value > UINT16_MAX) return false;
-            if (!file_printf(output, "    state->gpr[%u] = state->gpr[%u] %s (UINT32_C(%lu)%s);\n",
-                             rd, ra, operator_text, (unsigned long)unsigned_value, shifted ? " << 16" : "")) return false;
-            if (spec->operation == OP_ANDI || spec->operation == OP_ANDIS)
-                return file_printf(output, "    porpoise_set_cr0_result(state, state->gpr[%u]);\n", rd);
-            return true;
-        }
-        case OP_SLW:
-        case OP_SRW:
-            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) || !parse_register(operands.values[2], 'r', &rb)) return false;
-            return file_printf(output, "    state->gpr[%u] = porpoise_%s32(state->gpr[%u], state->gpr[%u]);\n",
-                               rd, spec->operation == OP_SLW ? "shift_left" : "shift_right", ra, rb);
-        case OP_SRAW:
-            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_register(operands.values[2], 'r', &rb) ||
-                !file_printf(output,
-                    "    state->gpr[%u] = porpoise_arithmetic_shift_right32(state, state->gpr[%u], state->gpr[%u]);\n",
-                    rd, ra, rb)) return false;
-            return emit_record_update(output, record, rd);
-        case OP_SRAWI:
-            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) || !parse_unsigned(operands.values[2], &unsigned_value) ||
-                unsigned_value > 31U) return false;
-            if (!file_printf(output, "    state->gpr[%u] = porpoise_arithmetic_shift_right32(state, state->gpr[%u], %luU);\n",
-                             rd, ra, (unsigned long)unsigned_value)) return false;
-            return emit_record_update(output, record, rd);
-        case OP_RLWINM:
-            if (operands.count != 5U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) || !parse_unsigned(operands.values[2], &unsigned_value) ||
-                unsigned_value > 31U) return false;
-            {
-                uint32_t mb, me;
-                if (!parse_unsigned(operands.values[3], &mb) || !parse_unsigned(operands.values[4], &me) || mb > 31U || me > 31U) return false;
-                if (!file_printf(output, "    state->gpr[%u] = porpoise_rotate_left32(state->gpr[%u], %luU) & porpoise_mask32(%luU, %luU);\n",
-                                 rd, ra, (unsigned long)unsigned_value, (unsigned long)mb, (unsigned long)me)) return false;
-                return emit_record_update(output, record, rd);
-            }
-        case OP_RLWIMI:
-            if (operands.count != 5U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) || !parse_unsigned(operands.values[2], &unsigned_value) ||
-                unsigned_value > 31U) return false;
-            {
-                uint32_t mb, me;
-                if (!parse_unsigned(operands.values[3], &mb) || !parse_unsigned(operands.values[4], &me) || mb > 31U || me > 31U) return false;
-                if (!file_printf(output,
-                    "    { uint32_t mask = porpoise_mask32(%luU, %luU); state->gpr[%u] = (state->gpr[%u] & ~mask) | (porpoise_rotate_left32(state->gpr[%u], %luU) & mask); }\n",
-                    (unsigned long)mb, (unsigned long)me, rd, rd, ra, (unsigned long)unsigned_value)) return false;
-                return emit_record_update(output, record, rd);
-            }
-        case OP_RLWNM:
-            if (operands.count != 5U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_register(operands.values[2], 'r', &rb)) return false;
-            {
-                uint32_t mb, me;
-                if (!parse_unsigned(operands.values[3], &mb) ||
-                    !parse_unsigned(operands.values[4], &me) || mb > 31U || me > 31U) return false;
-                if (!file_printf(output,
-                    "    state->gpr[%u] = porpoise_rotate_left32(state->gpr[%u], state->gpr[%u] & 31U) & porpoise_mask32(%luU, %luU);\n",
-                    rd, ra, rb, (unsigned long)mb, (unsigned long)me)) return false;
-                return emit_record_update(output, record, rd);
-            }
-        case OP_ROTLW:
-            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_register(operands.values[2], 'r', &rb) ||
-                !file_printf(output,
-                    "    state->gpr[%u] = porpoise_rotate_left32(state->gpr[%u], state->gpr[%u] & 31U);\n",
-                    rd, ra, rb)) return false;
-            return emit_record_update(output, record, rd);
-        case OP_ROTATE_ALIAS: {
-            uint32_t first, second = 0U;
-            uint32_t shift, mask_begin, mask_end;
-            bool four_operands =
-                spec->detail == ROTATE_CLEAR_LEFT_SHIFT_LEFT_IMMEDIATE ||
-                spec->detail == ROTATE_EXTRACT_LEFT_IMMEDIATE ||
-                spec->detail == ROTATE_EXTRACT_RIGHT_IMMEDIATE;
-            if (operands.count != (four_operands ? 4U : 3U) ||
-                !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_unsigned(operands.values[2], &first) || first > 32U ||
-                (four_operands && (!parse_unsigned(operands.values[3], &second) || second > 31U)))
-                return false;
-            switch (spec->detail) {
-                case ROTATE_SHIFT_LEFT_IMMEDIATE:
-                    if (first >= 32U) return false;
-                    shift = first; mask_begin = 0U; mask_end = 31U - first;
-                    break;
-                case ROTATE_SHIFT_RIGHT_IMMEDIATE:
-                    if (first >= 32U) return false;
-                    shift = (32U - first) & 31U; mask_begin = first; mask_end = 31U;
-                    break;
-                case ROTATE_CLEAR_LEFT_IMMEDIATE:
-                    if (first >= 32U) return false;
-                    shift = 0U; mask_begin = first; mask_end = 31U;
-                    break;
-                case ROTATE_CLEAR_RIGHT_IMMEDIATE:
-                    if (first >= 32U) return false;
-                    shift = 0U; mask_begin = 0U; mask_end = 31U - first;
-                    break;
-                case ROTATE_CLEAR_LEFT_SHIFT_LEFT_IMMEDIATE:
-                    if (first >= 32U || second > first) return false;
-                    shift = second; mask_begin = first - second; mask_end = 31U - second;
-                    break;
-                case ROTATE_EXTRACT_LEFT_IMMEDIATE:
-                    if (first == 0U) return false;
-                    shift = second; mask_begin = 0U; mask_end = first - 1U;
-                    break;
-                case ROTATE_EXTRACT_RIGHT_IMMEDIATE:
-                    if (first == 0U || first + second > 32U) return false;
-                    shift = (first + second) & 31U; mask_begin = (32U - first) & 31U; mask_end = 31U;
-                    break;
-                case ROTATE_LEFT_IMMEDIATE:
-                    if (first >= 32U) return false;
-                    shift = first; mask_begin = 0U; mask_end = 31U;
-                    break;
-                case ROTATE_RIGHT_IMMEDIATE:
-                    if (first >= 32U) return false;
-                    shift = (32U - first) & 31U; mask_begin = 0U; mask_end = 31U;
-                    break;
-                default:
-                    return false;
-            }
-            if (!file_printf(output,
-                "    state->gpr[%u] = porpoise_rotate_left32(state->gpr[%u], %luU) & porpoise_mask32(%luU, %luU);\n",
-                rd, ra, (unsigned long)shift, (unsigned long)mask_begin,
-                (unsigned long)mask_end)) return false;
-            return emit_record_update(output, record, rd);
-        }
-        case OP_INTEGER_UNARY:
-            if (operands.count != 2U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra)) return false;
-            if (spec->detail == INTEGER_EXTEND_BYTE &&
-                !file_printf(output,
-                    "    state->gpr[%u] = porpoise_sign_extend8(state->gpr[%u]);\n",
-                    rd, ra)) return false;
-            if (spec->detail == INTEGER_EXTEND_HALFWORD &&
-                !file_printf(output,
-                    "    state->gpr[%u] = porpoise_sign_extend16(state->gpr[%u]);\n",
-                    rd, ra)) return false;
-            if (spec->detail == INTEGER_COUNT_LEADING_ZEROS &&
-                !file_printf(output,
-                    "    state->gpr[%u] = porpoise_count_leading_zeros32(state->gpr[%u]);\n",
-                    rd, ra)) return false;
-            if (spec->detail == INTEGER_NEGATE &&
-                !file_printf(output, "    state->gpr[%u] = 0U - state->gpr[%u];\n", rd, ra)) return false;
-            return emit_record_update(output, record, rd);
-        case OP_LOAD:
-        case OP_STORE: {
-            int kind = spec->detail < 0 ? -spec->detail : spec->detail;
-            bool update = spec->detail < 0;
-            if (operands.count != 2U ||
-                !parse_register(operands.values[0], kind >= MEMORY_F32 ? 'f' : 'r', &rd) ||
-                !parse_memory_operand(operands.values[1], item->word, &immediate, &ra) ||
-                (update && ra == 0U) ||
-                (update && spec->operation == OP_LOAD && kind < MEMORY_F32 && rd == ra)) return false;
-            if (immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
-            if (ra == 0U) {
-                if (!file_printf(output,
-                    "    { uint32_t ea = porpoise_sign_extend16(UINT32_C(0x%04lX)); ",
-                    (unsigned long)(uint16_t)immediate)) return false;
-            } else if (!file_printf(output,
-                "    { uint32_t ea = state->gpr[%u] + porpoise_sign_extend16(UINT32_C(0x%04lX)); ",
-                ra, (unsigned long)(uint16_t)immediate)) return false;
-            if (spec->operation == OP_LOAD) {
-                if (kind == MEMORY_U8 && !file_printf(output, "uint32_t value = porpoise_load_u8(state, ea); ")) return false;
-                if ((kind == MEMORY_U16 || kind == MEMORY_S16) &&
-                    !file_printf(output, "uint32_t value = porpoise_load_u16(state, ea); ")) return false;
-                if (kind == MEMORY_U32 && !file_printf(output, "uint32_t value = porpoise_load_u32(state, ea); ")) return false;
-                if (kind == MEMORY_F32 && !file_printf(output,
-                    "if (!porpoise_fpr_load_binary32(state, %uU, 0U, ea)) return; "
-                    "porpoise_fpr_set_bits(state, %uU, 1U, porpoise_fpr_get_bits(state, %uU, 0U)); ",
-                    rd, rd, rd)) return false;
-                if (kind == MEMORY_F64 && !file_printf(output,
-                    "if (!porpoise_fpr_load_binary64(state, %uU, 0U, ea)) return; ", rd)) return false;
-            } else {
-                if (kind == MEMORY_U8 && !file_printf(output, "porpoise_store_u8(state, ea, (uint8_t)state->gpr[%u]); ", rd)) return false;
-                if ((kind == MEMORY_U16 || kind == MEMORY_S16) && !file_printf(output, "porpoise_store_u16(state, ea, (uint16_t)state->gpr[%u]); ", rd)) return false;
-                if (kind == MEMORY_U32 && !file_printf(output, "porpoise_store_u32(state, ea, state->gpr[%u]); ", rd)) return false;
-                if (kind == MEMORY_F32 && !file_printf(output,
-                    "if (!porpoise_fpr_store_binary32(state, %uU, 0U, ea)) return; ", rd)) return false;
-                if (kind == MEMORY_F64 && !file_printf(output,
-                    "if (!porpoise_fpr_store_binary64(state, %uU, 0U, ea)) return; ", rd)) return false;
-            }
-            if (!file_printf(output, "if (porpoise_state_has_fault(state)) return; ")) return false;
-            if (spec->operation == OP_LOAD) {
-                if ((kind == MEMORY_U8 || kind == MEMORY_U16 || kind == MEMORY_U32) &&
-                    !file_printf(output, "state->gpr[%u] = value; ", rd)) return false;
-                if (kind == MEMORY_S16 &&
-                    !file_printf(output, "state->gpr[%u] = porpoise_sign_extend16(value); ", rd)) return false;
-            }
-            if (update && !file_printf(output, "state->gpr[%u] = ea; ", ra)) return false;
-            return file_printf(output, "}\n");
-        }
-        case OP_INDEXED_LOAD:
-        case OP_INDEXED_STORE: {
-            int kind = spec->detail < 0 ? -spec->detail : spec->detail;
-            bool update = spec->detail < 0;
-            if (operands.count != 3U ||
-                !parse_register(operands.values[0], kind >= MEMORY_F32 ? 'f' : 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_register(operands.values[2], 'r', &rb) ||
-                (update && ra == 0U) ||
-                (update && spec->operation == OP_INDEXED_LOAD && kind < MEMORY_F32 && rd == ra))
-                return false;
-            if (ra == 0U) {
-                if (!file_printf(output, "    { uint32_t ea = state->gpr[%u]; ", rb)) return false;
-            } else if (!file_printf(output,
-                "    { uint32_t ea = state->gpr[%u] + state->gpr[%u]; ", ra, rb)) return false;
-            if (spec->operation == OP_INDEXED_LOAD) {
-                if (kind == MEMORY_U8 && !file_printf(output, "uint32_t value = porpoise_load_u8(state, ea); ")) return false;
-                if ((kind == MEMORY_U16 || kind == MEMORY_S16) &&
-                    !file_printf(output, "uint32_t value = porpoise_load_u16(state, ea); ")) return false;
-                if (kind == MEMORY_U32 && !file_printf(output, "uint32_t value = porpoise_load_u32(state, ea); ")) return false;
-                if (kind == MEMORY_F32 && !file_printf(output,
-                    "if (!porpoise_fpr_load_binary32(state, %uU, 0U, ea)) return; "
-                    "porpoise_fpr_set_bits(state, %uU, 1U, porpoise_fpr_get_bits(state, %uU, 0U)); ",
-                    rd, rd, rd)) return false;
-                if (kind == MEMORY_F64 && !file_printf(output,
-                    "if (!porpoise_fpr_load_binary64(state, %uU, 0U, ea)) return; ", rd)) return false;
-            } else {
-                if (kind == MEMORY_U8 && !file_printf(output, "porpoise_store_u8(state, ea, (uint8_t)state->gpr[%u]); ", rd)) return false;
-                if (kind == MEMORY_U16 && !file_printf(output, "porpoise_store_u16(state, ea, (uint16_t)state->gpr[%u]); ", rd)) return false;
-                if (kind == MEMORY_U32 && !file_printf(output, "porpoise_store_u32(state, ea, state->gpr[%u]); ", rd)) return false;
-                if (kind == MEMORY_F32 && !file_printf(output,
-                    "if (!porpoise_fpr_store_binary32(state, %uU, 0U, ea)) return; ", rd)) return false;
-                if (kind == MEMORY_F64 && !file_printf(output,
-                    "if (!porpoise_fpr_store_binary64(state, %uU, 0U, ea)) return; ", rd)) return false;
-                if (kind == MEMORY_FPR_U32 && !file_printf(output,
-                    "porpoise_store_u32(state, ea, (uint32_t)porpoise_fpr_get_bits(state, %uU, 0U)); ", rd)) return false;
-            }
-            if (!file_printf(output, "if (porpoise_state_has_fault(state)) return; ")) return false;
-            if (spec->operation == OP_INDEXED_LOAD) {
-                if ((kind == MEMORY_U8 || kind == MEMORY_U16 || kind == MEMORY_U32) &&
-                    !file_printf(output, "state->gpr[%u] = value; ", rd)) return false;
-                if (kind == MEMORY_S16 &&
-                    !file_printf(output, "state->gpr[%u] = porpoise_sign_extend16(value); ", rd)) return false;
-            }
-            if (update && !file_printf(output, "state->gpr[%u] = ea; ", ra)) return false;
-            return file_printf(output, "}\n");
-        }
-        case OP_BYTE_REVERSE_LOAD:
-            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_register(operands.values[2], 'r', &rb)) return false;
-            if (ra == 0U) {
-                if (!file_printf(output, "    { uint32_t ea = state->gpr[%u]; ", rb)) return false;
-            } else if (!file_printf(output,
-                "    { uint32_t ea = state->gpr[%u] + state->gpr[%u]; ", ra, rb)) return false;
-            return file_printf(output,
-                "uint32_t value = porpoise_load_u16(state, ea); if (porpoise_state_has_fault(state)) return; state->gpr[%u] = ((value & UINT32_C(0xFF)) << 8U) | ((value >> 8U) & UINT32_C(0xFF)); }\n",
-                rd);
-        case OP_BYTE_REVERSE_STORE:
-            if (operands.count != 3U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_register(operands.values[2], 'r', &rb)) return false;
-            if (ra == 0U) {
-                if (!file_printf(output, "    { uint32_t ea = state->gpr[%u]; ", rb)) return false;
-            } else if (!file_printf(output,
-                "    { uint32_t ea = state->gpr[%u] + state->gpr[%u]; ", ra, rb)) return false;
-            return file_printf(output,
-                "uint32_t value = state->gpr[%u]; porpoise_store_u16(state, ea, (uint16_t)(((value & UINT32_C(0xFF)) << 8U) | ((value >> 8U) & UINT32_C(0xFF)))); if (porpoise_state_has_fault(state)) return; }\n",
-                rd);
-        case OP_PSQ_DFORM: {
-            bool store = (spec->detail & PSQ_STORE) != 0;
-            bool update = (spec->detail & PSQ_UPDATE) != 0;
-            unsigned int expected_opcode = 56U + (store ? 4U : 0U) + (update ? 1U : 0U);
+    PorpoiseLowerInstructionContext context;
 
-            if (operands.count != 4U ||
-                !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_psq_memory_operand(operands.values[1], &immediate, &ra) ||
-                immediate < -2048 || immediate > 2047 ||
-                !parse_unsigned(operands.values[2], &unsigned_value) || unsigned_value > 1U ||
-                !parse_gqr_register(operands.values[3], &rc) ||
-                (update && ra == 0U)) {
-                return false;
-            }
-            rb = (unsigned int)unsigned_value;
-            if (!psq_dform_operands_match_word(
-                    item->word, expected_opcode, rd, ra, immediate, rb, rc)) {
-                return false;
-            }
-            if (ra == 0U) {
-                if (!file_printf(output,
-                    "    { uint32_t ea = UINT32_C(0x%08lX); ",
-                    (unsigned long)(uint32_t)immediate)) return false;
-            } else if (!file_printf(output,
-                "    { uint32_t ea = state->gpr[%u] + UINT32_C(0x%08lX); ",
-                ra, (unsigned long)(uint32_t)immediate)) return false;
-            if (!file_printf(output,
-                "if (!porpoise_psq_%s(state, %uU, ea, %uU, %uU, 1U)) return; ",
-                store ? "store" : "load", rd, rb, rc)) return false;
-            if (update && !file_printf(output, "state->gpr[%u] = ea; ", ra)) return false;
-            return file_printf(output, "}\n");
-        }
-        case OP_PSQ_INDEXED: {
-            bool store = (spec->detail & PSQ_STORE) != 0;
-            bool update = (spec->detail & PSQ_UPDATE) != 0;
-            unsigned int expected_xo = (store ? 7U : 6U) +
-                                       (update ? 32U : 0U);
+    context.output = output;
+    context.spec = spec;
+    context.program = program;
+    context.source = source;
+    context.function = function;
+    context.item = item;
+    context.abi = abi;
+    context.diagnostics = diagnostics;
+    context.record = opcode_records(item->mnemonic);
+    if (!split_operands(item->operands, &context.operands)) return false;
 
-            if (operands.count != 5U ||
-                !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'r', &ra) ||
-                !parse_register(operands.values[2], 'r', &rb) ||
-                !parse_unsigned(operands.values[3], &unsigned_value) || unsigned_value > 1U ||
-                !parse_gqr_register(operands.values[4], &rc) ||
-                (update && ra == 0U)) {
-                return false;
-            }
-            if (!psq_indexed_operands_match_word(
-                    item->word, expected_xo, rd, ra, rb,
-                    (unsigned int)unsigned_value, rc)) {
-                return false;
-            }
-            if (ra == 0U) {
-                if (!file_printf(output,
-                    "    { uint32_t ea = state->gpr[%u]; ", rb)) return false;
-            } else if (!file_printf(output,
-                "    { uint32_t ea = state->gpr[%u] + state->gpr[%u]; ",
-                ra, rb)) return false;
-            if (!file_printf(output,
-                "if (!porpoise_psq_%s(state, %uU, ea, %luU, %uU, 0U)) return; ",
-                store ? "store" : "load", rd,
-                (unsigned long)unsigned_value, rc)) return false;
-            if (update && !file_printf(output, "state->gpr[%u] = ea; ", ra)) return false;
-            return file_printf(output, "}\n");
-        }
-        case OP_LOAD_MULTIPLE:
-        case OP_STORE_MULTIPLE:
-            if (operands.count != 2U || !parse_register(operands.values[0], 'r', &rd) ||
-                !parse_memory_operand(operands.values[1], item->word, &immediate, &ra) ||
-                immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX ||
-                (spec->operation == OP_LOAD_MULTIPLE &&
-                 ((ra == 0U && rd == 0U) || (ra != 0U && ra >= rd)))) return false;
-            if (ra == 0U) {
-                if (!file_printf(output,
-                    "    { uint32_t ea = porpoise_sign_extend16(UINT32_C(0x%04lX)); ",
-                    (unsigned long)(uint16_t)immediate)) return false;
-            } else if (!file_printf(output,
-                "    { uint32_t ea = state->gpr[%u] + porpoise_sign_extend16(UINT32_C(0x%04lX)); ",
-                ra, (unsigned long)(uint16_t)immediate)) return false;
-            if (spec->operation == OP_LOAD_MULTIPLE) {
-                if (!file_printf(output,
-                    "if (!porpoise_load_multiple_words(state, ea, %uU)) return; }\n",
-                    rd)) return false;
-            } else if (!file_printf(output,
-                "if (!porpoise_store_multiple_words(state, ea, %uU)) return; }\n",
-                rd)) return false;
-            return true;
-        case OP_B:
-        case OP_BL:
-            if (operands.count != 1U) return false;
-            if (spec->operation == OP_BL && !file_printf(output, "    state->lr = UINT32_C(0x%08lX);\n",
-                                                         (unsigned long)(item->address + 4U))) return false;
-            return emit_branch_target(output, program, function, abi, operands.values[0],
-                                      spec->operation == OP_BL, diagnostics, source, item);
-        case OP_BLR:
-            if (operands.count != 0U) return false;
-            return file_printf(output, "    return;\n");
-        case OP_BLRL:
-            if (operands.count != 0U) return false;
-            return file_printf(output,
-                "    { uint32_t target = state->lr; state->lr = UINT32_C(0x%08lX); "
-                "if (!porpoise_call_address(state, target)) return; if (porpoise_state_should_stop(state)) return; }\n",
-                (unsigned long)(item->address + 4U));
-        case OP_BCTR:
-        case OP_BCTRL:
-            if (operands.count != 0U) return false;
-            if (spec->operation == OP_BCTRL && !file_printf(output, "    state->lr = UINT32_C(0x%08lX);\n",
-                                                            (unsigned long)(item->address + 4U))) return false;
-            if (!file_printf(output, "    if (!porpoise_call_address(state, state->ctr)) return;\n")) return false;
-            if (!file_printf(output, "    if (porpoise_state_should_stop(state)) return;\n")) return false;
-            return spec->operation == OP_BCTRL || file_printf(output, "    return;\n");
-        case OP_CONDITIONAL_BRANCH: {
-            unsigned int field = 0U;
-            const char *target;
-            unsigned int bit;
-            bool negate = spec->detail < 0 || (spec->detail & 0x100) != 0;
-            char condition[128];
-            if (operands.count == 2U) {
-                if (strncmp(operands.values[0], "cr", 2U) != 0 ||
-                    !parse_unsigned(operands.values[0] + 2, &unsigned_value) || unsigned_value > 7U) return false;
-                field = (unsigned int)unsigned_value;
-                target = operands.values[1];
-            } else if (operands.count == 1U) {
-                target = operands.values[0];
-            } else return false;
-            bit = (unsigned int)(spec->detail < 0 ? -spec->detail : (spec->detail & 0xff));
-            if (!porpoise_format(condition, sizeof(condition), "%sporpoise_cr_get_bit(state, %uU)",
-                                 negate ? "!" : "", field * 4U + bit)) return false;
-            return emit_conditional_target(output, program, function, abi, target, condition,
-                                           diagnostics, source, item);
-        }
-        case OP_CONDITIONAL_RETURN: {
-            unsigned int field = 0U;
-            unsigned int bit;
-            bool negate = spec->detail < 0 || (spec->detail & 0x100) != 0;
-            if (operands.count == 1U) {
-                if (strncmp(operands.values[0], "cr", 2U) != 0 ||
-                    !parse_unsigned(operands.values[0] + 2, &unsigned_value) || unsigned_value > 7U) return false;
-                field = (unsigned int)unsigned_value;
-            } else if (operands.count != 0U) return false;
-            bit = (unsigned int)(spec->detail < 0 ? -spec->detail : (spec->detail & 0xff));
-            return file_printf(output, "    if (%sporpoise_cr_get_bit(state, %uU)) return;\n",
-                               negate ? "!" : "", field * 4U + bit);
-        }
-        case OP_BDNZ:
-        case OP_BDZ:
-            if (operands.count != 1U) return false;
-            if (!file_printf(output, "    state->ctr -= UINT32_C(1);\n")) return false;
-            return emit_conditional_target(output, program, function, abi, operands.values[0],
-                                           spec->operation == OP_BDNZ
-                                               ? "state->ctr != UINT32_C(0)"
-                                               : "state->ctr == UINT32_C(0)",
-                                           diagnostics, source, item);
-        case OP_MFLR:
-        case OP_MFCTR:
-        case OP_MFCR:
-            if (operands.count != 1U || !parse_register(operands.values[0], 'r', &rd)) return false;
-            return file_printf(output, "    state->gpr[%u] = state->%s;\n", rd,
-                               spec->operation == OP_MFLR ? "lr" : spec->operation == OP_MFCTR ? "ctr" : "cr");
-        case OP_MTLR:
-        case OP_MTCTR:
-            if (operands.count != 1U || !parse_register(operands.values[0], 'r', &ra)) return false;
-            return file_printf(output, "    state->%s = state->gpr[%u];\n",
-                               spec->operation == OP_MTLR ? "lr" : "ctr", ra);
-        case OP_CR_LOGIC: {
-            unsigned int destination_bit, left_bit, right_bit;
-            if (spec->detail == CR_LOGICAL_CLEAR || spec->detail == CR_LOGICAL_SET) {
-                if (operands.count != 1U || !parse_cr_bit(operands.values[0], &destination_bit))
-                    return false;
-                return file_printf(output,
-                    "    porpoise_cr_set_bit(state, %uU, %d);\n",
-                    destination_bit, spec->detail == CR_LOGICAL_SET ? 1 : 0);
-            }
-            if (operands.count != 3U ||
-                !parse_cr_bit(operands.values[0], &destination_bit) ||
-                !parse_cr_bit(operands.values[1], &left_bit) ||
-                !parse_cr_bit(operands.values[2], &right_bit)) return false;
-            return file_printf(output,
-                "    porpoise_cr_set_bit(state, %uU, porpoise_cr_get_bit(state, %uU) || porpoise_cr_get_bit(state, %uU));\n",
-                destination_bit, left_bit, right_bit);
-        }
-        case OP_COMPARE: {
-            unsigned int field = 0U;
-            size_t base = 0U;
-            if (operands.count == 3U) {
-                if (strncmp(operands.values[0], "cr", 2U) != 0 ||
-                    !parse_unsigned(operands.values[0] + 2, &unsigned_value) || unsigned_value > 7U) return false;
-                field = (unsigned int)unsigned_value;
-                base = 1U;
-            } else if (operands.count != 2U) return false;
-            if (!parse_register(operands.values[base], 'r', &ra)) return false;
-            if (spec->detail <= 2) {
-                if (spec->detail == 1) {
-                    if (!parse_signed(operands.values[base + 1U], &immediate) ||
-                        immediate < INT16_MIN || immediate > (int32_t)UINT16_MAX) return false;
-                    return file_printf(output,
-                        "    porpoise_compare_signed(state, %uU, state->gpr[%u], porpoise_sign_extend16(UINT32_C(0x%04lX)));\n",
-                        field, ra, (unsigned long)(uint16_t)immediate);
-                }
-                if (!parse_unsigned(operands.values[base + 1U], &unsigned_value) || unsigned_value > UINT16_MAX) return false;
-                return file_printf(output,
-                    "    porpoise_compare_unsigned(state, %uU, state->gpr[%u], UINT32_C(0x%04lX));\n",
-                    field, ra, (unsigned long)unsigned_value);
-            }
-            if (!parse_register(operands.values[base + 1U], 'r', &rb)) return false;
-            return file_printf(output, "    porpoise_compare_%s(state, %uU, state->gpr[%u], state->gpr[%u]);\n",
-                               spec->detail == 3 ? "signed" : "unsigned", field, ra, rb);
-        }
-        case OP_FLOAT_BINARY:
-        case OP_PAIRED_BINARY: {
-            const char *operator_text = spec->detail == FLOAT_ADD ? "+" : spec->detail == FLOAT_SUB ? "-" :
-                                        spec->detail == FLOAT_MUL ? "*" : "/";
-            if (operands.count != 3U || !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra) || !parse_register(operands.values[2], 'f', &rb)) return false;
-            if (spec->operation == OP_FLOAT_BINARY) {
-                bool single = item->mnemonic[strlen(item->mnemonic) - 1U] == 's';
-                if (single) {
-                    return file_printf(output,
-                        "    { double result = (double)(float)(porpoise_fpr_get_f64(state, %uU, 0U) %s porpoise_fpr_get_f64(state, %uU, 0U)); "
-                        "porpoise_fpr_set_f64(state, %uU, 0U, result); porpoise_fpr_set_f64(state, %uU, 1U, result); }\n",
-                        ra, operator_text, rb, rd, rd);
-                }
-                return file_printf(output,
-                    "    porpoise_fpr_set_f64(state, %uU, 0U, porpoise_fpr_get_f64(state, %uU, 0U) %s porpoise_fpr_get_f64(state, %uU, 0U));\n",
-                    rd, ra, operator_text, rb);
-            }
-            return file_printf(output,
-                "    porpoise_fpr_set_f64(state, %uU, 0U, (double)(float)(porpoise_fpr_get_f64(state, %uU, 0U) %s porpoise_fpr_get_f64(state, %uU, 0U)));\n"
-                "    porpoise_fpr_set_f64(state, %uU, 1U, (double)(float)(porpoise_fpr_get_f64(state, %uU, 1U) %s porpoise_fpr_get_f64(state, %uU, 1U)));\n",
-                rd, ra, operator_text, rb, rd, ra, operator_text, rb);
-        }
-        case OP_PAIRED_TERNARY: {
-            const char *operator_text =
-                spec->detail == PAIRED_MSUB || spec->detail == PAIRED_NMSUB ? "-" : "+";
-            const char *negate_text =
-                spec->detail == PAIRED_NMADD || spec->detail == PAIRED_NMSUB
-                    ? "if (!isnan(result0)) result0 = -result0; if (!isnan(result1)) result1 = -result1; "
-                    : "";
-            if (operands.count != 4U || !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra) ||
-                !parse_register(operands.values[2], 'f', &rc) ||
-                !parse_register(operands.values[3], 'f', &rb)) return false;
-            return file_printf(output,
-                "    { double a0 = porpoise_fpr_get_f64(state, %uU, 0U); double a1 = porpoise_fpr_get_f64(state, %uU, 1U); "
-                "double c0 = porpoise_fpr_get_f64(state, %uU, 0U); double c1 = porpoise_fpr_get_f64(state, %uU, 1U); "
-                "double b0 = porpoise_fpr_get_f64(state, %uU, 0U); double b1 = porpoise_fpr_get_f64(state, %uU, 1U); "
-                "double result0 = (double)(float)(a0 * c0 %s b0); double result1 = (double)(float)(a1 * c1 %s b1); "
-                "%sporpoise_fpr_set_f64(state, %uU, 0U, result0); porpoise_fpr_set_f64(state, %uU, 1U, result1); }\n",
-                ra, ra, rc, rc, rb, rb, operator_text, operator_text, negate_text, rd, rd);
-        }
-        case OP_PAIRED_SCALAR_MADD:
-            if (operands.count != 4U || !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra) ||
-                !parse_register(operands.values[2], 'f', &rc) ||
-                !parse_register(operands.values[3], 'f', &rb)) return false;
-            return file_printf(output,
-                "    { double a0 = porpoise_fpr_get_f64(state, %uU, 0U); double a1 = porpoise_fpr_get_f64(state, %uU, 1U); "
-                "double scalar = porpoise_fpr_get_f64(state, %uU, %dU); "
-                "double b0 = porpoise_fpr_get_f64(state, %uU, 0U); double b1 = porpoise_fpr_get_f64(state, %uU, 1U); "
-                "double result0 = (double)(float)(a0 * scalar + b0); double result1 = (double)(float)(a1 * scalar + b1); "
-                "porpoise_fpr_set_f64(state, %uU, 0U, result0); porpoise_fpr_set_f64(state, %uU, 1U, result1); }\n",
-                ra, ra, rc, spec->detail, rb, rb, rd, rd);
-        case OP_PAIRED_SCALAR_MULTIPLY:
-            if (operands.count != 3U || !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra) ||
-                !parse_register(operands.values[2], 'f', &rc)) return false;
-            return file_printf(output,
-                "    { double a0 = porpoise_fpr_get_f64(state, %uU, 0U); double a1 = porpoise_fpr_get_f64(state, %uU, 1U); "
-                "double scalar = porpoise_fpr_get_f64(state, %uU, %dU); "
-                "porpoise_fpr_set_f64(state, %uU, 0U, (double)(float)(a0 * scalar)); "
-                "porpoise_fpr_set_f64(state, %uU, 1U, (double)(float)(a1 * scalar)); }\n",
-                ra, ra, rc, spec->detail, rd, rd);
-        case OP_PAIRED_SUM:
-            if (operands.count != 4U || !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra) ||
-                !parse_register(operands.values[2], 'f', &rc) ||
-                !parse_register(operands.values[3], 'f', &rb)) return false;
-            if (spec->detail == 0) {
-                return file_printf(output,
-                    "    { double sum = (double)(float)(porpoise_fpr_get_f64(state, %uU, 0U) + porpoise_fpr_get_f64(state, %uU, 1U)); "
-                    "double passthrough = (double)(float)porpoise_fpr_get_f64(state, %uU, 1U); "
-                    "porpoise_fpr_set_f64(state, %uU, 0U, sum); porpoise_fpr_set_f64(state, %uU, 1U, passthrough); }\n",
-                    ra, rb, rc, rd, rd);
-            }
-            return file_printf(output,
-                "    { double sum = (double)(float)(porpoise_fpr_get_f64(state, %uU, 0U) + porpoise_fpr_get_f64(state, %uU, 1U)); "
-                "double passthrough = (double)(float)porpoise_fpr_get_f64(state, %uU, 0U); "
-                "porpoise_fpr_set_f64(state, %uU, 0U, passthrough); porpoise_fpr_set_f64(state, %uU, 1U, sum); }\n",
-                ra, rb, rc, rd, rd);
-        case OP_PAIRED_MERGE: {
-            unsigned int left_lane =
-                spec->detail == PAIRED_MERGE_10 || spec->detail == PAIRED_MERGE_11 ? 1U : 0U;
-            unsigned int right_lane =
-                spec->detail == PAIRED_MERGE_01 || spec->detail == PAIRED_MERGE_11 ? 1U : 0U;
-            if (operands.count != 3U || !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra) ||
-                !parse_register(operands.values[2], 'f', &rb)) return false;
-            return file_printf(output,
-                "    { uint64_t result0 = porpoise_fpr_get_bits(state, %uU, %uU); "
-                "uint64_t result1 = porpoise_fpr_get_bits(state, %uU, %uU); "
-                "porpoise_fpr_set_bits(state, %uU, 0U, result0); porpoise_fpr_set_bits(state, %uU, 1U, result1); }\n",
-                ra, left_lane, rb, right_lane, rd, rd);
-        }
-        case OP_PAIRED_UNARY:
-            if (operands.count != 2U || !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra)) return false;
-            return file_printf(output,
-                "    { uint64_t lane0 = porpoise_fpr_get_bits(state, %uU, 0U)%s; "
-                "uint64_t lane1 = porpoise_fpr_get_bits(state, %uU, 1U)%s; "
-                "porpoise_fpr_set_bits(state, %uU, 0U, lane0); porpoise_fpr_set_bits(state, %uU, 1U, lane1); }\n",
-                ra, spec->detail == PAIRED_NEGATE ? " ^ UINT64_C(0x8000000000000000)" : "",
-                ra, spec->detail == PAIRED_NEGATE ? " ^ UINT64_C(0x8000000000000000)" : "",
-                rd, rd);
-        case OP_PAIRED_COMPARE: {
-            unsigned int field;
-            if (operands.count != 3U || strncmp(operands.values[0], "cr", 2U) != 0 ||
-                !parse_unsigned(operands.values[0] + 2, &unsigned_value) || unsigned_value > 7U ||
-                !parse_register(operands.values[1], 'f', &ra) ||
-                !parse_register(operands.values[2], 'f', &rb)) return false;
-            field = (unsigned int)unsigned_value;
-            return file_printf(output,
-                "    porpoise_fcmpo(state, %uU, porpoise_fpr_get_bits(state, %uU, 0U), porpoise_fpr_get_bits(state, %uU, 0U));\n"
-                "    if (porpoise_state_has_fault(state)) return;\n",
-                field, ra, rb);
-        }
-        case OP_PAIRED_SELECT:
-            if (operands.count != 4U || !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra) ||
-                !parse_register(operands.values[2], 'f', &rc) ||
-                !parse_register(operands.values[3], 'f', &rb)) return false;
-            return file_printf(output,
-                "    { uint64_t result0 = porpoise_fsel_bits(porpoise_fpr_get_bits(state, %uU, 0U), porpoise_fpr_get_bits(state, %uU, 0U), porpoise_fpr_get_bits(state, %uU, 0U)); "
-                "uint64_t result1 = porpoise_fsel_bits(porpoise_fpr_get_bits(state, %uU, 1U), porpoise_fpr_get_bits(state, %uU, 1U), porpoise_fpr_get_bits(state, %uU, 1U)); "
-                "porpoise_fpr_set_bits(state, %uU, 0U, result0); porpoise_fpr_set_bits(state, %uU, 1U, result1); }\n",
-                ra, rc, rb, ra, rc, rb, rd, rd);
-        case OP_FLOAT_UNARY:
-            if (operands.count != 2U || !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra)) return false;
-            if (spec->detail == FLOAT_MOVE) {
-                if (!file_printf(output,
-                    "    porpoise_fpr_set_bits(state, %uU, 0U, porpoise_fpr_get_bits(state, %uU, 0U));\n",
-                    rd, ra)) return false;
-            } else if (spec->detail == FLOAT_NEG) {
-                if (!file_printf(output,
-                    "    porpoise_fpr_set_bits(state, %uU, 0U, porpoise_fpr_get_bits(state, %uU, 0U) ^ UINT64_C(0x8000000000000000));\n",
-                    rd, ra)) return false;
-            } else if (spec->detail == FLOAT_ABS) {
-                if (!file_printf(output,
-                    "    porpoise_fpr_set_bits(state, %uU, 0U, porpoise_fpr_get_bits(state, %uU, 0U) & UINT64_C(0x7FFFFFFFFFFFFFFF));\n",
-                    rd, ra)) return false;
-            } else if (!file_printf(output,
-                       "    porpoise_fpr_set_bits(state, %uU, 0U, porpoise_fpr_get_bits(state, %uU, 0U) | UINT64_C(0x8000000000000000));\n",
-                       rd, ra)) {
-                return false;
-            }
-            return !record || file_printf(output, "    porpoise_fpscr_update_cr1(state);\n");
-        case OP_FLOAT_COMPARE: {
-            unsigned int field;
-            if (operands.count != 3U || strncmp(operands.values[0], "cr", 2U) != 0 ||
-                !parse_unsigned(operands.values[0] + 2, &unsigned_value) ||
-                unsigned_value > 7U ||
-                !parse_register(operands.values[1], 'f', &ra) ||
-                !parse_register(operands.values[2], 'f', &rb)) return false;
-            field = (unsigned int)unsigned_value;
-            return file_printf(
-                output,
-                "    porpoise_fcmp%c(state, %uU, porpoise_fpr_get_bits(state, %uU, 0U), porpoise_fpr_get_bits(state, %uU, 0U));\n"
-                "    if (porpoise_state_has_fault(state)) return;\n",
-                spec->detail != 0 ? 'o' : 'u', field, ra, rb);
-        }
-        case OP_FLOAT_SELECT:
-            if (operands.count != 4U ||
-                !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra) ||
-                !parse_register(operands.values[2], 'f', &rc) ||
-                !parse_register(operands.values[3], 'f', &rb) ||
-                !file_printf(
-                    output,
-                    "    porpoise_fpr_set_bits(state, %uU, 0U, porpoise_fsel_bits(porpoise_fpr_get_bits(state, %uU, 0U), porpoise_fpr_get_bits(state, %uU, 0U), porpoise_fpr_get_bits(state, %uU, 0U)));\n",
-                    rd, ra, rc, rb)) return false;
-            return !record || file_printf(output, "    porpoise_fpscr_update_cr1(state);\n");
-        case OP_FRSP:
-            if (operands.count != 2U || !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra)) return false;
-            return file_printf(output,
-                "    if (!porpoise_frsp(state, %uU, %uU, %d)) return;\n",
-                rd, ra, record ? 1 : 0);
-        case OP_FCTIW:
-        case OP_FCTIWZ:
-            if (operands.count != 2U || !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra)) return false;
-            return file_printf(output,
-                "    if (!porpoise_fctiw%s(state, %uU, %uU, %d)) return;\n",
-                spec->operation == OP_FCTIWZ ? "z" : "",
-                rd, ra, record ? 1 : 0);
-        case OP_MFFS:
-            if (operands.count != 1U || !parse_register(operands.values[0], 'f', &rd))
-                return false;
-            return file_printf(output,
-                "    if (!porpoise_mffs(state, %uU, %d)) return;\n",
-                rd, record ? 1 : 0);
-        case OP_MTFSF:
-            if (operands.count != 2U ||
-                !parse_unsigned(operands.values[0], &unsigned_value) || unsigned_value > UINT8_MAX ||
-                !parse_register(operands.values[1], 'f', &ra)) return false;
-            return file_printf(output,
-                "    if (!porpoise_mtfsf(state, %luU, %uU, %d)) return;\n",
-                (unsigned long)unsigned_value, ra, record ? 1 : 0);
-        case OP_MTFSB1:
-            if (operands.count != 1U || !parse_cr_bit(operands.values[0], &rd))
-                return false;
-            return file_printf(output,
-                "    if (!porpoise_mtfsb1(state, %uU, %d)) return;\n",
-                rd, record ? 1 : 0);
-        case OP_FLOAT_FMA: {
-            int operation = spec->detail & 0xff;
-            const char *operation_name = operation == SCALAR_FMA_MADD ? "MADD" :
-                                         operation == SCALAR_FMA_MSUB ? "MSUB" :
-                                         operation == SCALAR_FMA_NMADD ? "NMADD" : "NMSUB";
-            const char *precision_name = (spec->detail & SCALAR_FMA_SINGLE) != 0
-                ? "SINGLE" : "DOUBLE";
-            if (operands.count != 4U || !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra) ||
-                !parse_register(operands.values[2], 'f', &rc) ||
-                !parse_register(operands.values[3], 'f', &rb)) return false;
-            return file_printf(output,
-                "    if (!porpoise_fp_fma(state, %uU, %uU, %uU, %uU, "
-                "PORPOISE_FP_FMA_%s, PORPOISE_FP_PRECISION_%s, %d)) return;\n",
-                rd, ra, rc, rb, operation_name, precision_name, record ? 1 : 0);
-        }
-        case OP_RECIPROCAL_APPROX:
-            if (operands.count != 2U || !parse_register(operands.values[0], 'f', &rd) ||
-                !parse_register(operands.values[1], 'f', &ra)) return false;
-            if (spec->detail == 0)
-                return file_printf(output,
-                    "    porpoise_fpr_set_f64(state, %uU, 0U, 1.0 / porpoise_fpr_get_f64(state, %uU, 0U)); /* approximation */\n",
-                    rd, ra);
-            return file_printf(output,
-                "    porpoise_fpr_set_f64(state, %uU, 0U, 1.0 / sqrt(porpoise_fpr_get_f64(state, %uU, 0U))); /* approximation */\n",
-                rd, ra);
+    if ((spec->operation >= OP_NOP &&
+         spec->operation <= OP_INTEGER_UNARY) ||
+        spec->operation == OP_HOST_NOOP) {
+        return porpoise_lower_emit_integer(&context);
+    }
+    if (spec->operation >= OP_LOAD &&
+        spec->operation <= OP_STORE_MULTIPLE) {
+        return porpoise_lower_emit_memory(&context);
+    }
+    if (spec->operation >= OP_B &&
+        spec->operation <= OP_COMPARE) {
+        return porpoise_lower_emit_branch(&context);
+    }
+    if ((spec->operation >= OP_FLOAT_BINARY &&
+         spec->operation <= OP_PAIRED_SELECT) ||
+        spec->operation == OP_RECIPROCAL_APPROX) {
+        return porpoise_lower_emit_float(&context);
     }
     return false;
 }

@@ -1,0 +1,7 @@
+# Meson downloads wrap contents here. Keep only the reproducible pins and
+# package overlays in version control.
+*
+!.gitignore
+!*.wrap
+!packagefiles/
+!packagefiles/**

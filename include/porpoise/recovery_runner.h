@@ -16,6 +16,13 @@ typedef struct PorpoiseRecoveryRunOptions {
     size_t target_id_count;
     bool analyze_only;
     bool force;
+    /*
+     * Persist refreshed target caches to project->path atomically after every
+     * selected target plans successfully and before output staging begins.
+     * The default is false so in-process/GUI callers retain explicit-save
+     * semantics; the project CLI enables it.
+     */
+    bool persist_refreshed_caches;
     const char *report_path;
     const char *runtime_directory;
     const char *dtk_path;
@@ -30,6 +37,9 @@ typedef struct PorpoiseRecoveryRunTarget {
     PorpoiseTranslationPlan *plan;
     PorpoiseReport report;
     PorpoiseStagedProject *staged;
+    bool match_cache_hit;
+    bool match_cache_refreshed;
+    size_t match_cache_hint_used_count;
     bool generated;
     bool published;
 } PorpoiseRecoveryRunTarget;

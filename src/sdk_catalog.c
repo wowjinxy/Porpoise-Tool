@@ -721,19 +721,193 @@ static bool sdk_key(
 static bool sdk_signature_exact_equal(
     const PorpoiseFunctionSignature *left,
     const PorpoiseFunctionSignature *right) {
-    return left->algorithm_version == right->algorithm_version &&
-           left->function_size == right->function_size &&
-           left->instruction_count == right->instruction_count &&
-           left->fixed_instruction_count == right->fixed_instruction_count &&
-           left->meaningful_fixed_instruction_count ==
-               right->meaningful_fixed_instruction_count &&
-           left->relocation_count == right->relocation_count &&
-           left->internal_branch_count == right->internal_branch_count &&
-           left->external_branch_count == right->external_branch_count &&
-           left->external_target_count == right->external_target_count &&
-           left->issue_flags == right->issue_flags &&
-           memcmp(left->digest, right->digest,
-                  PORPOISE_SHA256_DIGEST_SIZE) == 0;
+    return porpoise_signature_equal(left, right);
+}
+
+typedef struct SdkCatalogIdentityIndexSlot {
+    uint64_t hash;
+    size_t entry_plus_one;
+} SdkCatalogIdentityIndexSlot;
+
+typedef struct SdkCatalogSignatureIndexSlot {
+    uint64_t hash;
+    size_t representative_plus_one;
+    size_t match_count;
+} SdkCatalogSignatureIndexSlot;
+
+struct PorpoiseSdkCatalogLookupIndex {
+    size_t capacity;
+    SdkCatalogIdentityIndexSlot *identities;
+    SdkCatalogSignatureIndexSlot *signatures;
+};
+
+static uint64_t sdk_index_hash_bytes(
+    uint64_t hash,
+    const void *data,
+    size_t size) {
+    const unsigned char *bytes = (const unsigned char *)data;
+    size_t index;
+    for (index = 0U; index < size; index++) {
+        hash ^= (uint64_t)bytes[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t sdk_index_hash_u32(uint64_t hash, uint32_t value) {
+    unsigned char bytes[4];
+    bytes[0] = (unsigned char)(value >> 24U);
+    bytes[1] = (unsigned char)(value >> 16U);
+    bytes[2] = (unsigned char)(value >> 8U);
+    bytes[3] = (unsigned char)value;
+    return sdk_index_hash_bytes(hash, bytes, sizeof(bytes));
+}
+
+static uint64_t sdk_index_identity_hash(const char *identity) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = sdk_index_hash_bytes(hash, identity, strlen(identity));
+    return hash == 0U ? UINT64_C(1) : hash;
+}
+
+static uint64_t sdk_index_signature_hash(
+    const PorpoiseFunctionSignature *signature) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = sdk_index_hash_u32(hash, signature->algorithm_version);
+    hash = sdk_index_hash_u32(hash, signature->function_size);
+    hash = sdk_index_hash_u32(hash, signature->instruction_count);
+    hash = sdk_index_hash_u32(hash, signature->fixed_instruction_count);
+    hash = sdk_index_hash_u32(
+        hash, signature->meaningful_fixed_instruction_count);
+    hash = sdk_index_hash_u32(hash, signature->relocation_count);
+    hash = sdk_index_hash_u32(hash, signature->internal_branch_count);
+    hash = sdk_index_hash_u32(hash, signature->external_branch_count);
+    hash = sdk_index_hash_u32(hash, signature->external_target_count);
+    hash = sdk_index_hash_u32(hash, signature->issue_flags);
+    hash = sdk_index_hash_bytes(
+        hash, signature->digest, PORPOISE_SHA256_DIGEST_SIZE);
+    return hash == 0U ? UINT64_C(1) : hash;
+}
+
+static void sdk_catalog_index_free(PorpoiseSdkCatalogLookupIndex *index) {
+    if (index == NULL) return;
+    free(index->identities);
+    free(index->signatures);
+    free(index);
+}
+
+static bool sdk_catalog_index_capacity(
+    size_t entry_count,
+    size_t *capacity_out) {
+    size_t required;
+    size_t capacity = 16U;
+    if (entry_count > SIZE_MAX / 2U) return false;
+    required = entry_count * 2U;
+    while (capacity < required) {
+        if (capacity > SIZE_MAX / 2U) return false;
+        capacity *= 2U;
+    }
+    *capacity_out = capacity;
+    return true;
+}
+
+static bool sdk_catalog_rebuild_index(PorpoiseSdkCatalog *catalog) {
+    PorpoiseSdkCatalogLookupIndex *replacement;
+    size_t capacity;
+    size_t entry_index;
+    if (catalog->entry_count == 0U) {
+        sdk_catalog_index_free(catalog->lookup_index);
+        catalog->lookup_index = NULL;
+        return true;
+    }
+    if (!sdk_catalog_index_capacity(catalog->entry_count, &capacity)) {
+        return false;
+    }
+    replacement = (PorpoiseSdkCatalogLookupIndex *)calloc(
+        1U, sizeof(*replacement));
+    if (replacement == NULL) return false;
+    replacement->capacity = capacity;
+    replacement->identities = (SdkCatalogIdentityIndexSlot *)calloc(
+        capacity, sizeof(*replacement->identities));
+    replacement->signatures = (SdkCatalogSignatureIndexSlot *)calloc(
+        capacity, sizeof(*replacement->signatures));
+    if (replacement->identities == NULL ||
+        replacement->signatures == NULL) {
+        sdk_catalog_index_free(replacement);
+        return false;
+    }
+    for (entry_index = 0U;
+         entry_index < catalog->entry_count;
+         entry_index++) {
+        const PorpoiseSdkCatalogEntry *entry =
+            &catalog->entries[entry_index];
+        uint64_t identity_hash = sdk_index_identity_hash(
+            entry->canonical_identity);
+        uint64_t signature_hash = sdk_index_signature_hash(
+            &entry->signature);
+        size_t slot = (size_t)identity_hash & (capacity - 1U);
+        while (replacement->identities[slot].entry_plus_one != 0U) {
+            slot = (slot + 1U) & (capacity - 1U);
+        }
+        replacement->identities[slot].hash = identity_hash;
+        replacement->identities[slot].entry_plus_one = entry_index + 1U;
+
+        slot = (size_t)signature_hash & (capacity - 1U);
+        while (replacement->signatures[slot].representative_plus_one != 0U) {
+            size_t representative =
+                replacement->signatures[slot].representative_plus_one - 1U;
+            if (replacement->signatures[slot].hash == signature_hash &&
+                sdk_signature_exact_equal(
+                    &catalog->entries[representative].signature,
+                    &entry->signature)) {
+                replacement->signatures[slot].match_count++;
+                break;
+            }
+            slot = (slot + 1U) & (capacity - 1U);
+        }
+        if (replacement->signatures[slot].representative_plus_one == 0U) {
+            replacement->signatures[slot].hash = signature_hash;
+            replacement->signatures[slot].representative_plus_one =
+                entry_index + 1U;
+            replacement->signatures[slot].match_count = 1U;
+        }
+    }
+    sdk_catalog_index_free(catalog->lookup_index);
+    catalog->lookup_index = replacement;
+    return true;
+}
+
+static bool sdk_catalog_lookup_indexed_signature(
+    const PorpoiseSdkCatalog *catalog,
+    const PorpoiseFunctionSignature *signature,
+    PorpoiseSdkCatalogMatch *match_out) {
+    const PorpoiseSdkCatalogLookupIndex *lookup_index;
+    uint64_t hash;
+    size_t slot;
+    memset(match_out, 0, sizeof(*match_out));
+    match_out->status = PORPOISE_SDK_CATALOG_MATCH_NONE;
+    lookup_index = catalog == NULL ? NULL : catalog->lookup_index;
+    if (lookup_index == NULL || lookup_index->capacity == 0U) return false;
+    hash = sdk_index_signature_hash(signature);
+    slot = (size_t)hash & (lookup_index->capacity - 1U);
+    while (lookup_index->signatures[slot].representative_plus_one != 0U) {
+        const SdkCatalogSignatureIndexSlot *candidate =
+            &lookup_index->signatures[slot];
+        size_t representative = candidate->representative_plus_one - 1U;
+        if (candidate->hash == hash &&
+            sdk_signature_exact_equal(
+                &catalog->entries[representative].signature, signature)) {
+            match_out->match_count = candidate->match_count;
+            if (candidate->match_count == 1U) {
+                match_out->status = PORPOISE_SDK_CATALOG_MATCH_UNIQUE;
+                match_out->entry = &catalog->entries[representative];
+            } else {
+                match_out->status = PORPOISE_SDK_CATALOG_MATCH_AMBIGUOUS;
+            }
+            return true;
+        }
+        slot = (slot + 1U) & (lookup_index->capacity - 1U);
+    }
+    return true;
 }
 
 static bool sdk_optional_string_equal(const char *left, const char *right) {
@@ -822,6 +996,7 @@ void porpoise_sdk_catalog_free(PorpoiseSdkCatalog *catalog) {
     for (index = 0U; index < catalog->entry_count; index++)
         sdk_entry_free(&catalog->entries[index]);
     free(catalog->entries);
+    sdk_catalog_index_free(catalog->lookup_index);
     memset(catalog, 0, sizeof(*catalog));
 }
 
@@ -906,6 +1081,14 @@ int porpoise_sdk_catalog_add(
     copy.provenance.source_kind = entry->provenance.source_kind;
     copy.provenance.line = entry->provenance.line;
     catalog->entries[catalog->entry_count++] = copy;
+    if (!sdk_catalog_rebuild_index(catalog)) {
+        catalog->entry_count--;
+        sdk_entry_free(&catalog->entries[catalog->entry_count]);
+        return sdk_add_diagnostic(
+            diagnostics, PORPOISE_EXIT_INTERNAL,
+            entry->provenance.path, entry->provenance.line,
+            "out of memory while indexing SDK catalog entry");
+    }
     return PORPOISE_EXIT_OK;
 }
 
@@ -1498,6 +1681,8 @@ PorpoiseSdkCatalogMatch porpoise_sdk_catalog_lookup_exact(
     memset(&match, 0, sizeof(match));
     match.status = PORPOISE_SDK_CATALOG_MATCH_NONE;
     if (catalog == NULL || signature == NULL) return match;
+    if (sdk_catalog_lookup_indexed_signature(catalog, signature, &match))
+        return match;
     for (index = 0U; index < catalog->entry_count; index++) {
         const PorpoiseSdkCatalogEntry *entry = &catalog->entries[index];
         if (!sdk_signature_exact_equal(&entry->signature, signature)) continue;
@@ -1509,6 +1694,69 @@ PorpoiseSdkCatalogMatch porpoise_sdk_catalog_lookup_exact(
     } else if (match.match_count > 1U) {
         match.status = PORPOISE_SDK_CATALOG_MATCH_AMBIGUOUS;
         match.entry = NULL;
+    }
+    return match;
+}
+
+const PorpoiseSdkCatalogEntry *porpoise_sdk_catalog_find_identity(
+    const PorpoiseSdkCatalog *catalog,
+    const char *canonical_identity) {
+    size_t index;
+    if (catalog == NULL || canonical_identity == NULL ||
+        canonical_identity[0] == '\0') {
+        return NULL;
+    }
+    if (catalog->lookup_index != NULL &&
+        catalog->lookup_index->capacity != 0U) {
+        uint64_t hash = sdk_index_identity_hash(canonical_identity);
+        size_t slot = (size_t)hash &
+            (catalog->lookup_index->capacity - 1U);
+        while (catalog->lookup_index->identities[slot].entry_plus_one != 0U) {
+            const SdkCatalogIdentityIndexSlot *candidate =
+                &catalog->lookup_index->identities[slot];
+            size_t entry_index = candidate->entry_plus_one - 1U;
+            if (candidate->hash == hash &&
+                strcmp(catalog->entries[entry_index].canonical_identity,
+                       canonical_identity) == 0) {
+                return &catalog->entries[entry_index];
+            }
+            slot = (slot + 1U) &
+                (catalog->lookup_index->capacity - 1U);
+        }
+        return NULL;
+    }
+    for (index = 0U; index < catalog->entry_count; index++) {
+        if (catalog->entries[index].canonical_identity != NULL &&
+            strcmp(catalog->entries[index].canonical_identity,
+                   canonical_identity) == 0) {
+            return &catalog->entries[index];
+        }
+    }
+    return NULL;
+}
+
+PorpoiseSdkCatalogMatch porpoise_sdk_catalog_lookup_identity_exact(
+    const PorpoiseSdkCatalog *catalog,
+    const char *canonical_identity,
+    const PorpoiseFunctionSignature *signature) {
+    PorpoiseSdkCatalogMatch match;
+    const PorpoiseSdkCatalogEntry *entry;
+    memset(&match, 0, sizeof(match));
+    match.status = PORPOISE_SDK_CATALOG_MATCH_NONE;
+    if (catalog == NULL || signature == NULL) return match;
+    entry = porpoise_sdk_catalog_find_identity(
+        catalog, canonical_identity);
+    if (entry == NULL ||
+        !sdk_signature_exact_equal(&entry->signature, signature)) {
+        return match;
+    }
+    if (!sdk_catalog_lookup_indexed_signature(catalog, signature, &match)) {
+        match = porpoise_sdk_catalog_lookup_exact(catalog, signature);
+    }
+    if (match.status == PORPOISE_SDK_CATALOG_MATCH_UNIQUE &&
+        match.entry != entry) {
+        memset(&match, 0, sizeof(match));
+        match.status = PORPOISE_SDK_CATALOG_MATCH_NONE;
     }
     return match;
 }

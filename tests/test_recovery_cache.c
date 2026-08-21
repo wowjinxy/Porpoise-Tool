@@ -245,6 +245,7 @@ static void test_rebuild_and_invalidation(
     PorpoiseRecoveryCacheValidation validation;
     PorpoiseDtkImportMetadata metadata;
     char preserved_hash[PORPOISE_SHA256_HEX_SIZE];
+    bool matches_plan = false;
     size_t original_matches;
     int result;
 
@@ -277,6 +278,24 @@ static void test_rebuild_and_invalidation(
           PORPOISE_EXIT_OK);
     CHECK(validation.state == PORPOISE_RECOVERY_CACHE_HIT);
     CHECK(validation.reason_flags == PORPOISE_RECOVERY_CACHE_REASON_NONE);
+    CHECK(porpoise_recovery_target_cache_matches_plan(
+              &first, plan, &matches_plan, diagnostics) == PORPOISE_EXIT_OK);
+    CHECK(matches_plan);
+    if (first.cache.match_count != 0U) {
+        char *saved_identity = first.cache.matches[0].canonical_identity;
+        char *different_identity = porpoise_strdup("DifferentSdkIdentity");
+        CHECK(different_identity != NULL);
+        if (different_identity != NULL) {
+            first.cache.matches[0].canonical_identity = different_identity;
+            matches_plan = true;
+            CHECK(porpoise_recovery_target_cache_matches_plan(
+                      &first, plan, &matches_plan, diagnostics) ==
+                  PORPOISE_EXIT_OK);
+            CHECK(!matches_plan);
+            free(first.cache.matches[0].canonical_identity);
+            first.cache.matches[0].canonical_identity = saved_identity;
+        }
+    }
 
     changed = inputs;
     changed.dependencies = dependencies_b;

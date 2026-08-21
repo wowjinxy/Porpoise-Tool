@@ -19,6 +19,17 @@ typedef struct BatchCancellationProbe {
     size_t publish_progress;
 } BatchCancellationProbe;
 
+typedef struct PublicationProbe {
+    size_t publish_progress;
+} PublicationProbe;
+
+typedef struct DestinationRaceProbe {
+    const char *output;
+    const char *sentinel;
+    PorpoiseDiagnostics *diagnostics;
+    bool injected;
+} DestinationRaceProbe;
+
 #define CHECK(condition)                                                        \
     do {                                                                        \
         if (!(condition)) {                                                     \
@@ -89,6 +100,69 @@ static void cancel_after_first_batch_publish(
 
 static bool batch_cancellation_requested(void *user_data) {
     return ((BatchCancellationProbe *)user_data)->cancel;
+}
+
+static void record_publication_progress(
+    void *user_data,
+    PorpoiseOperationPhase phase,
+    size_t completed,
+    size_t total,
+    const char *detail) {
+    PublicationProbe *probe = (PublicationProbe *)user_data;
+    (void)completed;
+    (void)total;
+    (void)detail;
+    if (phase == PORPOISE_PHASE_PUBLISH) probe->publish_progress++;
+}
+
+static void create_destination_during_publication(
+    void *user_data,
+    PorpoiseOperationPhase phase,
+    size_t completed,
+    size_t total,
+    const char *detail) {
+    DestinationRaceProbe *probe = (DestinationRaceProbe *)user_data;
+    FILE *file;
+    (void)total;
+    (void)detail;
+    if (phase != PORPOISE_PHASE_PUBLISH || completed != 0U ||
+        probe->injected) {
+        return;
+    }
+    probe->injected = true;
+    CHECK(porpoise_make_directories(
+        probe->output, probe->diagnostics));
+    file = fopen(probe->sentinel, "wb");
+    CHECK(file != NULL);
+    if (file != NULL) {
+        CHECK(fputs("created-during-publication", file) >= 0);
+        CHECK(fclose(file) == 0);
+    }
+}
+
+static int stage_with_stack_callbacks(
+    const PorpoiseTranslationPlan *plan,
+    const char *output,
+    const char *runtime,
+    PublicationProbe *probe,
+    PorpoiseReport *report,
+    PorpoiseStagedProject **staged_out,
+    PorpoiseDiagnostics *diagnostics) {
+    PorpoiseProjectOptions options;
+    PorpoiseOperationCallbacks callbacks;
+    int result;
+    porpoise_operation_callbacks_init(&callbacks);
+    callbacks.progress = record_publication_progress;
+    callbacks.user_data = probe;
+    porpoise_project_options_init(&options);
+    options.output_path = output;
+    options.runtime_directory = runtime;
+    options.entry_symbol = "lift_me";
+    options.operation = &callbacks;
+    result = porpoise_project_stage_plan(
+        plan, &options, report, staged_out, diagnostics);
+    memset(&callbacks, 0, sizeof(callbacks));
+    return result;
 }
 
 static char *read_file_snapshot(const char *path, size_t *size_out) {
@@ -756,6 +830,362 @@ static void test_transactional_batch_publication(
     porpoise_diagnostics_free(&diagnostics);
 }
 
+static void test_staged_publication_copies_callbacks(
+    const char *source_root) {
+    const char *output = ".porpoise-session-plan-callback-copy";
+    char input[PORPOISE_PATH_CAPACITY];
+    char runtime[PORPOISE_PATH_CAPACITY];
+    char generated[PORPOISE_PATH_CAPACITY];
+    PorpoiseSessionOpenOptions session_options;
+    PorpoisePlanOptions plan_options;
+    PublicationProbe probe;
+    PorpoiseSession *session = NULL;
+    PorpoiseTranslationPlan *plan = NULL;
+    PorpoiseStagedProject *staged = NULL;
+    PorpoiseReport report;
+    PorpoiseDiagnostics diagnostics;
+    int result;
+
+    CHECK(fixture_path(input, sizeof(input), source_root, "input"));
+    CHECK(porpoise_path_join(runtime, sizeof(runtime), source_root, "runtime"));
+    CHECK(porpoise_path_join(
+        generated, sizeof(generated), output, "meson.build"));
+    porpoise_diagnostics_init(&diagnostics);
+    porpoise_report_init(&report);
+    CHECK(porpoise_remove_tree(output, &diagnostics));
+
+    porpoise_session_open_options_init(&session_options);
+    session_options.input_path = input;
+    result = porpoise_session_open(
+        &session_options, &session, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    porpoise_plan_options_init(&plan_options);
+    plan_options.entry_symbol = "lift_me";
+    result = porpoise_plan_build(
+        session, &plan_options, &plan, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+
+    memset(&probe, 0, sizeof(probe));
+    result = stage_with_stack_callbacks(
+        plan, output, runtime, &probe, &report, &staged, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    probe.publish_progress = 0U;
+    result = porpoise_project_publish_staged(staged, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    CHECK(probe.publish_progress >= 2U);
+    CHECK(porpoise_path_exists(generated));
+
+    porpoise_staged_project_free(staged);
+    CHECK(porpoise_remove_tree(output, &diagnostics));
+    porpoise_report_free(&report);
+    porpoise_plan_free(plan);
+    porpoise_session_close(session);
+    porpoise_diagnostics_free(&diagnostics);
+}
+
+static void test_staged_publication_rejects_destination_race(
+    const char *source_root) {
+    const char *output = ".porpoise-session-plan-output-race";
+    char input[PORPOISE_PATH_CAPACITY];
+    char runtime[PORPOISE_PATH_CAPACITY];
+    char sentinel[PORPOISE_PATH_CAPACITY];
+    char generated[PORPOISE_PATH_CAPACITY];
+    PorpoiseSessionOpenOptions session_options;
+    PorpoisePlanOptions plan_options;
+    PorpoiseProjectOptions project_options;
+    PorpoiseOperationCallbacks callbacks;
+    DestinationRaceProbe probe;
+    PorpoiseSession *session = NULL;
+    PorpoiseTranslationPlan *plan = NULL;
+    PorpoiseStagedProject *staged = NULL;
+    PorpoiseReport report;
+    PorpoiseDiagnostics diagnostics;
+    int result;
+
+    CHECK(fixture_path(input, sizeof(input), source_root, "input"));
+    CHECK(porpoise_path_join(runtime, sizeof(runtime), source_root, "runtime"));
+    CHECK(porpoise_path_join(
+        sentinel, sizeof(sentinel), output, "sentinel.txt"));
+    CHECK(porpoise_path_join(
+        generated, sizeof(generated), output, "meson.build"));
+    porpoise_diagnostics_init(&diagnostics);
+    porpoise_report_init(&report);
+    CHECK(porpoise_remove_tree(output, &diagnostics));
+
+    porpoise_session_open_options_init(&session_options);
+    session_options.input_path = input;
+    result = porpoise_session_open(
+        &session_options, &session, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    porpoise_plan_options_init(&plan_options);
+    plan_options.entry_symbol = "lift_me";
+    result = porpoise_plan_build(
+        session, &plan_options, &plan, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+
+    porpoise_project_options_init(&project_options);
+    memset(&probe, 0, sizeof(probe));
+    probe.output = output;
+    probe.sentinel = sentinel;
+    probe.diagnostics = &diagnostics;
+    porpoise_operation_callbacks_init(&callbacks);
+    callbacks.progress = create_destination_during_publication;
+    callbacks.user_data = &probe;
+    project_options.output_path = output;
+    project_options.runtime_directory = runtime;
+    project_options.entry_symbol = "lift_me";
+    project_options.force = false;
+    project_options.operation = &callbacks;
+    result = porpoise_project_stage_plan(
+        plan, &project_options, &report, &staged, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+
+    result = porpoise_project_publish_staged(staged, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_USAGE);
+    CHECK(probe.injected);
+    CHECK(diagnostics_contain(
+        &diagnostics, "appeared before publication"));
+    CHECK(porpoise_path_exists(sentinel));
+    CHECK(!porpoise_path_exists(generated));
+    CHECK(porpoise_path_is_directory(
+        porpoise_staged_project_stage_path(staged)));
+
+    porpoise_staged_project_free(staged);
+    CHECK(porpoise_path_exists(sentinel));
+    CHECK(porpoise_remove_tree(output, &diagnostics));
+    porpoise_report_free(&report);
+    porpoise_plan_free(plan);
+    porpoise_session_close(session);
+    porpoise_diagnostics_free(&diagnostics);
+}
+
+static void test_plan_binding_digest(const char *source_root) {
+    const char *output = ".porpoise-session-plan-binding-mismatch";
+    char input[PORPOISE_PATH_CAPACITY];
+    char abi[PORPOISE_PATH_CAPACITY];
+    char skip[PORPOISE_PATH_CAPACITY];
+    char runtime[PORPOISE_PATH_CAPACITY];
+    PorpoiseSessionOpenOptions session_options;
+    PorpoisePlanOptions plan_options;
+    PorpoiseProjectOptions project_options;
+    PorpoiseSession *session = NULL;
+    PorpoiseTranslationPlan *first = NULL;
+    PorpoiseTranslationPlan *same = NULL;
+    PorpoiseTranslationPlan *different_entry = NULL;
+    PorpoiseTranslationPlan *bound = NULL;
+    PorpoiseProgram *program;
+    PorpoiseAbiManifest *manifest;
+    PorpoiseFunctionPlanView *view;
+    PorpoiseAbiFunction *effective_binding;
+    PorpoiseAbiValue saved_result;
+    PorpoisePlanAction saved_requested_action;
+    uint32_t saved_word;
+    char saved_digest[PORPOISE_SHA256_HEX_SIZE];
+    PorpoiseReport report;
+    PorpoiseDiagnostics diagnostics;
+    int result;
+
+    CHECK(fixture_path(input, sizeof(input), source_root, "input"));
+    CHECK(fixture_path(abi, sizeof(abi), source_root, "abi.json"));
+    CHECK(fixture_path(skip, sizeof(skip), source_root, "skip.txt"));
+    CHECK(porpoise_path_join(
+        runtime, sizeof(runtime), source_root, "runtime"));
+    porpoise_diagnostics_init(&diagnostics);
+    porpoise_report_init(&report);
+    CHECK(porpoise_remove_tree(output, &diagnostics));
+
+    /* Entry selection is part of the stable settings identity. */
+    porpoise_session_open_options_init(&session_options);
+    session_options.input_path = input;
+    CHECK(porpoise_session_open(
+              &session_options, &session, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    porpoise_plan_options_init(&plan_options);
+    plan_options.entry_symbol = "lift_me";
+    plan_options.target_id = "binding-test";
+    CHECK(porpoise_plan_build(
+              session, &plan_options, &first, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    CHECK(porpoise_plan_build(
+              session, &plan_options, &same, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    CHECK(strcmp(
+              porpoise_plan_digest(first),
+              porpoise_plan_digest(same)) == 0);
+    plan_options.entry_symbol = "import_me";
+    CHECK(porpoise_plan_build(
+              session, &plan_options, &different_entry, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    CHECK(strcmp(
+              porpoise_plan_digest(first),
+              porpoise_plan_digest(different_entry)) != 0);
+
+    /* A structurally valid plan-view edit is still rejected as tampering. */
+    view = (PorpoiseFunctionPlanView *)porpoise_plan_function_at(first, 2U);
+    CHECK(view != NULL);
+    if (view != NULL) {
+        saved_requested_action = view->requested_action;
+        view->requested_action = PORPOISE_PLAN_ACTION_OMIT;
+        CHECK(porpoise_plan_validate(first, &diagnostics) ==
+              PORPOISE_EXIT_TRANSLATION);
+        CHECK(diagnostics_contain(&diagnostics, "binding digest mismatch"));
+        view->requested_action = saved_requested_action;
+        CHECK(porpoise_plan_validate(first, &diagnostics) ==
+              PORPOISE_EXIT_OK);
+    }
+    memcpy(
+        saved_digest, porpoise_plan_digest(first), sizeof(saved_digest));
+    ((char *)porpoise_plan_digest(first))[0] =
+        saved_digest[0] == '0' ? '1' : '0';
+    CHECK(porpoise_plan_validate(first, &diagnostics) ==
+          PORPOISE_EXIT_TRANSLATION);
+    memcpy(
+        (char *)porpoise_plan_digest(first),
+        saved_digest,
+        sizeof(saved_digest));
+    CHECK(porpoise_plan_validate(first, &diagnostics) == PORPOISE_EXIT_OK);
+
+    porpoise_plan_free(different_entry);
+    porpoise_plan_free(same);
+    porpoise_plan_free(first);
+    different_entry = NULL;
+    same = NULL;
+    first = NULL;
+    porpoise_session_close(session);
+    session = NULL;
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_diagnostics_init(&diagnostics);
+
+    /* Program bytes and every ABI mapping are bound to the plan. */
+    porpoise_session_open_options_init(&session_options);
+    session_options.input_path = input;
+    session_options.abi_path = abi;
+    session_options.skip_list_path = skip;
+    CHECK(porpoise_session_open(
+              &session_options, &session, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    porpoise_plan_options_init(&plan_options);
+    plan_options.entry_symbol = "lift_me";
+    plan_options.target_id = "binding-test";
+    CHECK(porpoise_plan_build(
+              session, &plan_options, &bound, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    CHECK(porpoise_plan_validate(bound, &diagnostics) == PORPOISE_EXIT_OK);
+
+    program = (PorpoiseProgram *)porpoise_session_program(session);
+    CHECK(program != NULL && program->file_count != 0U);
+    CHECK(program != NULL && program->files[0].function_count != 0U);
+    CHECK(program != NULL &&
+          program->files[0].functions[0].item_count != 0U);
+    saved_word = program->files[0].functions[0].items[0].word;
+    program->files[0].functions[0].items[0].word ^= UINT32_C(1);
+    CHECK(porpoise_plan_validate(bound, &diagnostics) ==
+          PORPOISE_EXIT_TRANSLATION);
+
+    porpoise_project_options_init(&project_options);
+    project_options.output_path = output;
+    project_options.runtime_directory = runtime;
+    project_options.force = true;
+    result = porpoise_project_generate_plan(
+        bound, &project_options, &report, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_TRANSLATION);
+    CHECK(!porpoise_path_exists(output));
+    program->files[0].functions[0].items[0].word = saved_word;
+    CHECK(porpoise_plan_validate(bound, &diagnostics) == PORPOISE_EXIT_OK);
+
+    manifest = (PorpoiseAbiManifest *)porpoise_session_abi(session);
+    CHECK(manifest != NULL && manifest->function_count == 1U);
+    saved_result = manifest->functions[0].result;
+    manifest->functions[0].result.type = PORPOISE_ABI_U32;
+    manifest->functions[0].result.register_class =
+        PORPOISE_ABI_REGISTER_GPR;
+    manifest->functions[0].result.register_index = 3U;
+    CHECK(porpoise_plan_validate(bound, &diagnostics) ==
+          PORPOISE_EXIT_TRANSLATION);
+    manifest->functions[0].result = saved_result;
+    CHECK(porpoise_plan_validate(bound, &diagnostics) == PORPOISE_EXIT_OK);
+
+    view = (PorpoiseFunctionPlanView *)
+        porpoise_plan_find_function(bound, "import_me");
+    CHECK(view != NULL && view->binding != NULL);
+    effective_binding = view == NULL
+                            ? NULL
+                            : (PorpoiseAbiFunction *)view->binding;
+    if (effective_binding != NULL) {
+        saved_result = effective_binding->result;
+        effective_binding->result.type = PORPOISE_ABI_U32;
+        effective_binding->result.register_class =
+            PORPOISE_ABI_REGISTER_GPR;
+        effective_binding->result.register_index = 3U;
+        CHECK(porpoise_plan_validate(bound, &diagnostics) ==
+              PORPOISE_EXIT_TRANSLATION);
+        effective_binding->result = saved_result;
+        CHECK(porpoise_plan_validate(bound, &diagnostics) ==
+              PORPOISE_EXIT_OK);
+    }
+
+    porpoise_plan_free(bound);
+    porpoise_session_close(session);
+    porpoise_report_free(&report);
+    porpoise_diagnostics_free(&diagnostics);
+}
+
+static void test_plan_binding_includes_data(const char *source_root) {
+    char input[PORPOISE_PATH_CAPACITY];
+    PorpoiseSessionOpenOptions session_options;
+    PorpoisePlanOptions plan_options;
+    PorpoiseSession *session = NULL;
+    PorpoiseTranslationPlan *plan = NULL;
+    PorpoiseProgram *program;
+    PorpoiseDataSpan *span = NULL;
+    PorpoiseDiagnostics diagnostics;
+    uint8_t saved_byte = 0U;
+    size_t index;
+
+    CHECK(porpoise_path_join(
+        input, sizeof(input), source_root,
+        "tests/fixtures/inputs/asm_data/data_layout.s"));
+    porpoise_diagnostics_init(&diagnostics);
+    porpoise_session_open_options_init(&session_options);
+    session_options.input_path = input;
+    CHECK(porpoise_session_open(
+              &session_options, &session, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    porpoise_plan_options_init(&plan_options);
+    plan_options.entry_symbol = "entry_fn";
+    CHECK(porpoise_plan_build(
+              session, &plan_options, &plan, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    CHECK(porpoise_plan_validate(plan, &diagnostics) == PORPOISE_EXIT_OK);
+
+    program = (PorpoiseProgram *)porpoise_session_program(session);
+    for (index = 0U;
+         program != NULL && index < program->data_span_count;
+         index++) {
+        if (program->data_spans[index].kind ==
+                PORPOISE_DATA_SPAN_INITIALIZED &&
+            program->data_spans[index].size != 0U &&
+            program->data_spans[index].bytes != NULL) {
+            span = &program->data_spans[index];
+            break;
+        }
+    }
+    CHECK(span != NULL);
+    if (span != NULL) {
+        saved_byte = span->bytes[0];
+        span->bytes[0] ^= UINT8_C(1);
+        CHECK(porpoise_plan_validate(plan, &diagnostics) ==
+              PORPOISE_EXIT_TRANSLATION);
+        span->bytes[0] = saved_byte;
+        CHECK(porpoise_plan_validate(plan, &diagnostics) ==
+              PORPOISE_EXIT_OK);
+    }
+
+    porpoise_plan_free(plan);
+    porpoise_session_close(session);
+    porpoise_diagnostics_free(&diagnostics);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s SOURCE_ROOT\n", argv[0]);
@@ -769,6 +1199,10 @@ int main(int argc, char **argv) {
     test_additive_abi_contracts(argv[1]);
     test_treat_as_data_generation(argv[1]);
     test_transactional_batch_publication(argv[1]);
+    test_staged_publication_copies_callbacks(argv[1]);
+    test_staged_publication_rejects_destination_race(argv[1]);
+    test_plan_binding_digest(argv[1]);
+    test_plan_binding_includes_data(argv[1]);
     if (failures != 0U) {
         fprintf(stderr, "%u session/plan test(s) failed\n", failures);
         return 1;

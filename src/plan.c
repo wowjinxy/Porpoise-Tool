@@ -1,7 +1,6 @@
 #include "plan_internal.h"
 
 #include "porpoise/sdk_contract.h"
-#include "porpoise/sha256.h"
 #include "porpoise/util.h"
 
 #include <ctype.h>
@@ -201,6 +200,16 @@ static const PorpoiseAbiFunction *find_effective_import(
     return porpoise_abi_find_import(&plan->effective_abi, symbol);
 }
 
+static const PorpoiseAbiFunction *find_effective_direct_contract(
+    const PorpoiseTranslationPlan *plan,
+    const char *contract_name) {
+    const PorpoiseAbiFunction *function =
+        find_effective_import(plan, contract_name);
+    return function != NULL && function->adapter == NULL
+               ? function
+               : NULL;
+}
+
 static const PorpoiseAbiFunction *append_contract_import(
     PorpoiseTranslationPlan *plan,
     const PorpoiseSdkContract *contract,
@@ -306,6 +315,16 @@ static bool string_in_list(
     return false;
 }
 
+static const char *ownership_archive_basename(const char *library) {
+    const char *basename = library;
+    const char *cursor;
+    if (library == NULL) return NULL;
+    for (cursor = library; *cursor != '\0'; cursor++) {
+        if (*cursor == '/' || *cursor == '\\') basename = cursor + 1U;
+    }
+    return basename;
+}
+
 static bool map_library_category(
     const char *library,
     PorpoiseSdkCategory *category_out) {
@@ -324,7 +343,10 @@ static bool map_library_category(
         "TRK_MINNOW_DOLPHIN.a", "MetroTRK.a"
     };
     static const char *const stubs[] = {"amcstubs.a", "odemustubs.a"};
-    if (library == NULL || category_out == NULL) return false;
+    library = ownership_archive_basename(library);
+    if (library == NULL || library[0] == '\0' || category_out == NULL) {
+        return false;
+    }
     if (ascii_case_compare(library, "demo.a") == 0) {
         *category_out = PORPOISE_SDK_CATEGORY_DEMO;
     } else if (string_in_list(
@@ -363,11 +385,107 @@ static bool symbol_matches_function_address(
     const PorpoiseFunction *function) {
     return symbol->used && symbol->has_address &&
            symbol->address == function->start_address &&
+           optional_string_equal(symbol->section, function->section) &&
            (module == NULL || module[0] == '\0' ||
             optional_string_equal(symbol->module, module)) &&
            (symbol->kind == PORPOISE_SYMBOL_KIND_FUNCTION ||
             symbol->kind == PORPOISE_SYMBOL_KIND_UNKNOWN ||
             symbol->kind == PORPOISE_SYMBOL_KIND_LABEL);
+}
+
+static bool map_symbol_matches_canonical_identity(
+    const PorpoiseSymbol *symbol,
+    const char *identity) {
+    const char *archive;
+    const char *first_separator;
+    const char *last_separator;
+    const char *cursor;
+    size_t archive_length;
+    size_t identity_archive_length;
+    size_t object_length;
+    size_t identity_object_length;
+    if (symbol == NULL || identity == NULL) return false;
+    if (strcmp(symbol->name, identity) == 0) return true;
+    if (symbol->library == NULL || symbol->object == NULL) return false;
+    archive = ownership_archive_basename(symbol->library);
+    if (archive == NULL || archive[0] == '\0') return false;
+    first_separator = strchr(identity, '/');
+    last_separator = strrchr(identity, '/');
+    if (first_separator == NULL || last_separator == first_separator) {
+        return false;
+    }
+    if (strcmp(last_separator + 1U, symbol->name) != 0) return false;
+    archive_length = strlen(archive);
+    identity_archive_length = (size_t)(first_separator - identity);
+    if (archive_length != identity_archive_length) return false;
+    for (cursor = archive; *cursor != '\0'; cursor++) {
+        size_t offset = (size_t)(cursor - archive);
+        if (tolower((unsigned char)*cursor) !=
+            tolower((unsigned char)identity[offset])) {
+            return false;
+        }
+    }
+    object_length = strlen(symbol->object);
+    identity_object_length =
+        (size_t)(last_separator - first_separator - 1U);
+    if (object_length != identity_object_length) return false;
+    for (cursor = symbol->object; *cursor != '\0'; cursor++) {
+        size_t offset = (size_t)(cursor - symbol->object);
+        char map_character = *cursor == '\\' ? '/' : *cursor;
+        if (map_character != first_separator[1U + offset]) return false;
+    }
+    return true;
+}
+
+static bool assign_map_canonical_identity(
+    PorpoiseTranslationPlan *plan,
+    PorpoiseFunctionPlanView *view) {
+    const PorpoiseSymbol *symbol = view->map_symbol;
+    const char *archive;
+    size_t archive_length;
+    size_t object_length;
+    size_t name_length;
+    size_t total_length;
+    size_t index;
+    char *identity;
+    char *cursor;
+    const char *source;
+    if (symbol == NULL || symbol->library == NULL ||
+        symbol->object == NULL) {
+        view->canonical_sdk_identity =
+            symbol == NULL ? NULL : symbol->name;
+        return true;
+    }
+    archive = ownership_archive_basename(symbol->library);
+    archive_length = strlen(archive);
+    object_length = strlen(symbol->object);
+    name_length = strlen(symbol->name);
+    if (archive_length > SIZE_MAX - object_length ||
+        archive_length + object_length > SIZE_MAX - name_length ||
+        archive_length + object_length + name_length > SIZE_MAX - 3U) {
+        return false;
+    }
+    total_length = archive_length + object_length + name_length + 3U;
+    identity = (char *)malloc(total_length);
+    if (identity == NULL) return false;
+    cursor = identity;
+    memcpy(cursor, archive, archive_length);
+    cursor += archive_length;
+    *cursor++ = '/';
+    for (source = symbol->object; *source != '\0'; source++) {
+        *cursor++ = *source == '\\' ? '/' : *source;
+    }
+    *cursor++ = '/';
+    memcpy(cursor, symbol->name, name_length + 1U);
+    index = (size_t)(view - plan->functions);
+    if (index >= plan->function_count ||
+        plan->owned_sdk_identities[index] != NULL) {
+        free(identity);
+        return false;
+    }
+    plan->owned_sdk_identities[index] = identity;
+    view->canonical_sdk_identity = identity;
+    return true;
 }
 
 static const PorpoiseSymbol *select_map_symbol(
@@ -391,7 +509,8 @@ static const PorpoiseSymbol *select_map_symbol(
         }
         *has_map_evidence = true;
         if (sdk_entry != NULL &&
-            strcmp(symbol->name, sdk_entry->canonical_identity) == 0) {
+            map_symbol_matches_canonical_identity(
+                symbol, sdk_entry->canonical_identity)) {
             *canonical_name_seen = true;
             score += 100U;
         }
@@ -407,7 +526,7 @@ static const PorpoiseSymbol *select_map_symbol(
     return best;
 }
 
-static const PorpoiseSdkContract *contract_for_entry(
+static const char *contract_name_for_entry(
     const PorpoiseSdkCatalogEntry *entry,
     const char *override_name) {
     const char *name = override_name;
@@ -416,7 +535,14 @@ static const PorpoiseSdkContract *contract_for_entry(
                    ? entry->contract_name
                    : entry->canonical_identity;
     }
-    return porpoise_sdk_contract_find_by_canonical_name(name);
+    return name;
+}
+
+static const PorpoiseSdkContract *builtin_contract_for_entry(
+    const PorpoiseSdkCatalogEntry *entry,
+    const char *override_name) {
+    return porpoise_sdk_contract_find_by_canonical_name(
+        contract_name_for_entry(entry, override_name));
 }
 
 static void populate_legacy_action(
@@ -462,7 +588,59 @@ static void mark_view_blocked(
     if (plan->blocking_reason == NULL) plan->blocking_reason = reason;
 }
 
-static void populate_sdk_evidence(
+static const char *normalized_hint_identity(const char *value) {
+    return value == NULL ? "" : value;
+}
+
+static bool exact_optional_string_equal(
+    const char *left,
+    const char *right) {
+    if (left == NULL || right == NULL) return left == right;
+    return strcmp(left, right) == 0;
+}
+
+static bool lookup_verified_match_hint(
+    const PorpoiseSdkCatalog *catalog,
+    const PorpoisePlanOptions *options,
+    const PorpoiseFunctionPlanView *view,
+    PorpoiseSdkCatalogMatch *match_out) {
+    size_t index;
+    if (catalog == NULL || options == NULL || view == NULL ||
+        match_out == NULL || view->function == NULL ||
+        !porpoise_signature_is_automatic_match_eligible(&view->signature)) {
+        return false;
+    }
+    for (index = 0U; index < options->match_hint_count; index++) {
+        const PorpoisePlanMatchHint *hint = &options->match_hints[index];
+        PorpoiseSdkCatalogMatch match;
+        if (hint->target_id == NULL || hint->module == NULL ||
+            hint->normalized_fingerprint == NULL ||
+            hint->canonical_identity == NULL ||
+            strcmp(hint->target_id,
+                   normalized_hint_identity(options->target_id)) != 0 ||
+            strcmp(hint->module,
+                   normalized_hint_identity(options->module)) != 0 ||
+            hint->address != view->function->start_address ||
+            hint->size != view->function->size ||
+            strcmp(hint->normalized_fingerprint,
+                   view->signature.digest_hex) != 0) {
+            continue;
+        }
+        match = porpoise_sdk_catalog_lookup_identity_exact(
+            catalog, hint->canonical_identity, &view->signature);
+        if (match.status != PORPOISE_SDK_CATALOG_MATCH_UNIQUE ||
+            match.entry == NULL ||
+            !exact_optional_string_equal(
+                match.entry->contract_name, hint->contract_name)) {
+            continue;
+        }
+        *match_out = match;
+        return true;
+    }
+    return false;
+}
+
+static bool populate_sdk_evidence(
     PorpoiseTranslationPlan *plan,
     PorpoiseFunctionPlanView *view,
     const PorpoisePlanOptions *options,
@@ -473,6 +651,9 @@ static void populate_sdk_evidence(
         porpoise_session_symbols(plan->session);
     PorpoiseSdkCatalogMatch match;
     const PorpoiseSdkContract *contract = NULL;
+    const PorpoiseAbiFunction *direct_contract = NULL;
+    const char *contract_name = NULL;
+    bool match_hint_used;
     bool signature_eligible;
     bool has_map_evidence;
     bool canonical_name_seen;
@@ -484,12 +665,18 @@ static void populate_sdk_evidence(
             porpoise_session_program(plan->session),
             view->function,
             &view->signature)) {
-        return;
+        return true;
     }
     signature_eligible =
         porpoise_signature_is_automatic_match_eligible(&view->signature);
-    match = porpoise_sdk_catalog_lookup_exact(
-        sdk_catalog, &view->signature);
+    match_hint_used = lookup_verified_match_hint(
+        sdk_catalog, options, view, &match);
+    if (!match_hint_used) {
+        match = porpoise_sdk_catalog_lookup_exact(
+            sdk_catalog, &view->signature);
+    } else if (options->match_hint_used_count_out != NULL) {
+        (*options->match_hint_used_count_out)++;
+    }
     if (match.status == PORPOISE_SDK_CATALOG_MATCH_UNIQUE) {
         view->sdk_entry = match.entry;
         view->canonical_sdk_identity = match.entry->canonical_identity;
@@ -522,7 +709,7 @@ static void populate_sdk_evidence(
         if (!view->has_sdk_category && has_map_category) {
             view->sdk_category = map_category;
             view->has_sdk_category = true;
-            view->canonical_sdk_identity = view->map_symbol->name;
+            if (!assign_map_canonical_identity(plan, view)) return false;
         }
         if (view->map_symbol->has_size && view->map_symbol->size != 0U &&
             view->map_symbol->size != view->function->size) {
@@ -554,42 +741,53 @@ static void populate_sdk_evidence(
     if (view->action != PORPOISE_PLAN_ACTION_LIFT ||
         view->sdk_entry == NULL || !signature_eligible ||
         !porpoise_sdk_category_is_automatic(view->sdk_entry->category)) {
-        return;
+        return true;
     }
-    contract = contract_for_entry(view->sdk_entry, NULL);
-    if (contract != NULL &&
+    contract_name = contract_name_for_entry(view->sdk_entry, NULL);
+    direct_contract = find_effective_direct_contract(plan, contract_name);
+    if (direct_contract == NULL) {
+        contract = builtin_contract_for_entry(view->sdk_entry, NULL);
+    }
+    if (direct_contract == NULL && contract != NULL &&
         !porpoise_sdk_contract_allows_automatic_import(contract)) {
         contract = NULL;
     }
     if (options->sdk_policy == PORPOISE_SDK_POLICY_IMPORTED &&
-        contract != NULL && !conflict) {
+        (direct_contract != NULL || contract != NULL) && !conflict) {
         view->requested_action = PORPOISE_PLAN_ACTION_IMPORT;
     } else if (options->sdk_policy == PORPOISE_SDK_POLICY_OMIT &&
                !conflict) {
-        view->requested_action = contract != NULL
+        view->requested_action =
+            direct_contract != NULL || contract != NULL
                                      ? PORPOISE_PLAN_ACTION_IMPORT
                                      : PORPOISE_PLAN_ACTION_OMIT;
     }
     if (conflict && options->sdk_policy != PORPOISE_SDK_POLICY_KEEP) {
         mark_view_blocked(plan, view, BLOCK_CONFLICT);
-        return;
+        return true;
     }
     if (view->requested_action == PORPOISE_PLAN_ACTION_IMPORT) {
-        const PorpoiseAbiFunction *binding = append_contract_import(
-            plan, contract, view->function->name);
+        const PorpoiseAbiFunction *binding = direct_contract;
+        if (binding == NULL) {
+            binding = append_contract_import(
+                plan, contract, view->function->name);
+        }
         if (binding == NULL) {
             mark_view_blocked(plan, view, BLOCK_IMPORT_CONTRACT);
-            return;
+            return true;
         }
         view->action = PORPOISE_PLAN_ACTION_IMPORT;
         view->origin = PORPOISE_PLAN_ORIGIN_SDK_POLICY;
         view->binding = binding;
-        view->contract_name =
-            porpoise_sdk_contract_canonical_name(contract);
+        view->contract_name = direct_contract != NULL
+                                  ? direct_contract->symbol
+                                  : porpoise_sdk_contract_canonical_name(
+                                        contract);
     } else if (view->requested_action == PORPOISE_PLAN_ACTION_OMIT) {
         view->action = PORPOISE_PLAN_ACTION_OMIT;
         view->origin = PORPOISE_PLAN_ORIGIN_SDK_POLICY;
     }
+    return true;
 }
 
 static bool override_module_matches(
@@ -633,6 +831,7 @@ static void apply_override(
     const PorpoiseFunctionOverride *override) {
     const PorpoiseSdkContract *contract;
     const PorpoiseAbiFunction *binding;
+    const char *contract_name;
     view->overridden = true;
     view->override_action = override->action;
     view->evidence_flags |= PORPOISE_PLAN_EVIDENCE_OVERRIDE;
@@ -665,17 +864,26 @@ static void apply_override(
             }
             break;
         case PORPOISE_OVERRIDE_IMPORT:
-            contract = contract_for_entry(
+            contract_name = contract_name_for_entry(
                 view->sdk_entry, override->contract_name);
-            binding = append_contract_import(
-                plan, contract, view->function->name);
-            if (contract == NULL || binding == NULL) {
+            binding = find_effective_direct_contract(
+                plan, contract_name);
+            contract = NULL;
+            if (binding == NULL) {
+                contract = builtin_contract_for_entry(
+                    view->sdk_entry, override->contract_name);
+                binding = append_contract_import(
+                    plan, contract, view->function->name);
+            }
+            if (binding == NULL) {
                 mark_view_blocked(plan, view, BLOCK_IMPORT_CONTRACT);
             } else {
                 view->action = PORPOISE_PLAN_ACTION_IMPORT;
                 view->binding = binding;
-                view->contract_name =
-                    porpoise_sdk_contract_canonical_name(contract);
+                view->contract_name = contract != NULL
+                                          ? porpoise_sdk_contract_canonical_name(
+                                                contract)
+                                          : binding->symbol;
             }
             break;
         case PORPOISE_OVERRIDE_OMIT:
@@ -696,49 +904,6 @@ static void apply_override(
         default:
             break;
     }
-}
-
-static void hash_u32(PorpoiseSha256Context *hash, uint32_t value) {
-    uint8_t bytes[4];
-    bytes[0] = (uint8_t)(value >> 24U);
-    bytes[1] = (uint8_t)(value >> 16U);
-    bytes[2] = (uint8_t)(value >> 8U);
-    bytes[3] = (uint8_t)value;
-    porpoise_sha256_update(hash, bytes, sizeof(bytes));
-}
-
-static void hash_string(PorpoiseSha256Context *hash, const char *value) {
-    size_t length = value == NULL ? 0U : strlen(value);
-    hash_u32(hash, (uint32_t)length);
-    if (length != 0U) porpoise_sha256_update(hash, value, length);
-}
-
-static void compute_plan_digest(PorpoiseTranslationPlan *plan) {
-    PorpoiseSha256Context hash;
-    uint8_t digest[PORPOISE_SHA256_DIGEST_SIZE];
-    size_t index;
-    porpoise_sha256_init(&hash);
-    hash_string(&hash, "porpoise-translation-plan-v1");
-    hash_string(&hash, plan->target_id);
-    hash_string(&hash, plan->module);
-    hash_u32(&hash, (uint32_t)plan->sdk_policy);
-    for (index = 0U; index < plan->function_count; index++) {
-        const PorpoiseFunctionPlanView *view = &plan->functions[index];
-        hash_string(&hash, view->source->relative_path);
-        hash_string(&hash, view->function->name);
-        hash_u32(&hash, view->function->start_address);
-        hash_u32(&hash, view->function->size);
-        hash_u32(&hash, (uint32_t)view->requested_action);
-        hash_u32(&hash, (uint32_t)view->action);
-        hash_u32(&hash, view->evidence_flags);
-        porpoise_sha256_update(
-            &hash, view->signature.digest,
-            sizeof(view->signature.digest));
-        hash_string(&hash, view->canonical_sdk_identity);
-        hash_string(&hash, view->contract_name);
-    }
-    porpoise_sha256_final(&hash, digest);
-    porpoise_sha256_hex(digest, plan->digest_hex);
 }
 
 int porpoise_plan_build(
@@ -767,6 +932,9 @@ int porpoise_plan_build(
         porpoise_plan_options_init(&defaults);
         options = &defaults;
     }
+    if (options->match_hint_used_count_out != NULL) {
+        *options->match_hint_used_count_out = 0U;
+    }
     if (!sdk_policy_valid(options->sdk_policy)) {
         return plan_error(
             diagnostics, PORPOISE_EXIT_USAGE,
@@ -776,6 +944,11 @@ int porpoise_plan_build(
         return plan_error(
             diagnostics, PORPOISE_EXIT_USAGE,
             "translation plan override array is inconsistent");
+    }
+    if (options->match_hint_count != 0U && options->match_hints == NULL) {
+        return plan_error(
+            diagnostics, PORPOISE_EXIT_USAGE,
+            "translation plan match-hint array is inconsistent");
     }
     for (override_index = 0U;
          override_index < options->override_count;
@@ -838,7 +1011,10 @@ int porpoise_plan_build(
     if (plan->function_count != 0U) {
         plan->functions = (PorpoiseFunctionPlanView *)calloc(
             plan->function_count, sizeof(*plan->functions));
-        if (plan->functions == NULL) {
+        plan->owned_sdk_identities = (char **)calloc(
+            plan->function_count, sizeof(*plan->owned_sdk_identities));
+        if (plan->functions == NULL ||
+            plan->owned_sdk_identities == NULL) {
             porpoise_plan_free(plan);
             return plan_error(
                 diagnostics, PORPOISE_EXIT_INTERNAL,
@@ -877,7 +1053,14 @@ int porpoise_plan_build(
             PorpoiseFunctionPlanView *view = &plan->functions[view_index];
             populate_legacy_action(
                 view, source, function, &plan->analysis, plan);
-            populate_sdk_evidence(plan, view, options, diagnostics);
+            if (!populate_sdk_evidence(
+                    plan, view, options, diagnostics)) {
+                free(matched_overrides);
+                porpoise_plan_free(plan);
+                return plan_error(
+                    diagnostics, PORPOISE_EXIT_INTERNAL,
+                    "out of memory while recording SDK ownership identity");
+            }
             for (override_index = 0U;
                  override_index < options->override_count;
                  override_index++) {
@@ -940,7 +1123,13 @@ int porpoise_plan_build(
         }
     }
     free(matched_overrides);
-    compute_plan_digest(plan);
+    if (!porpoise_plan_compute_binding_digest(
+            plan, plan->digest_hex)) {
+        porpoise_plan_free(plan);
+        return plan_error(
+            diagnostics, PORPOISE_EXIT_INTERNAL,
+            "failed to bind translation plan to its recovery session");
+    }
     porpoise_operation_progress(
         options->operation, PORPOISE_PHASE_PLAN,
         plan->function_count, plan->function_count,
@@ -950,9 +1139,16 @@ int porpoise_plan_build(
 }
 
 void porpoise_plan_free(PorpoiseTranslationPlan *plan) {
+    size_t index;
     if (plan == NULL) return;
     free(plan->target_id);
     free(plan->module);
+    for (index = 0U; index < plan->function_count; index++) {
+        free(plan->owned_sdk_identities == NULL
+                 ? NULL
+                 : plan->owned_sdk_identities[index]);
+    }
+    free(plan->owned_sdk_identities);
     free(plan->functions);
     porpoise_abi_free(&plan->effective_abi);
     porpoise_analysis_free(&plan->analysis);
@@ -1003,6 +1199,7 @@ int porpoise_plan_validate(
     PorpoiseDiagnostics *diagnostics) {
     const PorpoiseProgram *program;
     const PorpoiseAbiManifest *session_abi;
+    char current_digest[PORPOISE_SHA256_HEX_SIZE];
     size_t expected_count;
     size_t file_index;
     size_t view_index = 0U;
@@ -1028,6 +1225,12 @@ int porpoise_plan_validate(
         return plan_error(
             diagnostics, PORPOISE_EXIT_INTERNAL,
             "translation plan function snapshot is inconsistent");
+    }
+    if (!porpoise_plan_compute_binding_digest(plan, current_digest) ||
+        strcmp(current_digest, plan->digest_hex) != 0) {
+        return plan_error(
+            diagnostics, PORPOISE_EXIT_TRANSLATION,
+            "translation plan binding digest mismatch; the recovery session, selected settings, or plan contents changed after planning");
     }
     if (plan->blocked) {
         porpoise_diagnostics_add(

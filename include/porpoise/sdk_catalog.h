@@ -39,10 +39,15 @@ typedef struct PorpoiseSdkCatalogEntry {
     PorpoiseSdkCatalogProvenance provenance;
 } PorpoiseSdkCatalogEntry;
 
+typedef struct PorpoiseSdkCatalogLookupIndex
+    PorpoiseSdkCatalogLookupIndex;
+
 typedef struct PorpoiseSdkCatalog {
     PorpoiseSdkCatalogEntry *entries;
     size_t entry_count;
     size_t entry_capacity;
+    /* Opaque exact-signature and canonical-identity lookup index. */
+    PorpoiseSdkCatalogLookupIndex *lookup_index;
 } PorpoiseSdkCatalog;
 
 typedef enum PorpoiseSdkCatalogMatchStatus {
@@ -92,6 +97,21 @@ int porpoise_sdk_catalog_load_builtin(
 /* Match the digest and every structural field exactly. */
 PorpoiseSdkCatalogMatch porpoise_sdk_catalog_lookup_exact(
     const PorpoiseSdkCatalog *catalog,
+    const PorpoiseFunctionSignature *signature);
+
+/* Find a unique catalog entry by canonical identity, or NULL if absent. */
+const PorpoiseSdkCatalogEntry *porpoise_sdk_catalog_find_identity(
+    const PorpoiseSdkCatalog *catalog,
+    const char *canonical_identity);
+
+/*
+ * Resolve identity and prove that signature has exactly one catalog owner.
+ * This indexed operation is intended for fully revalidated cache hints and
+ * never uses the identity to disambiguate an exact signature collision.
+ */
+PorpoiseSdkCatalogMatch porpoise_sdk_catalog_lookup_identity_exact(
+    const PorpoiseSdkCatalog *catalog,
+    const char *canonical_identity,
     const PorpoiseFunctionSignature *signature);
 
 const char *porpoise_sdk_category_name(PorpoiseSdkCategory category);

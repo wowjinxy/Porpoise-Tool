@@ -4,6 +4,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <direct.h>
+#include <process.h>
+#define TEST_GETPID() _getpid()
+#define TEST_MKDIR(path) _mkdir(path)
+#define TEST_RMDIR(path) _rmdir(path)
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define TEST_GETPID() getpid()
+#define TEST_MKDIR(path) mkdir((path), 0777)
+#define TEST_RMDIR(path) rmdir(path)
+#endif
+
 static unsigned int failures = 0U;
 
 #define CHECK(condition)                                                        \
@@ -54,6 +70,16 @@ static char *read_text(const char *path) {
     fclose(file);
     text[size] = '\0';
     return text;
+}
+
+static bool write_text(const char *path, const char *text) {
+    FILE *file = fopen(path, "wb");
+    int write_result;
+    int close_result;
+    if (file == NULL) return false;
+    write_result = fputs(text, file);
+    close_result = fclose(file);
+    return write_result >= 0 && close_result == 0;
 }
 
 static void check_loaded_project(const PorpoiseRecoveryProject *project) {
@@ -171,13 +197,23 @@ static void test_strict_failures_are_transactional(const char *root) {
 
 static void test_save_rebase_reopen_and_determinism(const char *root) {
     char input_path[PORPOISE_PATH_CAPACITY];
-    const char *first_path = "recovery-project-roundtrip-a.json";
-    const char *second_path = "recovery-project-roundtrip-b.json";
+    char first_path[PORPOISE_PATH_CAPACITY];
+    char second_path[PORPOISE_PATH_CAPACITY];
     PorpoiseRecoveryProject project;
     PorpoiseRecoveryProject reopened;
     PorpoiseDiagnostics diagnostics;
     char *first_text;
     char *second_text;
+    CHECK(snprintf(
+              first_path, sizeof(first_path),
+              "recovery-project-roundtrip-%lu-a.json",
+              (unsigned long)TEST_GETPID()) > 0);
+    CHECK(snprintf(
+              second_path, sizeof(second_path),
+              "recovery-project-roundtrip-%lu-b.json",
+              (unsigned long)TEST_GETPID()) > 0);
+    (void)remove(first_path);
+    (void)remove(second_path);
     CHECK(fixture_path(
         input_path, sizeof(input_path), root, "valid.porpoise.json"));
     porpoise_recovery_project_init(&project);
@@ -222,6 +258,107 @@ static void test_save_rebase_reopen_and_determinism(const char *root) {
     porpoise_recovery_project_free(&project);
 }
 
+static void test_atomic_save_preserves_prior_destination(const char *root) {
+    static const char prior_serialization[] =
+        "prior project bytes before serialization failure\n";
+    static const char prior_publication[] =
+        "prior project bytes before publication failure\n";
+    char save_path[PORPOISE_PATH_CAPACITY];
+    char directory_path[PORPOISE_PATH_CAPACITY];
+    char directory_sentinel[PORPOISE_PATH_CAPACITY];
+    char input_path[PORPOISE_PATH_CAPACITY];
+    PorpoiseRecoveryProject project;
+    PorpoiseRecoveryProject reopened;
+    PorpoiseDiagnostics diagnostics;
+    char *saved_catalog_value;
+    char *saved_catalog_resolved;
+    char *text;
+
+    CHECK(snprintf(
+              save_path, sizeof(save_path),
+              "recovery-project-atomic-save-%lu.json",
+              (unsigned long)TEST_GETPID()) > 0);
+    CHECK(snprintf(
+              directory_path, sizeof(directory_path),
+              "recovery-project-save-directory-%lu",
+              (unsigned long)TEST_GETPID()) > 0);
+    CHECK(snprintf(
+              directory_sentinel, sizeof(directory_sentinel),
+              "%s/prior.txt", directory_path) > 0);
+    CHECK(fixture_path(
+        input_path, sizeof(input_path), root, "valid.porpoise.json"));
+    porpoise_recovery_project_init(&project);
+    porpoise_recovery_project_init(&reopened);
+    porpoise_diagnostics_init(&diagnostics);
+    (void)remove(save_path);
+    (void)remove(directory_sentinel);
+    (void)TEST_RMDIR(directory_path);
+    CHECK(porpoise_recovery_project_load(
+              &project, input_path, &diagnostics) == PORPOISE_EXIT_OK);
+
+    CHECK(write_text(save_path, prior_serialization));
+    saved_catalog_value = project.sdk_catalogs[0].value;
+    saved_catalog_resolved = project.sdk_catalogs[0].resolved;
+    project.sdk_catalogs[0].value = NULL;
+    project.sdk_catalogs[0].resolved = NULL;
+    reset_diagnostics(&diagnostics);
+    CHECK(porpoise_recovery_project_save(
+              &project, save_path, &diagnostics) == PORPOISE_EXIT_IO);
+    project.sdk_catalogs[0].value = saved_catalog_value;
+    project.sdk_catalogs[0].resolved = saved_catalog_resolved;
+    text = read_text(save_path);
+    CHECK(text != NULL && strcmp(text, prior_serialization) == 0);
+    free(text);
+
+    reset_diagnostics(&diagnostics);
+    CHECK(porpoise_recovery_project_save(
+              &project, save_path, &diagnostics) == PORPOISE_EXIT_OK);
+    text = read_text(save_path);
+    CHECK(text != NULL && strcmp(text, prior_serialization) != 0);
+    CHECK(text != NULL && strncmp(text, "{\n", 2U) == 0);
+    free(text);
+    CHECK(porpoise_recovery_project_load(
+              &reopened, save_path, &diagnostics) == PORPOISE_EXIT_OK);
+    CHECK(reopened.target_count == project.target_count);
+
+#ifdef _WIN32
+    {
+        HANDLE locked;
+        CHECK(write_text(save_path, prior_publication));
+        locked = CreateFileA(
+            save_path, GENERIC_READ, FILE_SHARE_READ, NULL,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        CHECK(locked != INVALID_HANDLE_VALUE);
+        if (locked != INVALID_HANDLE_VALUE) {
+            reset_diagnostics(&diagnostics);
+            CHECK(porpoise_recovery_project_save(
+                      &project, save_path, &diagnostics) ==
+                  PORPOISE_EXIT_IO);
+            CHECK(CloseHandle(locked) != 0);
+            text = read_text(save_path);
+            CHECK(text != NULL && strcmp(text, prior_publication) == 0);
+            free(text);
+        }
+    }
+#endif
+
+    CHECK(TEST_MKDIR(directory_path) == 0);
+    CHECK(write_text(directory_sentinel, prior_publication));
+    reset_diagnostics(&diagnostics);
+    CHECK(porpoise_recovery_project_save(
+              &project, directory_path, &diagnostics) == PORPOISE_EXIT_IO);
+    text = read_text(directory_sentinel);
+    CHECK(text != NULL && strcmp(text, prior_publication) == 0);
+    free(text);
+
+    (void)remove(save_path);
+    (void)remove(directory_sentinel);
+    (void)TEST_RMDIR(directory_path);
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_recovery_project_free(&reopened);
+    porpoise_recovery_project_free(&project);
+}
+
 static void test_enum_names(void) {
     PorpoiseRecoverySourceKind source_kind;
     PorpoiseRecoveryAnnotationInterpretation interpretation;
@@ -256,6 +393,7 @@ int main(int argc, char **argv) {
     test_load_and_stale_independence(argv[1]);
     test_strict_failures_are_transactional(argv[1]);
     test_save_rebase_reopen_and_determinism(argv[1]);
+    test_atomic_save_preserves_prior_destination(argv[1]);
     test_enum_names();
     if (failures != 0U) {
         fprintf(stderr, "%u recovery project test(s) failed\n", failures);

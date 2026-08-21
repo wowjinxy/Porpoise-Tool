@@ -28,10 +28,16 @@ porpoise_core_sources = files(
   'src/abi.c',
   'src/asm_data.c',
   'src/lower.c',
+  'src/lower_integer.c',
+  'src/lower_memory.c',
+  'src/lower_branch.c',
+  'src/lower_float.c',
   'src/operation.c',
   'src/options.c',
   'src/program.c',
   'src/project.c',
+  'src/project_report.c',
+  'src/project_publish.c',
   'src/raw_word.c',
   'src/recovery_annotation.c',
   'src/recovery_cache.c',
@@ -47,6 +53,7 @@ porpoise_core_sources = files(
   'src/symbol_map.c',
   'src/dtk_import.c',
   'src/plan.c',
+  'src/plan_digest.c',
   'src/system_lower.c',
   'src/util.c',
   'third_party/jsmn/jsmn.c',
@@ -68,6 +75,117 @@ porpoise = executable(
   c_args: porpoise_compile_args,
   install: true,
 )
+
+# The recovery workbench is deliberately feature-gated. A default setup never
+# enables C++, downloads GUI sources, or introduces desktop dependencies into
+# the C99 core and CLI.
+if get_option('gui').enabled()
+  add_languages('cpp', native: false, required: true)
+
+  cmake = import('cmake')
+  sdl2_options = cmake.subproject_options()
+  sdl2_options.add_cmake_defines({
+    'SDL2_DISABLE_INSTALL': true,
+    'SDL_SHARED': false,
+    'SDL_STATIC': true,
+    # SDL supplies its portable libc shims. Besides reducing host variation,
+    # this avoids hundreds of compiler probes in the bundled configuration.
+    'SDL_LIBC': false,
+    'SDL_TEST': false,
+    'SDL_TESTS': false,
+  })
+  # Keep the parent project's --werror policy on Porpoise while treating the
+  # pinned third-party source as external code.
+  sdl2_options.set_override_option('werror', 'false')
+  sdl2_options.set_install(false)
+  sdl2_project = cmake.subproject(
+    'sdl2',
+    options: sdl2_options,
+    required: true,
+  )
+  sdl2_dep = sdl2_project.dependency('SDL2-static')
+  # CMake models SDL's public headers as generated copies. Making that target
+  # an explicit source dependency prevents ImGui backend compilation from
+  # racing those copies in a fresh parallel build.
+  sdl2_headers = sdl2_project.target('sdl_headers_copy')
+  gui_dependencies = [sdl2_dep, threads_dep]
+  if host_machine.system() == 'windows'
+    gui_dependencies += sdl2_project.dependency('SDL2main')
+  endif
+
+  imgui_project = subproject('imgui', required: true)
+  imgui_dep = imgui_project.get_variable('imgui_dep')
+  imgui_backend_sources = imgui_project.get_variable(
+    'imgui_sdlrenderer2_backend_sources',
+  )
+  portable_file_dialogs_project = subproject(
+    'portable-file-dialogs',
+    required: true,
+  )
+  portable_file_dialogs_dep = portable_file_dialogs_project.get_variable(
+    'portable_file_dialogs_dep',
+  )
+
+  porpoise_gui = executable(
+    'porpoise-gui',
+    [
+      'gui/main.cpp',
+      'gui/workbench_app.cpp',
+      'gui/workbench_model.cpp',
+      imgui_backend_sources,
+      sdl2_headers,
+    ],
+    include_directories: porpoise_inc,
+    dependencies: gui_dependencies + [
+      imgui_dep,
+      portable_file_dialogs_dep,
+    ],
+    link_with: porpoise_core,
+    cpp_args: porpoise_compile_args,
+    override_options: ['cpp_std=c++17'],
+    install: true,
+  )
+
+  # This exercises project open/save/reopen, analysis, overrides, annotations,
+  # ABI editing, and autosave without opening a desktop window.
+  workbench_model_test = executable(
+    'test_workbench_model',
+    [
+      'tests/test_workbench_model.cpp',
+      'gui/workbench_model.cpp',
+    ],
+    include_directories: [porpoise_inc, include_directories('gui')],
+    dependencies: threads_dep,
+    link_with: porpoise_core,
+    cpp_args: porpoise_compile_args,
+    override_options: ['cpp_std=c++17'],
+  )
+  test(
+    'workbench-model',
+    workbench_model_test,
+    args: [meson.project_source_root(), meson.current_build_dir()],
+    timeout: 180,
+  )
+
+  # Initialize the shipped SDL/ImGui executable, exercise dirty File actions,
+  # render several complete frames, and exit without user interaction. The
+  # dummy driver keeps this runnable on headless Linux and Windows CI hosts.
+  gui_smoke_environment = environment()
+  gui_smoke_environment.set('SDL_VIDEODRIVER', 'dummy')
+  gui_smoke_environment.set('SDL_AUDIODRIVER', 'dummy')
+  gui_smoke_environment.set('SDL_RENDER_DRIVER', 'software')
+  gui_smoke_environment.set(
+    'PORPOISE_GUI_SMOKE_STATE_DIR',
+    meson.current_build_dir() / 'workbench-gui-smoke-state',
+  )
+  test(
+    'workbench-gui-startup',
+    porpoise_gui,
+    args: ['--smoke-test'],
+    env: gui_smoke_environment,
+    timeout: 30,
+  )
+endif
 
 install_data(
   'tools/porpoise_sdk_catalog.py',
@@ -826,6 +944,12 @@ test(
   timeout: 180,
 )
 
+test(
+  'onetri-acceptance-tool',
+  python,
+  args: [files('tests/test_onetri_acceptance_tool.py')],
+)
+
 sdk_policy_test = executable(
   'test_sdk_policy',
   'tests/test_sdk_policy.c',
@@ -959,7 +1083,18 @@ test(
     porpoise,
     meson.project_source_root(),
   ],
-  timeout: 180,
+  # This broad end-to-end contract test can take close to three minutes on a
+  # contended Windows runner; leave headroom so parallel CI load is not
+  # mistaken for a functional timeout.
+  timeout: 300,
+)
+
+project_cli_api_helper = executable(
+  'project_cli_api_helper',
+  'tests/project_cli_api_helper.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
 )
 
 test(
@@ -968,6 +1103,7 @@ test(
   args: [
     files('tests/test_project_cli.py'),
     porpoise,
+    project_cli_api_helper,
     meson.project_source_root(),
   ],
   timeout: 180,

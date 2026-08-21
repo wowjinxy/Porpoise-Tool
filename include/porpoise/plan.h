@@ -67,6 +67,21 @@ typedef struct PorpoiseFunctionOverride {
     bool acknowledge_conflict;
 } PorpoiseFunctionOverride;
 
+/*
+ * Non-authoritative exact-match hint. Every field is revalidated against the
+ * loaded function and current SDK catalog; stale or malformed hints are
+ * ignored and ordinary exact catalog matching proceeds unchanged.
+ */
+typedef struct PorpoisePlanMatchHint {
+    const char *target_id;
+    const char *module;
+    uint32_t address;
+    uint32_t size;
+    const char *normalized_fingerprint;
+    const char *canonical_identity;
+    const char *contract_name;
+} PorpoisePlanMatchHint;
+
 typedef struct PorpoisePlanOptions {
     const char *entry_symbol;
     const char *target_id;
@@ -74,13 +89,18 @@ typedef struct PorpoisePlanOptions {
     PorpoiseSdkPolicy sdk_policy;
     const PorpoiseFunctionOverride *overrides;
     size_t override_count;
+    const PorpoisePlanMatchHint *match_hints;
+    size_t match_hint_count;
+    /* Optional operational counter; reset and filled by plan_build(). */
+    size_t *match_hint_used_count_out;
     const PorpoiseOperationCallbacks *operation;
 } PorpoisePlanOptions;
 
 /*
- * A view is immutable and borrows all pointer members from the plan's session.
- * binding_address is the ABI binding address for IMPORT and the function start
- * address for every other action.
+ * A view is immutable. Pointer members are owned by either the plan or its
+ * session and remain valid until the plan is freed (the session must outlive
+ * the plan). binding_address is the ABI binding address for IMPORT and the
+ * function start address for every other action.
  */
 typedef struct PorpoiseFunctionPlanView {
     const PorpoiseSourceFile *source;
@@ -119,7 +139,11 @@ int porpoise_plan_build(
     PorpoiseDiagnostics *diagnostics);
 void porpoise_plan_free(PorpoiseTranslationPlan *plan);
 
-/* Recheck the structural invariants of an already built plan. */
+/*
+ * Recheck structural invariants and the plan's session/settings binding.
+ * Validation rejects a plan when any generation-relevant session input or
+ * snapshotted plan field has changed since porpoise_plan_build().
+ */
 int porpoise_plan_validate(
     const PorpoiseTranslationPlan *plan,
     PorpoiseDiagnostics *diagnostics);

@@ -76,6 +76,77 @@ _BUILTIN_ARCHIVE_CATEGORIES = {
     "odemustubs.a": "stub",
 }
 
+# Audited direct-call adapters implemented by src/sdk_contract.c.  Map import
+# may attach these names only after exact archive ownership has classified the
+# function as Nintendo/Dolphin SDK code.  Keep this list synchronized with the
+# C registry; tests compare the two sources exactly.
+_BUILTIN_SDK_CONTRACTS = frozenset(
+    {
+        "AIInit",
+        "ARAlloc",
+        "ARFree",
+        "ARGetSize",
+        "ARInit",
+        "ARQPostRequest",
+        "ARReset",
+        "CARDProbeEx",
+        "DSPAddTask",
+        "DVDCancel",
+        "DVDClose",
+        "DVDConvertPathToEntrynum",
+        "DVDFastOpen",
+        "DVDGetCommandBlockStatus",
+        "DVDOpen",
+        "DVDReadPrio",
+        "GXCallDisplayList",
+        "GXCopyDisp",
+        "GXCopyTex",
+        "GXGetProjectionv",
+        "GXGetViewportv",
+        "GXInit",
+        "GXLoadLightObjImm",
+        "GXLoadNrmMtxImm",
+        "GXLoadPosMtxImm",
+        "GXLoadTexMtxImm",
+        "GXLoadTexObj",
+        "GXLoadTlut",
+        "GXSetArray",
+        "GXSetChanAmbColor",
+        "GXSetChanMatColor",
+        "GXSetCopyClear",
+        "GXSetCopyFilter",
+        "GXSetDispCopyDst",
+        "GXSetDrawDoneCallback",
+        "GXSetFog",
+        "GXSetFogRangeAdj",
+        "GXSetIndTexMtx",
+        "GXSetProjection",
+        "GXSetTevColor",
+        "GXSetTevColorS10",
+        "GXSetTevIndirect",
+        "GXSetTevKColor",
+        "GXSetTexCopyDst",
+        "OSAllocFromArenaHi",
+        "OSAllocFromArenaLo",
+        "OSExitThread",
+        "OSGetArenaHi",
+        "OSGetArenaLo",
+        "OSGetCurrentThread",
+        "OSInitMessageQueue",
+        "OSReceiveMessage",
+        "OSReport",
+        "OSResumeThread",
+        "OSSendMessage",
+        "OSSetArenaHi",
+        "OSSetArenaLo",
+        "OSSleepThread",
+        "OSSuspendThread",
+        "OSWakeupThread",
+        "VIConfigure",
+        "VISetNextFrameBuffer",
+    }
+)
+
 _DTK_VERSION_PATTERN = re.compile(
     r"\bdtk(?:\.exe)?\s+(\d+)\.(\d+)\.(\d+)(?:\s+[0-9a-fA-F]+)?\b",
     re.IGNORECASE,
@@ -102,6 +173,7 @@ class Candidate:
     category: str
     contract: str | None = None
     expected_size: int | None = None
+    address: int | None = None
     source: str | None = None
     line: int = 0
 
@@ -307,7 +379,7 @@ def load_allowlist(path: Path) -> list[Candidate]:
         _require_exact_keys(
             raw_entry,
             {"symbol", "canonical_identity", "category"},
-            {"contract"},
+            {"contract", "address"},
             context,
         )
         symbol = _nonempty_string(raw_entry["symbol"], f"{context}.symbol")
@@ -322,12 +394,26 @@ def load_allowlist(path: Path) -> list[Candidate]:
         contract: str | None = None
         if "contract" in raw_entry:
             contract = _nonempty_string(raw_entry["contract"], f"{context}.contract")
+        address: int | None = None
+        if "address" in raw_entry:
+            raw_address = raw_entry["address"]
+            if (
+                type(raw_address) is not int
+                or raw_address < 0
+                or raw_address > UINT32_MAX
+                or raw_address % 4 != 0
+            ):
+                raise CatalogError(
+                    f"{context}.address must be an aligned uint32 integer"
+                )
+            address = raw_address
         candidates.append(
             Candidate(
                 symbol=symbol,
                 canonical_identity=identity,
                 category=category,
                 contract=contract,
+                address=address,
                 source=str(path),
                 line=index + 1,
             )
@@ -340,6 +426,7 @@ def load_allowlist(path: Path) -> list[Candidate]:
             or previous.category != entry.category
             or previous.contract != entry.contract
             or previous.expected_size != entry.expected_size
+            or previous.address != entry.address
         ):
             raise CatalogError(
                 f"allowlist symbol selector '{entry.symbol}' names both "
@@ -352,6 +439,16 @@ def load_allowlist(path: Path) -> list[Candidate]:
 
 def _archive_basename(value: str) -> str:
     return value.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _builtin_contract_for_identity(
+    canonical_identity: str,
+    category: str,
+) -> str | None:
+    if category != "nintendo_dolphin":
+        return None
+    leaf = canonical_identity.rsplit("/", 1)[-1]
+    return leaf if leaf in _BUILTIN_SDK_CONTRACTS else None
 
 
 def parse_library_overrides(values: Iterable[str]) -> dict[str, str]:
@@ -428,6 +525,7 @@ def load_codewarrior_map(
         if match is None:
             continue
         size = int(match.group(2), 16)
+        address = int(match.group(3), 16)
         symbol = match.group(5)
         library = match.group(6)
         object_name = match.group(7)
@@ -449,37 +547,40 @@ def load_codewarrior_map(
                 symbol=symbol,
                 canonical_identity=identity,
                 category=category,
+                contract=_builtin_contract_for_identity(identity, category),
                 expected_size=size,
+                address=address,
                 source=str(path),
                 line=line_number,
             )
         )
 
-    # DTK's `-s` selector cannot distinguish two same-named local symbols and
-    # resolves the first one.  Retain that first map occurrence (its size is
-    # verified after DTK runs), but never assign its body to later owners.
-    by_symbol: dict[str, Candidate] = {}
-    unique: list[Candidate] = []
+    # DTK's `-s` selector cannot distinguish same-named symbols.  Selecting an
+    # arbitrary first owner is unsafe even when all candidates have the same
+    # size, so exclude every member of every duplicated map-symbol group.
+    by_symbol: dict[str, list[Candidate]] = {}
     for candidate in candidates:
-        previous = by_symbol.get(candidate.symbol)
-        if previous is not None and previous.canonical_identity != candidate.canonical_identity:
+        by_symbol.setdefault(candidate.symbol, []).append(candidate)
+
+    unique: list[Candidate] = []
+    for symbol_candidates in by_symbol.values():
+        if len(symbol_candidates) == 1:
+            unique.append(symbol_candidates[0])
+            continue
+        for candidate in symbol_candidates:
             if skipped_ambiguous is not None:
                 skipped_ambiguous.append(
                     {
                         "symbol": candidate.symbol,
-                        "selected_identity": previous.canonical_identity,
-                        "selected_size": previous.expected_size,
-                        "skipped_identity": candidate.canonical_identity,
-                        "skipped_size": candidate.expected_size,
+                        "excluded_identity": candidate.canonical_identity,
+                        "excluded_size": candidate.expected_size,
+                        "excluded_address": candidate.address,
+                        "group_size": len(symbol_candidates),
                         "source": candidate.source,
                         "line": candidate.line,
                         "reason": "dtk_name_selector_is_ambiguous",
                     }
                 )
-            continue
-        if previous is None:
-            by_symbol[candidate.symbol] = candidate
-            unique.append(candidate)
     return unique
 
 
@@ -682,6 +783,9 @@ def _normalize_relocation_kind(kind: str) -> str:
         "addr16_lo": "l",
         "addr16_hi": "h",
         "addr16_ha": "ha",
+        # DTK serializes PpcAddr16Hi as "hi" (while Porpoise's assembly
+        # suffix and canonical signature vocabulary use "h").
+        "hi": "h",
         "emb_sda21": "sda21",
         "rel14_brta": "rel14",
         "rel14_brntaken": "rel14",
@@ -736,6 +840,7 @@ def convert_dtk_signature(
     record: _DtkRecord,
     requested_symbol: str,
     expected_size: int | None = None,
+    function_address: int | None = None,
 ) -> SignatureResult:
     blob = _decode_dtk_signature(record, requested_symbol)
     symbols = record.symbols
@@ -765,6 +870,15 @@ def convert_dtk_signature(
         raise CatalogError(
             f"DTK function '{requested_symbol}' has size {function_size}, but its map "
             f"record has size {expected_size}"
+        )
+    if function_address is not None and (
+        function_address < 0
+        or function_address > UINT32_MAX
+        or function_address % 4 != 0
+        or function_size - 1 > UINT32_MAX - function_address
+    ):
+        raise CatalogError(
+            f"function '{requested_symbol}' has an invalid uint32 address range"
         )
 
     relocations: dict[int, tuple[str, int, int]] = {}
@@ -863,22 +977,57 @@ def convert_dtk_signature(
         elif branch is not None:
             _, variable_mask, displacement, absolute = branch
             if absolute:
-                raise CatalogError(
-                    f"DTK function '{requested_symbol}' has an absolute branch at {offset} "
-                    "without relocation metadata"
+                # DTK can omit relocation records for absolute executable
+                # branches. The DTK record does not carry the function's load
+                # address, so map/allowlist layout evidence is required to
+                # distinguish internal control flow from an external vector.
+                if function_address is None:
+                    raise CatalogError(
+                        f"DTK function '{requested_symbol}' contains an absolute "
+                        "branch but has no function layout address"
+                    )
+                decoded_target = displacement & UINT32_MAX
+            else:
+                decoded_target = offset + displacement
+            if absolute:
+                assert function_address is not None
+                internal_offset = decoded_target - function_address
+                internal = (
+                    decoded_target >= function_address
+                    and 0 <= internal_offset < function_size
+                    and internal_offset % 4 == 0
                 )
-            decoded_target = offset + displacement
-            if 0 <= decoded_target < function_size and decoded_target % 4 == 0:
+            else:
+                internal_offset = decoded_target
+                internal = (
+                    0 <= internal_offset < function_size
+                    and internal_offset % 4 == 0
+                )
+            if internal:
                 target_kind = 1
-                target_offset = decoded_target
+                target_offset = internal_offset
+                if absolute:
+                    significant_mask &= ~variable_mask & UINT32_MAX
                 internal_branch_count += 1
             else:
                 target_kind = 2
                 significant_mask &= ~variable_mask & UINT32_MAX
-                ordinal = target_ordinal((target_kind, "relative", decoded_target))
+                ordinal = target_ordinal(
+                    (
+                        target_kind,
+                        "absolute" if absolute else "relative",
+                        decoded_target,
+                    )
+                )
                 external_branch_count += 1
 
-        if dtk_mask != significant_mask:
+        inferred_linker_branch_mask = (
+            relocation is None
+            and branch is not None
+            and dtk_mask == UINT32_MAX
+            and significant_mask != UINT32_MAX
+        )
+        if dtk_mask != significant_mask and not inferred_linker_branch_mask:
             raise CatalogError(
                 f"DTK mask 0x{dtk_mask:08x} at {offset} in '{requested_symbol}' "
                 f"does not match validated mask 0x{significant_mask:08x}"
@@ -964,6 +1113,7 @@ def build_catalog(
                 record,
                 candidate.symbol,
                 expected_size=candidate.expected_size,
+                function_address=candidate.address,
             )
             entry: dict[str, object] = {
                 "canonical_identity": candidate.canonical_identity,
@@ -1095,9 +1245,11 @@ def make_argument_parser() -> argparse.ArgumentParser:
         epilog=(
             "Allowlist v1: {\"schema_version\":1,\"entries\":[{\"symbol\":"
             "\"OSReport\",\"canonical_identity\":\"sdk:OSReport\",\"category\":"
-            "\"nintendo_dolphin\",\"contract\":\"OSReport\"}]}\n"
-            "The contract key is optional. Categories are explicit; symbol-name "
-            "prefixes are never used."
+            "\"nintendo_dolphin\",\"contract\":\"OSReport\",\"address\":"
+            "2147487744}]}\nThe contract and aligned uint32 address keys are "
+            "optional. An address is required if the selected function contains "
+            "an absolute branch. Categories are explicit; symbol-name prefixes "
+            "are never used."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1160,8 +1312,9 @@ def main(argv: Sequence[str] | None = None, runner: Runner | None = None) -> int
         for skipped in skipped_ambiguous:
             print(
                 f"porpoise-sdk-catalog: warning: map symbol '{skipped['symbol']}' "
-                f"selects '{skipped['selected_identity']}'; skipping unreachable "
-                f"'{skipped['skipped_identity']}'",
+                f"is ambiguous across {skipped['group_size']} function records; "
+                f"excluding '{skipped['excluded_identity']}' at "
+                f"0x{skipped['excluded_address']:08x}",
                 file=sys.stderr,
             )
         try:

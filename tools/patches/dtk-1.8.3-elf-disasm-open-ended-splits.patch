@@ -1,0 +1,41 @@
+diff --git a/src/cmd/elf.rs b/src/cmd/elf.rs
+index 8763800..cc58826 100644
+--- a/src/cmd/elf.rs
++++ b/src/cmd/elf.rs
+@@ -135,7 +135,10 @@ fn disasm(args: DisasmArgs) -> Result<()> {
+     match obj.kind {
+         ObjKind::Executable => {
+             log::info!("Splitting {} objects", obj.link_order.len());
+-            let split_objs = split_obj(&obj, None, false)?;
++            // Executable splits otherwise preserve duplicate local names in
++            // relocations between translation units. Qualify those external
++            // references by address so consumers can resolve them exactly.
++            let split_objs = split_obj(&obj, None, true)?;
+
+             let asm_dir = args.out.join("asm");
+             let include_dir = args.out.join("include");
+diff --git a/src/util/split.rs b/src/util/split.rs
+index 14650e6..d20936b 100644
+--- a/src/util/split.rs
++++ b/src/util/split.rs
+@@ -1359,8 +1359,19 @@ pub fn split_obj(
+                 current_address
+             );
+
+-            let split_end = SectionAddress::new(section_index, split.end);
+             let next_addr = split_iter.peek().map(|&(addr, _)| addr).unwrap_or(section_end);
++            let split_end = if split.end == 0 {
++                next_addr
++            } else {
++                SectionAddress::new(section_index, split.end)
++            };
++
++            // Inferred executable splits can collide at one address. The
++            // final inferred unit owns the range, matching section boundary
++            // ownership in executable link order.
++            if split.end == 0 && split_end == current_address {
++                continue;
++            }
+             if next_addr > split_end
+                 && section.data_range(split_end.address, next_addr.address)?.iter().any(|&b| b != 0)
+             {

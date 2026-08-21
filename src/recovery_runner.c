@@ -64,83 +64,132 @@ static uint32_t recovery_runner_name_hash(const char *text) {
     return hash;
 }
 
-static bool recovery_runner_reject_output_overlap(
-    const char *output,
-    const char *dependency,
-    const char *description,
+static int recovery_runner_reject_path_overlap(
+    const char *path,
+    const char *path_description,
+    const char *protected_path,
+    const char *protected_description,
     PorpoiseDiagnostics *diagnostics) {
     bool overlap = false;
-    if (dependency == NULL || dependency[0] == '\0') return true;
-    if (!porpoise_path_trees_overlap(output, dependency, &overlap)) {
+    if (protected_path == NULL || protected_path[0] == '\0') {
+        return PORPOISE_EXIT_OK;
+    }
+    if (!porpoise_path_trees_overlap(path, protected_path, &overlap)) {
         porpoise_diagnostics_add(
-            diagnostics, PORPOISE_SEVERITY_ERROR, output, 0U, 0U,
-            "cannot compare output with %s safely", description);
-        return false;
+            diagnostics, PORPOISE_SEVERITY_ERROR, path, 0U, 0U,
+            "cannot compare %s with %s safely",
+            path_description, protected_description);
+        return PORPOISE_EXIT_IO;
     }
     if (overlap) {
         porpoise_diagnostics_add(
-            diagnostics, PORPOISE_SEVERITY_ERROR, output, 0U, 0U,
-            "output overlaps %s: %s", description, dependency);
-        return false;
-    }
-    return true;
-}
-
-static int recovery_runner_validate_target_paths(
-    const PorpoiseRecoveryProject *project,
-    const PorpoiseRecoveryTarget *target,
-    PorpoiseDiagnostics *diagnostics) {
-    size_t index;
-    bool output_contains_project = false;
-    if (!porpoise_path_contains_path(
-            target->output.resolved, project->path,
-            &output_contains_project)) {
-        return recovery_runner_error(
-            diagnostics, PORPOISE_EXIT_IO, target->output.resolved,
-            "cannot compare project and output paths safely");
-    }
-    if (output_contains_project) {
-        return recovery_runner_error(
-            diagnostics, PORPOISE_EXIT_USAGE, target->output.resolved,
-            "output must not contain the Porpoise project file");
-    }
-    if (!recovery_runner_reject_output_overlap(
-            target->output.resolved, target->input.resolved,
-            "target input", diagnostics) ||
-        (target->has_skip_list &&
-         !recovery_runner_reject_output_overlap(
-             target->output.resolved, target->skip_list.resolved,
-             "skip list", diagnostics))) {
+            diagnostics, PORPOISE_SEVERITY_ERROR, path, 0U, 0U,
+            "%s overlaps %s: %s", path_description,
+            protected_description, protected_path);
         return PORPOISE_EXIT_USAGE;
     }
+    return PORPOISE_EXIT_OK;
+}
+
+static int recovery_runner_validate_protected_path(
+    const PorpoiseRecoveryProject *project,
+    const char *path,
+    const char *path_description,
+    const char *runtime_directory,
+    PorpoiseDiagnostics *diagnostics) {
+    char cache_root[PORPOISE_PATH_CAPACITY];
+    char protected_description[PORPOISE_NAME_CAPACITY + 64U];
+    size_t index;
+    int result;
+    if (path == NULL || path[0] == '\0' || project->path == NULL ||
+        project->path[0] == '\0' || project->directory == NULL ||
+        project->directory[0] == '\0') {
+        return recovery_runner_error(
+            diagnostics, PORPOISE_EXIT_INTERNAL, path,
+            "recovery path preflight received an incomplete path");
+    }
+    result = recovery_runner_reject_path_overlap(
+        path, path_description, project->path,
+        "the Porpoise project file", diagnostics);
+    if (result != PORPOISE_EXIT_OK) return result;
+    if (!porpoise_path_join(
+            cache_root, sizeof(cache_root), project->directory,
+            ".porpoise-cache")) {
+        return PORPOISE_EXIT_INTERNAL;
+    }
+    result = recovery_runner_reject_path_overlap(
+        path, path_description, cache_root,
+        "the managed .porpoise-cache tree", diagnostics);
+    if (result != PORPOISE_EXIT_OK) return result;
+    if (runtime_directory != NULL && runtime_directory[0] != '\0') {
+        result = recovery_runner_reject_path_overlap(
+            path, path_description, runtime_directory,
+            "the runtime directory", diagnostics);
+        if (result != PORPOISE_EXIT_OK) return result;
+    }
     for (index = 0U; index < project->sdk_catalog_count; index++) {
-        if (!recovery_runner_reject_output_overlap(
-                target->output.resolved,
-                project->sdk_catalogs[index].resolved,
-                "SDK catalog", diagnostics)) {
-            return PORPOISE_EXIT_USAGE;
-        }
+        result = recovery_runner_reject_path_overlap(
+            path, path_description, project->sdk_catalogs[index].resolved,
+            "an SDK catalog", diagnostics);
+        if (result != PORPOISE_EXIT_OK) return result;
     }
     for (index = 0U; index < project->abi_contract_count; index++) {
-        if (!recovery_runner_reject_output_overlap(
-                target->output.resolved,
-                project->abi_contracts[index].resolved,
-                "ABI contract", diagnostics)) {
-            return PORPOISE_EXIT_USAGE;
-        }
+        result = recovery_runner_reject_path_overlap(
+            path, path_description, project->abi_contracts[index].resolved,
+            "an ABI contract", diagnostics);
+        if (result != PORPOISE_EXIT_OK) return result;
     }
-    for (index = 0U; index < target->symbol_source_count; index++) {
-        const PorpoiseRecoverySymbolSource *source =
-            &target->symbol_sources[index];
-        if (!recovery_runner_reject_output_overlap(
-                target->output.resolved, source->path.resolved,
-                "symbol source", diagnostics) ||
-            (source->has_auxiliary_path &&
-             !recovery_runner_reject_output_overlap(
-                 target->output.resolved,
-                 source->auxiliary_path.resolved,
-                 "symbol-source auxiliary file", diagnostics))) {
-            return PORPOISE_EXIT_USAGE;
+    for (index = 0U; index < project->target_count; index++) {
+        const PorpoiseRecoveryTarget *target = &project->targets[index];
+        size_t symbol_index;
+        if (!porpoise_format(
+                protected_description, sizeof(protected_description),
+                "input for target %s",
+                target->id == NULL ? "<unknown>" : target->id)) {
+            return PORPOISE_EXIT_INTERNAL;
+        }
+        result = recovery_runner_reject_path_overlap(
+            path, path_description, target->input.resolved,
+            protected_description, diagnostics);
+        if (result != PORPOISE_EXIT_OK) return result;
+        if (target->has_skip_list) {
+            if (!porpoise_format(
+                    protected_description, sizeof(protected_description),
+                    "skip list for target %s",
+                    target->id == NULL ? "<unknown>" : target->id)) {
+                return PORPOISE_EXIT_INTERNAL;
+            }
+            result = recovery_runner_reject_path_overlap(
+                path, path_description, target->skip_list.resolved,
+                protected_description, diagnostics);
+            if (result != PORPOISE_EXIT_OK) return result;
+        }
+        for (symbol_index = 0U;
+             symbol_index < target->symbol_source_count;
+             symbol_index++) {
+            const PorpoiseRecoverySymbolSource *source =
+                &target->symbol_sources[symbol_index];
+            if (!porpoise_format(
+                    protected_description, sizeof(protected_description),
+                    "symbol source for target %s",
+                    target->id == NULL ? "<unknown>" : target->id)) {
+                return PORPOISE_EXIT_INTERNAL;
+            }
+            result = recovery_runner_reject_path_overlap(
+                path, path_description, source->path.resolved,
+                protected_description, diagnostics);
+            if (result != PORPOISE_EXIT_OK) return result;
+            if (!source->has_auxiliary_path) continue;
+            if (!porpoise_format(
+                    protected_description, sizeof(protected_description),
+                    "symbol auxiliary for target %s",
+                    target->id == NULL ? "<unknown>" : target->id)) {
+                return PORPOISE_EXIT_INTERNAL;
+            }
+            result = recovery_runner_reject_path_overlap(
+                path, path_description, source->auxiliary_path.resolved,
+                protected_description, diagnostics);
+            if (result != PORPOISE_EXIT_OK) return result;
         }
     }
     return PORPOISE_EXIT_OK;
@@ -284,17 +333,15 @@ static void recovery_runner_hash_string(
 static void recovery_runner_settings_identity(
     const PorpoiseRecoveryProject *project,
     const PorpoiseRecoveryTarget *target,
-    const PorpoiseTranslationPlan *plan,
     char identity[PORPOISE_SHA256_HEX_SIZE]) {
     PorpoiseSha256Context hash;
     uint8_t digest[PORPOISE_SHA256_DIGEST_SIZE];
     size_t index;
-    static const char domain[] = "porpoise-recovery-target-settings-v1";
+    static const char domain[] = "porpoise-recovery-target-settings-v2";
     porpoise_sha256_init(&hash);
     recovery_runner_hash_string(&hash, domain);
     recovery_runner_hash_u32(&hash, project->schema_version);
     recovery_runner_hash_string(&hash, target->id);
-    recovery_runner_hash_u32(&hash, target->enabled ? 1U : 0U);
     recovery_runner_hash_u32(&hash, (uint32_t)target->source_kind);
     recovery_runner_hash_string(&hash, target->input.resolved);
     recovery_runner_hash_string(&hash, target->output.resolved);
@@ -361,28 +408,37 @@ static void recovery_runner_settings_identity(
         recovery_runner_hash_u32(&hash, annotation->element_count);
         recovery_runner_hash_string(&hash, annotation->encoding);
     }
-    recovery_runner_hash_string(&hash, porpoise_plan_digest(plan));
     porpoise_sha256_final(&hash, digest);
     porpoise_sha256_hex(digest, identity);
 }
 
-static int recovery_runner_update_cache(
+typedef struct RecoveryRunnerCacheContext {
+    PorpoiseRecoveryTarget *target;
+    PorpoiseRecoveryCacheDependencyInput *dependencies;
+    PorpoiseRecoveryCacheInputs inputs;
+    const PorpoiseDtkImportMetadata *metadata;
+    char settings_identity[PORPOISE_SHA256_HEX_SIZE];
+} RecoveryRunnerCacheContext;
+
+static void recovery_runner_cache_context_free(
+    RecoveryRunnerCacheContext *context) {
+    if (context == NULL) return;
+    free(context->dependencies);
+    memset(context, 0, sizeof(*context));
+}
+
+static int recovery_runner_cache_context_prepare(
     PorpoiseRecoveryProject *project,
     PorpoiseRecoveryRunTarget *run_target,
     const PorpoiseRecoveryRunOptions *options,
-    PorpoiseDiagnostics *diagnostics) {
+    RecoveryRunnerCacheContext *context) {
     PorpoiseRecoveryTarget *target;
-    PorpoiseRecoveryCacheDependencyInput *dependencies = NULL;
-    PorpoiseRecoveryCacheInputs inputs;
-    PorpoiseRecoveryCacheValidation validation;
-    const PorpoiseDtkImportMetadata *metadata = NULL;
-    char settings_identity[PORPOISE_SHA256_HEX_SIZE];
     size_t dependency_count = project->sdk_catalog_count +
                               project->abi_contract_count;
     size_t cursor = 0U;
     size_t index;
-    int result;
 
+    memset(context, 0, sizeof(*context));
     target = porpoise_recovery_project_find_target_mutable(
         project, run_target->target->id);
     if (target == NULL) return PORPOISE_EXIT_INTERNAL;
@@ -393,50 +449,93 @@ static int recovery_runner_update_cache(
             dependency_count++;
     }
     if (dependency_count != 0U) {
-        dependencies = (PorpoiseRecoveryCacheDependencyInput *)calloc(
-            dependency_count, sizeof(*dependencies));
-        if (dependencies == NULL) return PORPOISE_EXIT_INTERNAL;
+        context->dependencies =
+            (PorpoiseRecoveryCacheDependencyInput *)calloc(
+                dependency_count, sizeof(*context->dependencies));
+        if (context->dependencies == NULL) return PORPOISE_EXIT_INTERNAL;
     }
     for (index = 0U; index < project->sdk_catalog_count; index++) {
-        dependencies[cursor++].path =
+        context->dependencies[cursor++].path =
             project->sdk_catalogs[index].resolved;
     }
     for (index = 0U; index < project->abi_contract_count; index++) {
-        dependencies[cursor++].path =
+        context->dependencies[cursor++].path =
             project->abi_contracts[index].resolved;
     }
     if (target->has_skip_list) {
-        dependencies[cursor++].path = target->skip_list.resolved;
+        context->dependencies[cursor++].path = target->skip_list.resolved;
     }
     for (index = 0U; index < target->symbol_source_count; index++) {
         const PorpoiseRecoverySymbolSource *source =
             &target->symbol_sources[index];
-        dependencies[cursor++].path = source->path.resolved;
+        context->dependencies[cursor++].path = source->path.resolved;
         if (source->has_auxiliary_path) {
-            dependencies[cursor++].path = source->auxiliary_path.resolved;
+            context->dependencies[cursor++].path =
+                source->auxiliary_path.resolved;
         }
     }
+    context->target = target;
     if (target->source_kind != PORPOISE_RECOVERY_SOURCE_ASSEMBLY) {
-        metadata = &run_target->import_result.metadata;
+        context->metadata = &run_target->import_result.metadata;
     }
     recovery_runner_settings_identity(
-        project, target, run_target->plan, settings_identity);
-    porpoise_recovery_cache_inputs_init(&inputs);
-    inputs.source_path = target->input.resolved;
-    inputs.settings_identity = settings_identity;
-    inputs.dependencies = dependencies;
-    inputs.dependency_count = dependency_count;
-    inputs.operation = options->operation;
+        project, target, context->settings_identity);
+    porpoise_recovery_cache_inputs_init(&context->inputs);
+    context->inputs.source_path = target->input.resolved;
+    context->inputs.settings_identity = context->settings_identity;
+    context->inputs.dependencies = context->dependencies;
+    context->inputs.dependency_count = dependency_count;
+    context->inputs.operation = options->operation;
+    return PORPOISE_EXIT_OK;
+}
+
+static int recovery_runner_validate_cache(
+    PorpoiseRecoveryProject *project,
+    PorpoiseRecoveryRunTarget *run_target,
+    const PorpoiseRecoveryRunOptions *options,
+    PorpoiseDiagnostics *diagnostics) {
+    RecoveryRunnerCacheContext context;
+    PorpoiseRecoveryCacheValidation validation;
+    int result = recovery_runner_cache_context_prepare(
+        project, run_target, options, &context);
+    if (result != PORPOISE_EXIT_OK) return result;
     porpoise_recovery_cache_validation_init(&validation);
     result = porpoise_recovery_target_cache_validate(
-        target, &inputs, metadata, &validation, diagnostics);
-    if (result == PORPOISE_EXIT_OK &&
-        validation.state != PORPOISE_RECOVERY_CACHE_HIT) {
-        result = porpoise_recovery_target_cache_rebuild(
-            target, &inputs, run_target->session, run_target->plan,
-            metadata, diagnostics);
+        context.target, &context.inputs, context.metadata,
+        &validation, diagnostics);
+    if (result == PORPOISE_EXIT_OK) {
+        run_target->match_cache_hit =
+            validation.state == PORPOISE_RECOVERY_CACHE_HIT;
+        run_target->match_cache_refreshed = false;
     }
-    free(dependencies);
+    recovery_runner_cache_context_free(&context);
+    return result;
+}
+
+static int recovery_runner_refresh_cache(
+    PorpoiseRecoveryProject *project,
+    PorpoiseRecoveryRunTarget *run_target,
+    const PorpoiseRecoveryRunOptions *options,
+    PorpoiseDiagnostics *diagnostics) {
+    RecoveryRunnerCacheContext context;
+    bool matches = false;
+    int result = recovery_runner_cache_context_prepare(
+        project, run_target, options, &context);
+    if (result != PORPOISE_EXIT_OK) return result;
+    if (run_target->match_cache_hit) {
+        result = porpoise_recovery_target_cache_matches_plan(
+            context.target, run_target->plan, &matches, diagnostics);
+    }
+    if (result == PORPOISE_EXIT_OK && !matches) {
+        result = porpoise_recovery_target_cache_rebuild(
+            context.target, &context.inputs, run_target->session,
+            run_target->plan, context.metadata, diagnostics);
+        if (result == PORPOISE_EXIT_OK) {
+            run_target->match_cache_hit = false;
+            run_target->match_cache_refreshed = true;
+        }
+    }
+    recovery_runner_cache_context_free(&context);
     return result;
 }
 
@@ -482,9 +581,7 @@ static int recovery_runner_prepare_source(
         import_options.source_kind = PORPOISE_DTK_SOURCE_MANAGED_ELF;
         import_options.input_path = target->input.resolved;
         import_options.cache_path = cache_path;
-        import_options.dtk_path =
-            options->dtk_path == NULL || options->dtk_path[0] == '\0'
-                ? "dtk" : options->dtk_path;
+        import_options.dtk_path = options->dtk_path;
         import_options.settings_identity = settings;
         import_options.allow_cache_reuse = true;
         import_options.operation = options->operation;
@@ -515,6 +612,7 @@ static int recovery_runner_build_plan(
     PorpoisePlanOptions plan_options;
     PorpoiseSessionSymbolSource *symbol_sources = NULL;
     PorpoiseFunctionOverride *overrides = NULL;
+    PorpoisePlanMatchHint *match_hints = NULL;
     const char **sdk_catalog_paths = NULL;
     const char **abi_paths = NULL;
     size_t index;
@@ -555,6 +653,28 @@ static int recovery_runner_build_plan(
             overrides[index].contract_name = source->contract_name;
             overrides[index].acknowledge_conflict =
                 source->acknowledge_conflict;
+        }
+    }
+    if (run_target->match_cache_hit && target->cache.match_count != 0U) {
+        match_hints = (PorpoisePlanMatchHint *)calloc(
+            target->cache.match_count, sizeof(*match_hints));
+        if (match_hints == NULL) {
+            free(overrides);
+            free(symbol_sources);
+            return PORPOISE_EXIT_INTERNAL;
+        }
+        for (index = 0U; index < target->cache.match_count; index++) {
+            const PorpoiseRecoveryMatchCacheEntry *source =
+                &target->cache.matches[index];
+            match_hints[index].target_id = target->id;
+            match_hints[index].module = source->module;
+            match_hints[index].address = source->address;
+            match_hints[index].size = source->size;
+            match_hints[index].normalized_fingerprint =
+                source->normalized_fingerprint;
+            match_hints[index].canonical_identity =
+                source->canonical_identity;
+            match_hints[index].contract_name = source->contract_name;
         }
     }
     if (project->sdk_catalog_count != 0U) {
@@ -606,6 +726,11 @@ static int recovery_runner_build_plan(
         plan_options.sdk_policy = target->sdk_policy;
         plan_options.overrides = overrides;
         plan_options.override_count = target->override_count;
+        plan_options.match_hints = match_hints;
+        plan_options.match_hint_count = run_target->match_cache_hit
+            ? target->cache.match_count : 0U;
+        plan_options.match_hint_used_count_out =
+            &run_target->match_cache_hint_used_count;
         plan_options.operation = options->operation;
         result = porpoise_plan_build(
             run_target->session, &plan_options,
@@ -622,12 +747,9 @@ static int recovery_runner_build_plan(
             target->id, recovery_runner_target_module(target),
             diagnostics);
     }
-    if (result == PORPOISE_EXIT_OK) {
-        result = recovery_runner_update_cache(
-            project, run_target, options, diagnostics);
-    }
     free(abi_paths);
     free(sdk_catalog_paths);
+    free(match_hints);
     free(overrides);
     free(symbol_sources);
     return result;
@@ -651,6 +773,8 @@ static void recovery_runner_write_function(
     porpoise_json_write_string(file, view->function->name);
     fputs(", \"canonical_name\": ", file);
     porpoise_json_write_string(file, canonical_name);
+    fputs(", \"canonical_sdk_identity\": ", file);
+    recovery_runner_write_nullable(file, view->canonical_sdk_identity);
     fputs(", \"translation_unit\": ", file);
     porpoise_json_write_string(file, view->source->relative_path);
     fputs(", \"section\": ", file);
@@ -701,7 +825,12 @@ static void recovery_runner_write_function(
     if (view->map_symbol == NULL) {
         fputs("null", file);
     } else {
-        fputs("{\"path\": ", file);
+        fputs("{\"source_kind\": ", file);
+        porpoise_json_write_string(
+            file,
+            porpoise_symbol_source_kind_name(
+                view->map_symbol->provenance.kind));
+        fputs(", \"path\": ", file);
         recovery_runner_write_nullable(
             file, view->map_symbol->provenance.path);
         fprintf(file, ", \"line\": %lu, \"module\": ",
@@ -717,7 +846,12 @@ static void recovery_runner_write_function(
     if (view->sdk_entry == NULL) {
         fputs("null", file);
     } else {
-        fputs("{\"path\": ", file);
+        fputs("{\"source_kind\": ", file);
+        porpoise_json_write_string(
+            file,
+            porpoise_sdk_catalog_source_kind_name(
+                view->sdk_entry->provenance.source_kind));
+        fputs(", \"path\": ", file);
         recovery_runner_write_nullable(
             file, view->sdk_entry->provenance.path);
         fprintf(file, ", \"line\": %lu}",
@@ -771,10 +905,13 @@ static int recovery_runner_write_report_file(
         fprintf(
             file,
             ", \"generated\": %s, \"published\": %s, "
-            "\"cache_hit\": %s, \"functions\": [",
+            "\"cache_hit\": %s, \"match_cache_hit\": %s, "
+            "\"match_cache_refreshed\": %s, \"functions\": [",
             run_target->generated ? "true" : "false",
             run_target->published ? "true" : "false",
-            run_target->import_result.cache_hit ? "true" : "false");
+            run_target->import_result.cache_hit ? "true" : "false",
+            run_target->match_cache_hit ? "true" : "false",
+            run_target->match_cache_refreshed ? "true" : "false");
         for (function_index = 0U;
              run_target->plan != NULL &&
              function_index <
@@ -851,6 +988,113 @@ static bool recovery_runner_unique_sibling(
     return false;
 }
 
+static int recovery_runner_validate_report_destination(
+    const PorpoiseRecoveryProject *project,
+    const PorpoiseRecoveryRunResult *result,
+    const char *path,
+    const char *runtime_directory,
+    PorpoiseDiagnostics *diagnostics) {
+    size_t target_index;
+    int validation_result;
+    if (path == NULL || path[0] == '\0') return PORPOISE_EXIT_OK;
+    if (porpoise_path_exists(path) && porpoise_path_is_directory(path)) {
+        if (diagnostics != NULL) {
+            porpoise_diagnostics_add(
+                diagnostics, PORPOISE_SEVERITY_ERROR, path, 0U, 0U,
+                "aggregate report path names an existing directory");
+        }
+        return PORPOISE_EXIT_USAGE;
+    }
+    validation_result = recovery_runner_validate_protected_path(
+        project, path, "aggregate report path", runtime_directory,
+        diagnostics);
+    if (validation_result != PORPOISE_EXIT_OK) return validation_result;
+    for (target_index = 0U;
+         result != NULL && target_index < result->target_count;
+         target_index++) {
+        const PorpoiseRecoveryTarget *target =
+            result->targets[target_index].target;
+        char output_description[PORPOISE_NAME_CAPACITY + 32U];
+        if (target == NULL || target->output.resolved == NULL ||
+            target->output.resolved[0] == '\0') {
+            continue;
+        }
+        if (!porpoise_format(
+                output_description, sizeof(output_description),
+                "output for target %s",
+                target->id == NULL ? "<unknown>" : target->id)) {
+            return PORPOISE_EXIT_INTERNAL;
+        }
+        validation_result = recovery_runner_reject_path_overlap(
+            path, "aggregate report path", target->output.resolved,
+            output_description, diagnostics);
+        if (validation_result != PORPOISE_EXIT_OK) return validation_result;
+    }
+    return PORPOISE_EXIT_OK;
+}
+
+static int recovery_runner_preflight_paths(
+    const PorpoiseRecoveryProject *project,
+    const PorpoiseRecoveryRunResult *result,
+    const PorpoiseRecoveryRunOptions *options,
+    PorpoiseDiagnostics *diagnostics) {
+    size_t target_index;
+    if (!options->analyze_only &&
+        (options->runtime_directory == NULL ||
+         options->runtime_directory[0] == '\0')) {
+        return recovery_runner_error(
+            diagnostics, PORPOISE_EXIT_INTERNAL, project->path,
+            "runtime directory is required for generation");
+    }
+    for (target_index = 0U;
+         target_index < result->target_count;
+         target_index++) {
+        const PorpoiseRecoveryTarget *target =
+            result->targets[target_index].target;
+        char output_description[PORPOISE_NAME_CAPACITY + 32U];
+        size_t prior_index;
+        int validation_result;
+        if (target == NULL || target->output.resolved == NULL ||
+            target->output.resolved[0] == '\0' ||
+            !porpoise_format(
+                output_description, sizeof(output_description),
+                "output for target %s",
+                target == NULL || target->id == NULL
+                    ? "<unknown>" : target->id)) {
+            return PORPOISE_EXIT_INTERNAL;
+        }
+        validation_result = recovery_runner_validate_protected_path(
+            project, target->output.resolved, output_description,
+            options->runtime_directory, diagnostics);
+        if (validation_result != PORPOISE_EXIT_OK) {
+            return validation_result;
+        }
+        for (prior_index = 0U;
+             prior_index < target_index;
+             prior_index++) {
+            const PorpoiseRecoveryTarget *prior =
+                result->targets[prior_index].target;
+            char prior_description[PORPOISE_NAME_CAPACITY + 32U];
+            if (prior == NULL || prior->output.resolved == NULL ||
+                !porpoise_format(
+                    prior_description, sizeof(prior_description),
+                    "output for target %s",
+                    prior->id == NULL ? "<unknown>" : prior->id)) {
+                return PORPOISE_EXIT_INTERNAL;
+            }
+            validation_result = recovery_runner_reject_path_overlap(
+                target->output.resolved, output_description,
+                prior->output.resolved, prior_description, diagnostics);
+            if (validation_result != PORPOISE_EXIT_OK) {
+                return validation_result;
+            }
+        }
+    }
+    return recovery_runner_validate_report_destination(
+        project, result, options->report_path,
+        options->runtime_directory, diagnostics);
+}
+
 int porpoise_recovery_run_write_report(
     const PorpoiseRecoveryProject *project,
     const PorpoiseRecoveryRunResult *result,
@@ -866,6 +1110,12 @@ int porpoise_recovery_run_write_report(
         return PORPOISE_EXIT_INTERNAL;
     }
     porpoise_diagnostics_init(&write_diagnostics);
+    write_result = recovery_runner_validate_report_destination(
+        project, result, path, NULL, &write_diagnostics);
+    if (write_result != PORPOISE_EXIT_OK) {
+        porpoise_diagnostics_free(&write_diagnostics);
+        return write_result;
+    }
     if (!recovery_runner_unique_sibling(
             path, "report", temporary, &write_diagnostics)) {
         porpoise_diagnostics_free(&write_diagnostics);
@@ -884,6 +1134,11 @@ int porpoise_recovery_run_write_report(
         return write_result;
     }
     had_output = porpoise_path_exists(path);
+    if (had_output && porpoise_path_is_directory(path)) {
+        (void)remove(temporary);
+        porpoise_diagnostics_free(&write_diagnostics);
+        return PORPOISE_EXIT_USAGE;
+    }
     if (had_output &&
         (!recovery_runner_unique_sibling(
              path, "report-backup", backup, &write_diagnostics) ||
@@ -927,27 +1182,40 @@ int porpoise_recovery_project_run(
     run_result = recovery_runner_select_targets(
         project, options, &candidate, diagnostics);
     if (run_result != PORPOISE_EXIT_OK) goto finished;
+    run_result = recovery_runner_preflight_paths(
+        project, &candidate, options, diagnostics);
+    if (run_result != PORPOISE_EXIT_OK) goto finished;
 
     for (index = 0U; index < candidate.target_count; index++) {
-        run_result = recovery_runner_validate_target_paths(
-            project, candidate.targets[index].target, diagnostics);
-        if (run_result != PORPOISE_EXIT_OK) goto finished;
         run_result = recovery_runner_prepare_source(
+            project, &candidate.targets[index], options, diagnostics);
+        if (run_result != PORPOISE_EXIT_OK) goto finished;
+        run_result = recovery_runner_validate_cache(
             project, &candidate.targets[index], options, diagnostics);
         if (run_result != PORPOISE_EXIT_OK) goto finished;
         run_result = recovery_runner_build_plan(
             project, &candidate.targets[index], options, diagnostics);
         if (run_result != PORPOISE_EXIT_OK) goto finished;
+        run_result = recovery_runner_refresh_cache(
+            project, &candidate.targets[index], options, diagnostics);
+        if (run_result != PORPOISE_EXIT_OK) goto finished;
+    }
+    if (options->persist_refreshed_caches) {
+        bool refreshed = false;
+        for (index = 0U; index < candidate.target_count; index++) {
+            if (candidate.targets[index].match_cache_refreshed) {
+                refreshed = true;
+                break;
+            }
+        }
+        if (refreshed) {
+            run_result = porpoise_recovery_project_save(
+                project, project->path, diagnostics);
+            if (run_result != PORPOISE_EXIT_OK) goto finished;
+        }
     }
     if (options->analyze_only) {
         run_result = PORPOISE_EXIT_OK;
-        goto finished;
-    }
-    if (options->runtime_directory == NULL ||
-        options->runtime_directory[0] == '\0') {
-        run_result = recovery_runner_error(
-            diagnostics, PORPOISE_EXIT_INTERNAL, project->path,
-            "runtime directory is required for generation");
         goto finished;
     }
     staged = (PorpoiseStagedProject **)calloc(
@@ -982,11 +1250,23 @@ int porpoise_recovery_project_run(
     }
 
 finished:
+    for (index = 0U; index < candidate.target_count; index++) {
+        PorpoiseRecoveryRunTarget *target = &candidate.targets[index];
+        if (!target->published && target->staged != NULL) {
+            porpoise_staged_project_free(target->staged);
+            target->staged = NULL;
+        }
+    }
     free(staged);
     *result = candidate;
     if (options->report_path != NULL && options->report_path[0] != '\0') {
-        int report_result = porpoise_recovery_run_write_report(
-            project, result, options->report_path, diagnostics);
+        int report_result = recovery_runner_validate_report_destination(
+            project, result, options->report_path,
+            options->runtime_directory, diagnostics);
+        if (report_result == PORPOISE_EXIT_OK) {
+            report_result = porpoise_recovery_run_write_report(
+                project, result, options->report_path, diagnostics);
+        }
         if (run_result == PORPOISE_EXIT_OK &&
             report_result != PORPOISE_EXIT_OK) {
             run_result = report_result;

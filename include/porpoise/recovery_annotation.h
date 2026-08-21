@@ -31,6 +31,7 @@ typedef struct PorpoiseRecoveryAnnotationView {
     PorpoiseRecoveryByteView byte_view;
     size_t element_width;
     size_t decoded_element_count;
+    char normalized_fingerprint[PORPOISE_SHA256_HEX_SIZE];
     char exact_bytes_sha256[PORPOISE_SHA256_HEX_SIZE];
 } PorpoiseRecoveryAnnotationView;
 
@@ -48,6 +49,20 @@ int porpoise_recovery_byte_view_extract(
     uint32_t address,
     uint32_t size,
     PorpoiseRecoveryByteView *view,
+    PorpoiseDiagnostics *diagnostics);
+
+/*
+ * Recompute the stable locator fingerprint for a current Program range.
+ * An exact non-data function range uses its relocation-aware function
+ * signature. Other fully covered ranges (including data-object subranges)
+ * use the SHA-256 of their immutable guest bytes. This is the same identity
+ * check performed when an annotation view is opened.
+ */
+int porpoise_recovery_normalized_fingerprint_compute(
+    const PorpoiseProgram *program,
+    uint32_t address,
+    uint32_t size,
+    char output[PORPOISE_SHA256_HEX_SIZE],
     PorpoiseDiagnostics *diagnostics);
 
 void porpoise_recovery_annotation_view_init(

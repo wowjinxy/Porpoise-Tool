@@ -82,6 +82,17 @@ void porpoise_asm_data_parser_init(PorpoiseAsmDataParser *parser) {
     memset(parser, 0, sizeof(*parser));
 }
 
+bool porpoise_asm_data_accepts_annotated_words(
+    const PorpoiseAsmDataParser *parser) {
+    return parser != NULL && parser->executable_symbol_data;
+}
+
+void porpoise_asm_data_begin_function(PorpoiseAsmDataParser *parser) {
+    if (parser == NULL) return;
+    parser->executable_symbol_data = false;
+    parser->have_metadata = false;
+}
+
 PorpoiseAsmDataLineResult porpoise_asm_data_parse_metadata(
     PorpoiseAsmDataParser *parser,
     const PorpoiseSourceFile *file,
@@ -221,11 +232,26 @@ PorpoiseAsmDataLineResult porpoise_asm_data_parse_metadata(
         return PORPOISE_ASM_DATA_ERROR;
     }
     if (parser->current_object != NULL) {
-        porpoise_diagnostics_add(
-            diagnostics, PORPOISE_SEVERITY_ERROR, file->path, source_line,
-            address, "contribution metadata appears inside data object %s",
-            parser->current_object->name);
-        return PORPOISE_ASM_DATA_ERROR;
+        const PorpoiseDataObject *object = parser->current_object;
+        uint64_t expected_address =
+            (uint64_t)object->address + parser->current_offset;
+        uint64_t object_end = (uint64_t)object->address + object->size;
+
+        /*
+         * DTK emits a zero-size contribution immediately before a `.sym`
+         * inside an owning `.obj`.  It is a location declaration, not a
+         * nested object and not an attempt to emit bytes.
+         */
+        if (size != 0U || strcmp(parser->metadata.section, object->section) != 0 ||
+            address < object->address || (uint64_t)address > object_end ||
+            (uint64_t)address != expected_address) {
+            porpoise_diagnostics_add(
+                diagnostics, PORPOISE_SEVERITY_ERROR, file->path,
+                source_line, address,
+                "contribution metadata appears inside data object %s",
+                object->name);
+            return PORPOISE_ASM_DATA_ERROR;
+        }
     }
     parser->metadata.section_offset = section_offset;
     parser->metadata.address = address;
@@ -293,6 +319,35 @@ static bool parse_object_declaration(
         return true;
     }
     return false;
+}
+
+static PorpoiseDataAlias *add_data_alias(
+    PorpoiseSourceFile *file,
+    const PorpoiseAsmDataMetadata *metadata,
+    const char *name,
+    bool is_global,
+    size_t source_line) {
+    PorpoiseDataAlias candidate;
+    PorpoiseDataAlias *alias;
+
+    memset(&candidate, 0, sizeof(candidate));
+    candidate.name = porpoise_strdup(name);
+    candidate.section = porpoise_strdup(metadata->section);
+    candidate.is_global = is_global;
+    candidate.source_line = source_line;
+    candidate.address = metadata->address;
+    if (candidate.name == NULL || candidate.section == NULL ||
+        file->data_alias_count == SIZE_MAX ||
+        !porpoise_grow_array(
+            (void **)&file->data_aliases, &file->data_alias_capacity,
+            sizeof(*file->data_aliases), file->data_alias_count + 1U)) {
+        free(candidate.name);
+        free(candidate.section);
+        return NULL;
+    }
+    alias = &file->data_aliases[file->data_alias_count++];
+    *alias = candidate;
+    return alias;
 }
 
 static bool parse_end_object(
@@ -1041,6 +1096,45 @@ static PorpoiseAsmDataLineResult parse_object_body_line(
     size_t directive_length;
 
     if (*line == '\0' || *line == '#') return PORPOISE_ASM_DATA_HANDLED;
+    if (is_directive(line, ".sym")) {
+        bool is_global;
+        if (!parse_object_declaration(
+                line, ".sym", name, sizeof(name), &is_global)) {
+            parser->have_metadata = false;
+            porpoise_diagnostics_add(
+                diagnostics, PORPOISE_SEVERITY_ERROR, file->path,
+                source_line, parser->current_object->address,
+                "malformed .sym directive inside data object %s",
+                parser->current_object->name);
+            return PORPOISE_ASM_DATA_ERROR;
+        }
+        if (!parser->have_metadata || parser->metadata.size != 0U) {
+            parser->have_metadata = false;
+            porpoise_diagnostics_add(
+                diagnostics, PORPOISE_SEVERITY_ERROR, file->path,
+                source_line, parser->current_object->address,
+                "data symbol alias %s inside object %s is missing fresh zero-size contribution metadata",
+                name, parser->current_object->name);
+            return PORPOISE_ASM_DATA_ERROR;
+        }
+        if (add_data_alias(
+                file, &parser->metadata, name, is_global,
+                source_line) == NULL) {
+            parser->have_metadata = false;
+            return PORPOISE_ASM_DATA_INTERNAL_ERROR;
+        }
+        parser->have_metadata = false;
+        return PORPOISE_ASM_DATA_HANDLED;
+    }
+    if (parser->have_metadata) {
+        parser->have_metadata = false;
+        porpoise_diagnostics_add(
+            diagnostics, PORPOISE_SEVERITY_ERROR, file->path,
+            source_line, parser->current_object->address,
+            "zero-size contribution metadata inside data object %s is not followed by .sym",
+            parser->current_object->name);
+        return PORPOISE_ASM_DATA_ERROR;
+    }
     if (is_directive(line, ".obj")) {
         porpoise_diagnostics_add(
             diagnostics, PORPOISE_SEVERITY_ERROR, file->path, source_line,
@@ -1353,6 +1447,14 @@ PorpoiseAsmDataLineResult porpoise_asm_data_parse_line(
         parser->have_metadata = false;
         parser->active_anonymous = NULL;
         parser->contribution_offset = 0U;
+        parser->executable_symbol_data = false;
+        if (!porpoise_copy_string(
+                parser->selected_section,
+                sizeof(parser->selected_section), section)) {
+            return PORPOISE_ASM_DATA_INTERNAL_ERROR;
+        }
+        parser->have_selected_section = true;
+        parser->selected_section_executable = executable;
         if (parser->have_range) {
             parser->have_range = false;
             if (!executable) {
@@ -1367,8 +1469,58 @@ PorpoiseAsmDataLineResult porpoise_asm_data_parse_line(
         /* Let the main parser retain its section-selection behavior. */
         return PORPOISE_ASM_DATA_NOT_HANDLED;
     }
+    if (is_directive(line, ".sym")) {
+        bool alias_executable;
+        if (!parser->have_metadata) {
+            /* No data location evidence: retain instruction-alias parsing. */
+            return PORPOISE_ASM_DATA_NOT_HANDLED;
+        }
+        if (!parse_object_declaration(
+                line, ".sym", name, sizeof(name), &is_global)) {
+            parser->have_metadata = false;
+            porpoise_diagnostics_add(
+                diagnostics, PORPOISE_SEVERITY_ERROR, file->path,
+                source_line, 0U,
+                "malformed data .sym directive");
+            return PORPOISE_ASM_DATA_ERROR;
+        }
+        if (parser->metadata.size != 0U) {
+            parser->have_metadata = false;
+            porpoise_diagnostics_add(
+                diagnostics, PORPOISE_SEVERITY_ERROR, file->path,
+                source_line, parser->metadata.address,
+                "data symbol alias %s requires zero-size contribution metadata",
+                name);
+            return PORPOISE_ASM_DATA_ERROR;
+        }
+        if (parser->have_selected_section &&
+            strcmp(parser->selected_section, parser->metadata.section) != 0) {
+            parser->have_metadata = false;
+            porpoise_diagnostics_add(
+                diagnostics, PORPOISE_SEVERITY_ERROR, file->path,
+                source_line, parser->metadata.address,
+                "data symbol alias %s metadata section %s does not match selected section %s",
+                name, parser->metadata.section,
+                parser->selected_section);
+            return PORPOISE_ASM_DATA_ERROR;
+        }
+        alias_executable = parser->have_selected_section
+                               ? parser->selected_section_executable
+                               : strcmp(parser->metadata.section, ".text") == 0 ||
+                                     strcmp(parser->metadata.section, ".init") == 0;
+        if (add_data_alias(
+                file, &parser->metadata, name, is_global,
+                source_line) == NULL) {
+            parser->have_metadata = false;
+            return PORPOISE_ASM_DATA_INTERNAL_ERROR;
+        }
+        parser->have_metadata = false;
+        parser->executable_symbol_data = alias_executable;
+        return PORPOISE_ASM_DATA_HANDLED;
+    }
     if (is_directive(line, ".obj")) {
         PorpoiseDataObject *object;
+        parser->executable_symbol_data = false;
         if (!parse_object_declaration(
                 line, ".obj", name, sizeof(name), &is_global)) {
             parser->have_metadata = false;
@@ -1513,13 +1665,216 @@ static int compare_data_symbol_entries(const void *left, const void *right) {
     const PorpoiseProgramDataSymbolIndexEntry *b =
         (const PorpoiseProgramDataSymbolIndexEntry *)right;
     int comparison = strcmp(a->name, b->name);
+    uint32_t a_address;
+    uint32_t b_address;
     if (comparison != 0) return comparison;
     comparison = strcmp(a->file->relative_path, b->file->relative_path);
     if (comparison != 0) return comparison;
-    if (a->object->address != b->object->address) {
-        return a->object->address < b->object->address ? -1 : 1;
+    a_address = a->alias != NULL ? a->alias->address : a->object->address;
+    b_address = b->alias != NULL ? b->alias->address : b->object->address;
+    if (a_address != b_address) {
+        return a_address < b_address ? -1 : 1;
+    }
+    if ((a->alias == NULL) != (b->alias == NULL)) {
+        return a->alias == NULL ? -1 : 1;
+    }
+    if (a->alias != NULL) {
+        comparison = strcmp(a->alias->section, b->alias->section);
+        if (comparison != 0) return comparison;
+        if (a->alias->source_line != b->alias->source_line) {
+            return a->alias->source_line < b->alias->source_line ? -1 : 1;
+        }
+        if (a->alias->is_global != b->alias->is_global) {
+            return a->alias->is_global ? -1 : 1;
+        }
     }
     return 0;
+}
+
+static bool parse_dtk_section_base_name(
+    const char *name,
+    char *section,
+    size_t capacity) {
+    size_t name_length;
+    size_t component_length;
+    size_t index;
+
+    if (name == NULL || section == NULL || capacity == 0U) return false;
+    name_length = strlen(name);
+    if (name_length < 7U || strncmp(name, "...", 3U) != 0 ||
+        strcmp(name + name_length - 2U, ".0") != 0) {
+        return false;
+    }
+    component_length = name_length - 5U;
+    if (component_length == 0U || component_length + 2U > capacity) {
+        return false;
+    }
+    for (index = 0U; index < component_length; index++) {
+        unsigned char character = (unsigned char)name[index + 3U];
+        if (!isalnum(character) && character != '_' && character != '.') {
+            return false;
+        }
+    }
+    section[0] = '.';
+    memcpy(section + 1U, name + 3U, component_length);
+    section[component_length + 1U] = '\0';
+    return true;
+}
+
+static bool file_has_data_symbol(
+    const PorpoiseSourceFile *file,
+    const char *name) {
+    size_t index;
+    for (index = 0U; index < file->data_object_count; index++) {
+        if (strcmp(file->data_objects[index].name, name) == 0) return true;
+    }
+    for (index = 0U; index < file->data_alias_count; index++) {
+        if (strcmp(file->data_aliases[index].name, name) == 0) return true;
+    }
+    return false;
+}
+
+static void add_section_base_candidate(
+    uint32_t candidate,
+    bool *found,
+    bool *ambiguous,
+    uint32_t *base) {
+    if (!*found) {
+        *found = true;
+        *base = candidate;
+    } else if (*base != candidate) {
+        *ambiguous = true;
+    }
+}
+
+static bool find_file_section_base(
+    const PorpoiseSourceFile *file,
+    const char *section,
+    uint32_t *base_out,
+    bool *ambiguous_out) {
+    bool found = false;
+    bool ambiguous = false;
+    uint32_t base = 0U;
+    size_t index;
+
+    for (index = 0U; index < file->data_object_count; index++) {
+        const PorpoiseDataObject *object = &file->data_objects[index];
+        if (strcmp(object->section, section) != 0 ||
+            object->address < object->section_offset) {
+            continue;
+        }
+        add_section_base_candidate(
+            object->address - object->section_offset,
+            &found, &ambiguous, &base);
+    }
+    /* A range-only contribution still provides an exact section start. */
+    if (!found) {
+        for (index = 0U; index < file->anonymous_data_count; index++) {
+            const PorpoiseDataObject *storage =
+                &file->anonymous_data[index].storage;
+            if (strcmp(storage->section, section) != 0 ||
+                storage->address < storage->section_offset) {
+                continue;
+            }
+            add_section_base_candidate(
+                storage->address - storage->section_offset,
+                &found, &ambiguous, &base);
+        }
+    }
+    *ambiguous_out = ambiguous;
+    if (found && !ambiguous) *base_out = base;
+    return found;
+}
+
+static bool synthesize_referenced_section_base(
+    PorpoiseSourceFile *file,
+    const char *symbol,
+    size_t source_line,
+    PorpoiseDiagnostics *diagnostics) {
+    PorpoiseAsmDataMetadata metadata;
+    char section[PORPOISE_NAME_CAPACITY];
+    uint32_t base = 0U;
+    bool ambiguous = false;
+
+    if (symbol == NULL ||
+        !parse_dtk_section_base_name(symbol, section, sizeof(section)) ||
+        file_has_data_symbol(file, symbol)) {
+        return true;
+    }
+    if (!find_file_section_base(file, section, &base, &ambiguous)) {
+        return true;
+    }
+    if (ambiguous) {
+        porpoise_diagnostics_add(
+            diagnostics, PORPOISE_SEVERITY_ERROR, file->path,
+            source_line, 0U,
+            "ambiguous DTK section base %s in one translation unit",
+            symbol);
+        return false;
+    }
+    memset(&metadata, 0, sizeof(metadata));
+    if (!porpoise_copy_string(
+            metadata.section, sizeof(metadata.section), section)) {
+        return false;
+    }
+    metadata.address = base;
+    metadata.source_line = source_line;
+    return add_data_alias(
+               file, &metadata, symbol, false, source_line) != NULL;
+}
+
+static bool synthesize_referenced_section_bases(
+    PorpoiseProgram *program,
+    PorpoiseDiagnostics *diagnostics) {
+    size_t file_index;
+    bool ok = true;
+
+    for (file_index = 0U; file_index < program->file_count; file_index++) {
+        PorpoiseSourceFile *file = &program->files[file_index];
+        size_t object_index;
+        for (object_index = 0U;
+             object_index < file->data_object_count;
+             object_index++) {
+            PorpoiseDataObject *object = &file->data_objects[object_index];
+            size_t fixup_index;
+            for (fixup_index = 0U;
+                 fixup_index < object->fixup_count;
+                 fixup_index++) {
+                const PorpoiseDataFixup *fixup =
+                    &object->fixups[fixup_index];
+                if (!synthesize_referenced_section_base(
+                        file, fixup->base_symbol, fixup->source_line,
+                        diagnostics) ||
+                    !synthesize_referenced_section_base(
+                        file, fixup->target_symbol, fixup->source_line,
+                        diagnostics)) {
+                    ok = false;
+                }
+            }
+        }
+        for (object_index = 0U;
+             object_index < file->anonymous_data_count;
+             object_index++) {
+            PorpoiseDataObject *object =
+                &file->anonymous_data[object_index].storage;
+            size_t fixup_index;
+            for (fixup_index = 0U;
+                 fixup_index < object->fixup_count;
+                 fixup_index++) {
+                const PorpoiseDataFixup *fixup =
+                    &object->fixups[fixup_index];
+                if (!synthesize_referenced_section_base(
+                        file, fixup->base_symbol, fixup->source_line,
+                        diagnostics) ||
+                    !synthesize_referenced_section_base(
+                        file, fixup->target_symbol, fixup->source_line,
+                        diagnostics)) {
+                    ok = false;
+                }
+            }
+        }
+    }
+    return ok;
 }
 
 static bool build_data_symbol_index(PorpoiseProgram *program) {
@@ -1532,8 +1887,11 @@ static bool build_data_symbol_index(PorpoiseProgram *program) {
         program->data_symbol_index_capacity != 0U) return false;
     for (file_index = 0U; file_index < program->file_count; file_index++) {
         const PorpoiseSourceFile *file = &program->files[file_index];
-        if (count > SIZE_MAX - file->data_object_count) return false;
+        if (count > SIZE_MAX - file->data_object_count ||
+            count + file->data_object_count >
+                SIZE_MAX - file->data_alias_count) return false;
         count += file->data_object_count;
+        count += file->data_alias_count;
     }
     if (count > SIZE_MAX / sizeof(*entries)) return false;
     if (count != 0U) {
@@ -1549,6 +1907,15 @@ static bool build_data_symbol_index(PorpoiseProgram *program) {
             entries[cursor].name = file->data_objects[object_index].name;
             entries[cursor].file = file;
             entries[cursor].object = &file->data_objects[object_index];
+            entries[cursor].alias = NULL;
+            cursor++;
+        }
+        for (object_index = 0U; object_index < file->data_alias_count;
+             object_index++) {
+            entries[cursor].name = file->data_aliases[object_index].name;
+            entries[cursor].file = file;
+            entries[cursor].object = NULL;
+            entries[cursor].alias = &file->data_aliases[object_index];
             cursor++;
         }
     }
@@ -1648,10 +2015,16 @@ static void collect_named_candidates(
            strcmp(program->data_symbol_index[index].name, name) == 0) {
         const PorpoiseProgramDataSymbolIndexEntry *entry =
             &program->data_symbol_index[index++];
+        bool entry_global = entry->alias != NULL
+                                ? entry->alias->is_global
+                                : entry->object->is_global;
+        uint32_t entry_address = entry->alias != NULL
+                                     ? entry->alias->address
+                                     : entry->object->address;
         if ((!global && entry->file == scope_file) ||
-            (global && entry->object->is_global)) {
+            (global && entry_global)) {
             add_address_candidate(
-                entry->object->address, found, ambiguous, value);
+                entry_address, found, ambiguous, value);
         }
     }
     index = raw_symbol_lower_bound(program, name);
@@ -2070,6 +2443,15 @@ static bool validate_data_names(
         for (index = cursor; index < group_end; index++) {
             const PorpoiseProgramDataSymbolIndexEntry *entry =
                 &program->data_symbol_index[index];
+            uint32_t entry_address = entry->alias != NULL
+                                         ? entry->alias->address
+                                         : entry->object->address;
+            size_t entry_line = entry->alias != NULL
+                                    ? entry->alias->source_line
+                                    : entry->object->source_line;
+            bool entry_global = entry->alias != NULL
+                                    ? entry->alias->is_global
+                                    : entry->object->is_global;
             size_t prior;
             bool duplicate_reported = false;
             bool global_reported = false;
@@ -2079,21 +2461,25 @@ static bool validate_data_names(
                 if (!duplicate_reported && candidate->file == entry->file) {
                     porpoise_diagnostics_add(
                         diagnostics, PORPOISE_SEVERITY_ERROR,
-                        entry->file->path, entry->object->source_line,
-                        entry->object->address,
-                        "duplicate data object symbol %s in one input file",
+                        entry->file->path, entry_line,
+                        entry_address,
+                        "duplicate data symbol %s in one input file",
                         entry->name);
                     duplicate_reported = true;
                     ok = false;
                 }
-                if (!global_reported && entry->object->is_global &&
-                    candidate->object->is_global &&
-                    candidate->object->address != entry->object->address) {
+                if (!global_reported && entry_global &&
+                    (candidate->alias != NULL
+                         ? candidate->alias->is_global
+                         : candidate->object->is_global) &&
+                    (candidate->alias != NULL
+                         ? candidate->alias->address
+                         : candidate->object->address) != entry_address) {
                     porpoise_diagnostics_add(
                         diagnostics, PORPOISE_SEVERITY_ERROR,
-                        entry->file->path, entry->object->source_line,
-                        entry->object->address,
-                        "ambiguous global data object symbol %s",
+                        entry->file->path, entry_line,
+                        entry_address,
+                        "ambiguous global data symbol %s",
                         entry->name);
                     global_reported = true;
                     ok = false;
@@ -2218,6 +2604,9 @@ bool porpoise_asm_data_finalize(
     PorpoiseConcreteRange *ranges = NULL;
     size_t range_count = 0U;
     bool built_ranges;
+    if (!synthesize_referenced_section_bases(program, diagnostics)) {
+        return false;
+    }
     if (!build_data_symbol_index(program)) return false;
     if (!validate_data_names(program, diagnostics)) return false;
     if (!resolve_fixups(program, diagnostics)) return false;

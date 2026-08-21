@@ -66,6 +66,7 @@ static void test_repeatable_selection_and_operational_flags(void) {
         "porpoise",
         "--target", "main-dol",
         "--project", "game.porpoise.json",
+        "--dtk", "tools/dtk.exe",
         "--target", "overlay-rel",
         "--analyze-only",
         "--report", "reports/analysis.json",
@@ -79,6 +80,7 @@ static void test_repeatable_selection_and_operational_flags(void) {
     CHECK(strcmp(options.target_ids[0], "main-dol") == 0);
     CHECK(strcmp(options.target_ids[1], "overlay-rel") == 0);
     CHECK(options.analyze_only);
+    CHECK(strcmp(options.dtk_path, "tools/dtk.exe") == 0);
     CHECK(strcmp(options.report_path, "reports/analysis.json") == 0);
     CHECK(options.force);
     CHECK(options.verbosity == PORPOISE_VERBOSITY_VERBOSE);
@@ -143,6 +145,7 @@ static void test_project_only_options_require_project(void) {
         const char *first;
         const char *second;
     } cases[] = {
+        { "--dtk", "dtk" },
         { "--target", "main" },
         { "--analyze-only", NULL },
         { "--report", "report.json" }
@@ -246,6 +249,7 @@ static void test_help_and_classic_compatibility(void) {
         if (help != NULL) {
             CHECK(strstr(help,
                          "porpoise-test --project FILE") != NULL);
+            CHECK(strstr(help, "--dtk FILE") != NULL);
             CHECK(strstr(help, "--target ID") != NULL);
             CHECK(strstr(help, "--analyze-only") != NULL);
             CHECK(strstr(help, "--report FILE") != NULL);

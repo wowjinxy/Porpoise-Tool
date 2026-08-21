@@ -1,3 +1,7 @@
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "porpoise/recovery_project.h"
 
 #include "porpoise/util.h"
@@ -5,12 +9,36 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <io.h>
+#include <process.h>
+#define RECOVERY_CLOSE _close
+#define RECOVERY_COMMIT _commit
+#define RECOVERY_FDOPEN _fdopen
+#define RECOVERY_FILENO _fileno
+#define RECOVERY_GETPID _getpid
+#define RECOVERY_OPEN _open
+#else
+#include <unistd.h>
+#define RECOVERY_CLOSE close
+#define RECOVERY_COMMIT fsync
+#define RECOVERY_FDOPEN fdopen
+#define RECOVERY_FILENO fileno
+#define RECOVERY_GETPID getpid
+#define RECOVERY_OPEN open
+#endif
 
 #define RECOVERY_JSON_MAX_DEPTH 48U
 #define RECOVERY_READ_CHUNK 4096U
@@ -3079,6 +3107,218 @@ static bool recovery_write_target(
     return !ferror(file);
 }
 
+static bool recovery_write_document(
+    FILE *file,
+    const PorpoiseRecoveryProject *project,
+    const char *destination_directory) {
+    size_t target_index;
+    fputs("{\n  \"schema_version\": 1,\n  \"sdk_catalogs\": ", file);
+    if (!recovery_write_path_array(
+            file, project->sdk_catalogs, project->sdk_catalog_count,
+            destination_directory, 4U)) return false;
+    fputs(",\n  \"abi_contracts\": ", file);
+    if (!recovery_write_path_array(
+            file, project->abi_contracts, project->abi_contract_count,
+            destination_directory, 4U)) return false;
+    fputs(",\n  \"targets\": ", file);
+    if (project->target_count == 0U) {
+        fputs("[]", file);
+    } else {
+        fputs("[\n", file);
+        for (target_index = 0U; target_index < project->target_count;
+             target_index++) {
+            if (!recovery_write_target(
+                    file, &project->targets[target_index],
+                    destination_directory)) return false;
+            if (target_index + 1U < project->target_count) fputc(',', file);
+            fputc('\n', file);
+        }
+        fputs("  ]", file);
+    }
+    fputs("\n}\n", file);
+    return !ferror(file);
+}
+
+static bool recovery_sibling_path(
+    const char *destination,
+    const char *tag,
+    unsigned int attempt,
+    char path[PORPOISE_PATH_CAPACITY]) {
+    char parent[PORPOISE_PATH_CAPACITY];
+    char base[PORPOISE_PATH_CAPACITY];
+    char name[PORPOISE_PATH_CAPACITY];
+    unsigned long seed =
+        (unsigned long)time(NULL) ^ (unsigned long)RECOVERY_GETPID();
+    return porpoise_path_parent(parent, sizeof(parent), destination) &&
+           porpoise_path_basename(base, sizeof(base), destination) &&
+           porpoise_format(
+               name, sizeof(name), ".%s.porpoise-%s-%08lx-%u",
+               base, tag, seed, attempt) &&
+           porpoise_path_join(
+               path, PORPOISE_PATH_CAPACITY, parent, name);
+}
+
+static FILE *recovery_create_stage_file(
+    const char *destination,
+    char stage_path[PORPOISE_PATH_CAPACITY],
+    PorpoiseDiagnostics *diagnostics) {
+    unsigned int attempt;
+    for (attempt = 0U; attempt < 1000U; attempt++) {
+        int descriptor;
+        FILE *file;
+        if (!recovery_sibling_path(
+                destination, "save", attempt, stage_path)) {
+            recovery_add_diagnostic(
+                diagnostics, PORPOISE_EXIT_USAGE, destination, 0U,
+                "save staging path is too long");
+            return NULL;
+        }
+#ifdef _WIN32
+        descriptor = RECOVERY_OPEN(
+            stage_path,
+            _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+            _S_IREAD | _S_IWRITE);
+#else
+        descriptor = RECOVERY_OPEN(
+            stage_path, O_WRONLY | O_CREAT | O_EXCL,
+            S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP |
+                S_IROTH | S_IWOTH);
+#endif
+        if (descriptor < 0) {
+            if (errno == EEXIST) continue;
+            recovery_add_diagnostic(
+                diagnostics, PORPOISE_EXIT_IO, destination, 0U,
+                "failed to create adjacent recovery project stage: %s",
+                strerror(errno));
+            return NULL;
+        }
+        file = RECOVERY_FDOPEN(descriptor, "wb");
+        if (file != NULL) return file;
+        {
+            int saved_errno = errno;
+            (void)RECOVERY_CLOSE(descriptor);
+            (void)remove(stage_path);
+            errno = saved_errno;
+        }
+        recovery_add_diagnostic(
+            diagnostics, PORPOISE_EXIT_IO, destination, 0U,
+            "failed to open adjacent recovery project stage: %s",
+            strerror(errno));
+        return NULL;
+    }
+    recovery_add_diagnostic(
+        diagnostics, PORPOISE_EXIT_IO, destination, 0U,
+        "cannot allocate a unique adjacent recovery project stage");
+    return NULL;
+}
+
+static bool recovery_close_stage(FILE *file) {
+    bool success = ferror(file) == 0;
+    int descriptor = RECOVERY_FILENO(file);
+    if (success && fflush(file) != 0) success = false;
+    if (success &&
+        (descriptor < 0 || RECOVERY_COMMIT(descriptor) != 0)) {
+        success = false;
+    }
+    if (fclose(file) != 0) success = false;
+    return success;
+}
+
+static void recovery_cleanup_save_file(
+    const char *path,
+    PorpoiseDiagnostics *diagnostics) {
+    if (path == NULL || path[0] == '\0' || !porpoise_path_exists(path)) {
+        return;
+    }
+    if (remove(path) != 0) {
+        porpoise_diagnostics_add(
+            diagnostics, PORPOISE_SEVERITY_WARNING, path, 0U, 0U,
+            "could not remove recovery save temporary file: %s",
+            strerror(errno));
+    }
+}
+
+#ifdef _WIN32
+static bool recovery_unique_backup_path(
+    const char *destination,
+    char backup_path[PORPOISE_PATH_CAPACITY],
+    PorpoiseDiagnostics *diagnostics) {
+    unsigned int attempt;
+    for (attempt = 0U; attempt < 1000U; attempt++) {
+        if (!recovery_sibling_path(
+                destination, "backup", attempt, backup_path)) {
+            recovery_add_diagnostic(
+                diagnostics, PORPOISE_EXIT_USAGE, destination, 0U,
+                "save rollback path is too long");
+            return false;
+        }
+        if (!porpoise_path_exists(backup_path)) return true;
+    }
+    recovery_add_diagnostic(
+        diagnostics, PORPOISE_EXIT_IO, destination, 0U,
+        "cannot allocate a recovery save rollback path");
+    return false;
+}
+#endif
+
+static bool recovery_publish_save_file(
+    const char *stage_path,
+    const char *destination,
+    bool destination_existed,
+    PorpoiseDiagnostics *diagnostics) {
+#ifdef _WIN32
+    if (!destination_existed) {
+        if (MoveFileExA(stage_path, destination, MOVEFILE_WRITE_THROUGH)) {
+            return true;
+        }
+        recovery_add_diagnostic(
+            diagnostics, PORPOISE_EXIT_IO, destination, 0U,
+            "failed to publish recovery project atomically "
+            "(Windows error %lu)",
+            (unsigned long)GetLastError());
+        return false;
+    }
+    {
+        char backup_path[PORPOISE_PATH_CAPACITY];
+        DWORD publish_error;
+        if (!recovery_unique_backup_path(
+                destination, backup_path, diagnostics)) return false;
+        if (ReplaceFileA(
+                destination, stage_path, backup_path,
+                REPLACEFILE_WRITE_THROUGH, NULL, NULL)) {
+            recovery_cleanup_save_file(backup_path, diagnostics);
+            return true;
+        }
+        publish_error = GetLastError();
+        if (porpoise_path_exists(backup_path)) {
+            if (!MoveFileExA(
+                    backup_path, destination,
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                recovery_add_diagnostic(
+                    diagnostics, PORPOISE_EXIT_IO, destination, 0U,
+                    "recovery project publication failed and rollback from "
+                    "%s also failed (Windows error %lu)",
+                    backup_path, (unsigned long)GetLastError());
+            }
+        } else if (!porpoise_path_exists(destination)) {
+            recovery_add_diagnostic(
+                diagnostics, PORPOISE_EXIT_IO, destination, 0U,
+                "recovery project publication failed and the prior project "
+                "could not be located for rollback");
+        }
+        recovery_add_diagnostic(
+            diagnostics, PORPOISE_EXIT_IO, destination, 0U,
+            "failed to replace recovery project atomically "
+            "(Windows error %lu)",
+            (unsigned long)publish_error);
+        return false;
+    }
+#else
+    (void)destination_existed;
+    return porpoise_move_path(stage_path, destination, diagnostics);
+#endif
+}
+
 int porpoise_recovery_project_save(
     const PorpoiseRecoveryProject *project,
     const char *path,
@@ -3086,8 +3326,11 @@ int porpoise_recovery_project_save(
     char normalized_host[PORPOISE_PATH_CAPACITY];
     char normalized[PORPOISE_PATH_CAPACITY];
     char destination_directory[PORPOISE_PATH_CAPACITY];
-    FILE *file;
-    size_t target_index;
+    char stage_path[PORPOISE_PATH_CAPACITY];
+    FILE *file = NULL;
+    bool destination_existed;
+    bool destination_exists_now;
+    bool serialized;
     int result;
 
     if (path == NULL || path[0] == '\0' ||
@@ -3109,47 +3352,44 @@ int porpoise_recovery_project_save(
             diagnostics, PORPOISE_EXIT_USAGE, path, 0U,
             "save path is invalid or too long");
     }
-    file = fopen(path, "wb");
+    destination_existed = porpoise_path_exists(normalized_host);
+    if (destination_existed &&
+        porpoise_path_is_directory(normalized_host)) {
+        return recovery_add_diagnostic(
+            diagnostics, PORPOISE_EXIT_IO, path, 0U,
+            "recovery project destination is a directory");
+    }
+    stage_path[0] = '\0';
+    file = recovery_create_stage_file(
+        normalized_host, stage_path, diagnostics);
     if (file == NULL) {
+        return PORPOISE_EXIT_IO;
+    }
+    serialized = recovery_write_document(
+        file, project, destination_directory);
+    if (!recovery_close_stage(file)) serialized = false;
+    file = NULL;
+    if (!serialized) {
+        recovery_cleanup_save_file(stage_path, diagnostics);
         return recovery_add_diagnostic(
             diagnostics, PORPOISE_EXIT_IO, path, 0U,
-            "failed to open recovery project for writing: %s",
-            strerror(errno));
+            "failed to serialize recovery project; prior project was not changed");
     }
-    fputs("{\n  \"schema_version\": 1,\n  \"sdk_catalogs\": ", file);
-    if (!recovery_write_path_array(
-            file, project->sdk_catalogs, project->sdk_catalog_count,
-            destination_directory, 4U)) goto write_failed;
-    fputs(",\n  \"abi_contracts\": ", file);
-    if (!recovery_write_path_array(
-            file, project->abi_contracts, project->abi_contract_count,
-            destination_directory, 4U)) goto write_failed;
-    fputs(",\n  \"targets\": ", file);
-    if (project->target_count == 0U) {
-        fputs("[]", file);
-    } else {
-        fputs("[\n", file);
-        for (target_index = 0U; target_index < project->target_count;
-             target_index++) {
-            if (!recovery_write_target(
-                    file, &project->targets[target_index],
-                    destination_directory)) goto write_failed;
-            if (target_index + 1U < project->target_count) fputc(',', file);
-            fputc('\n', file);
-        }
-        fputs("  ]", file);
-    }
-    fputs("\n}\n", file);
-    if (ferror(file) || fclose(file) != 0) {
+    destination_exists_now = porpoise_path_exists(normalized_host);
+    if (destination_exists_now != destination_existed ||
+        (destination_exists_now &&
+         porpoise_path_is_directory(normalized_host))) {
+        recovery_cleanup_save_file(stage_path, diagnostics);
         return recovery_add_diagnostic(
             diagnostics, PORPOISE_EXIT_IO, path, 0U,
-            "failed to write recovery project");
+            "recovery project destination changed while the save was staged; "
+            "prior project was not changed");
+    }
+    if (!recovery_publish_save_file(
+            stage_path, normalized_host, destination_existed,
+            diagnostics)) {
+        recovery_cleanup_save_file(stage_path, diagnostics);
+        return PORPOISE_EXIT_IO;
     }
     return PORPOISE_EXIT_OK;
-
-write_failed:
-    (void)fclose(file);
-    return recovery_add_diagnostic(
-        diagnostics, PORPOISE_EXIT_IO, path, 0U,
-        "failed to write recovery project");
 }

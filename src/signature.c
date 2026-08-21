@@ -711,6 +711,13 @@ bool porpoise_signature_equal(
     return left->algorithm_version == right->algorithm_version &&
            left->function_size == right->function_size &&
            left->instruction_count == right->instruction_count &&
+           left->fixed_instruction_count == right->fixed_instruction_count &&
+           left->meaningful_fixed_instruction_count ==
+               right->meaningful_fixed_instruction_count &&
+           left->relocation_count == right->relocation_count &&
+           left->internal_branch_count == right->internal_branch_count &&
+           left->external_branch_count == right->external_branch_count &&
+           left->external_target_count == right->external_target_count &&
            left->issue_flags == right->issue_flags &&
            memcmp(left->digest, right->digest,
                   PORPOISE_SHA256_DIGEST_SIZE) == 0;

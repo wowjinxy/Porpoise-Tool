@@ -3,29 +3,13 @@
 #include "porpoise/analysis.h"
 #include "porpoise/lower.h"
 #include "porpoise/util.h"
-#include "plan_internal.h"
+#include "project_internal.h"
 
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-
-#ifdef _WIN32
-#include <process.h>
-#define PORPOISE_GETPID() _getpid()
-#else
-#include <unistd.h>
-#define PORPOISE_GETPID() getpid()
-#endif
-
-typedef struct ProjectDataChunk {
-    uint32_t address;
-    size_t size;
-    size_t capacity;
-    uint8_t *bytes;
-} ProjectDataChunk;
 
 typedef struct ProjectDataRange {
     uint32_t address;
@@ -36,41 +20,6 @@ typedef struct ProjectDataRange {
     const PorpoiseFunction *function;
     bool zero_fill;
 } ProjectDataRange;
-
-typedef struct ProjectContext {
-    const PorpoiseProgram *program;
-    const PorpoiseAbiManifest *abi;
-    const PorpoiseProjectOptions *options;
-    PorpoiseReport *report;
-    PorpoiseDiagnostics *diagnostics;
-    const PorpoiseTranslationPlan *plan;
-    const PorpoiseAnalysis *analysis;
-    const PorpoiseFunction *entry;
-    int failure_code;
-    char stage[PORPOISE_PATH_CAPACITY];
-    char project_name[PORPOISE_NAME_CAPACITY];
-    uint16_t *registry_shards;
-    size_t registry_shard_count;
-    ProjectDataChunk *data_chunks;
-    size_t data_chunk_count;
-    size_t data_chunk_capacity;
-    bool cancellation_reported;
-} ProjectContext;
-
-struct PorpoiseStagedProject {
-    char output_path[PORPOISE_PATH_CAPACITY];
-    char stage_path[PORPOISE_PATH_CAPACITY];
-    const PorpoiseOperationCallbacks *operation;
-    bool published;
-};
-
-typedef struct ProjectPublishEntry {
-    PorpoiseStagedProject *staged;
-    char backup_path[PORPOISE_PATH_CAPACITY];
-    bool had_output;
-    bool backup_moved;
-    bool output_published;
-} ProjectPublishEntry;
 
 enum {
     PORPOISE_REGISTRY_SHARD_SHIFT = 16,
@@ -220,28 +169,45 @@ static size_t data_word_count(const PorpoiseProgram *program) {
     return count;
 }
 
-static bool make_unique_sibling(
-    const char *output,
-    const char *tag,
-    char *path,
+FILE *porpoise_project_open_generated_file(
+    ProjectContext *context,
+    const char *relative_path,
+    char *full_path) {
+    return open_generated_file(context, relative_path, full_path);
+}
+
+bool porpoise_project_checked_close(
+    FILE *file,
+    const char *path,
     PorpoiseDiagnostics *diagnostics) {
-    char parent[PORPOISE_PATH_CAPACITY];
-    char base[PORPOISE_PATH_CAPACITY];
-    unsigned int attempt;
-    unsigned long seed = (unsigned long)time(NULL) ^ (unsigned long)PORPOISE_GETPID();
-    if (!porpoise_path_parent(parent, sizeof(parent), output) ||
-        !porpoise_path_basename(base, sizeof(base), output) ||
-        !porpoise_make_directories(parent, diagnostics)) return false;
-    for (attempt = 0U; attempt < 1000U; attempt++) {
-        char name[PORPOISE_PATH_CAPACITY];
-        if (!porpoise_format(name, sizeof(name), ".%s.porpoise-%s-%08lx-%u",
-                             base, tag, seed, attempt) ||
-            !porpoise_path_join(path, PORPOISE_PATH_CAPACITY, parent, name)) return false;
-        if (!porpoise_path_exists(path)) return true;
-    }
-    porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, output, 0U, 0U,
-                             "cannot allocate a sibling staging path");
-    return false;
+    return checked_close(file, path, diagnostics);
+}
+
+const PorpoiseFunctionPlanView *porpoise_project_find_function_plan(
+    const ProjectContext *context,
+    const PorpoiseFunction *function) {
+    return find_function_plan(context, function);
+}
+
+PorpoisePlanAction porpoise_project_function_action(
+    const ProjectContext *context,
+    const PorpoiseFunction *function) {
+    return function_action(context, function);
+}
+
+const PorpoiseAbiFunction *porpoise_project_function_import_binding(
+    const ProjectContext *context,
+    const PorpoiseFunction *function) {
+    return function_import_binding(context, function);
+}
+
+size_t porpoise_project_translated_function_count(
+    const ProjectContext *context) {
+    return translated_function_count(context);
+}
+
+size_t porpoise_project_data_word_count(const PorpoiseProgram *program) {
+    return data_word_count(program);
 }
 
 static bool write_generated_header(ProjectContext *context, const PorpoiseSourceFile *source) {
@@ -1771,486 +1737,6 @@ static bool write_meson(ProjectContext *context) {
     return checked_close(output, full, context->diagnostics);
 }
 
-static void write_data_fixups(
-    FILE *output,
-    const PorpoiseDataObject *object) {
-    size_t fixup_index;
-    fputc('[', output);
-    for (fixup_index = 0U;
-         fixup_index < object->fixup_count;
-         fixup_index++) {
-        const PorpoiseDataFixup *fixup = &object->fixups[fixup_index];
-        if (fixup_index != 0U) fputc(',', output);
-        fputs("{\"kind\": ", output);
-        porpoise_json_write_string(
-            output,
-            fixup->kind == PORPOISE_DATA_FIXUP_ABSOLUTE_32
-                ? "absolute_32"
-                : "rel_target_32");
-        fprintf(
-            output,
-            ", \"line\": %lu, \"offset\": %lu, "
-            "\"width\": %u, \"target\": ",
-            (unsigned long)fixup->source_line,
-            (unsigned long)fixup->offset,
-            (unsigned int)fixup->width);
-        if (fixup->target_symbol == NULL) {
-            fputs("null", output);
-        } else {
-            porpoise_json_write_string(output, fixup->target_symbol);
-        }
-        fprintf(output, ", \"target_addend\": %lld, \"base\": ",
-                (long long)fixup->target_addend);
-        if (fixup->base_symbol == NULL) {
-            fputs("null", output);
-        } else {
-            porpoise_json_write_string(output, fixup->base_symbol);
-        }
-        fprintf(output, ", \"base_addend\": %lld}",
-                (long long)fixup->base_addend);
-    }
-    fputc(']', output);
-}
-
-static void write_json_nullable_string(FILE *output, const char *value) {
-    if (value == NULL || value[0] == '\0') fputs("null", output);
-    else porpoise_json_write_string(output, value);
-}
-
-static bool write_report(ProjectContext *context) {
-    char full[PORPOISE_PATH_CAPACITY];
-    FILE *output = open_generated_file(context, "porpoise-report.json", full);
-    size_t file_index;
-    size_t function_index;
-    size_t object_index;
-    size_t anonymous_index;
-    size_t span_index;
-    size_t instruction_index;
-    size_t diagnostic_index;
-    size_t data_object_count = 0U;
-    size_t anonymous_data_count = 0U;
-    size_t data_fixup_count = 0U;
-    uint64_t anonymous_explicit_bytes = 0U;
-    uint64_t initialized_data_bytes = 0U;
-    uint64_t zero_fill_data_bytes = 0U;
-    bool first;
-    if (output == NULL) return false;
-    for (file_index = 0U;
-         file_index < context->program->file_count;
-         file_index++) {
-        const PorpoiseSourceFile *file = &context->program->files[file_index];
-        data_object_count += file->data_object_count;
-        for (object_index = 0U;
-             object_index < file->data_object_count;
-             object_index++) {
-            data_fixup_count += file->data_objects[object_index].fixup_count;
-        }
-        anonymous_data_count += file->anonymous_data_count;
-        for (anonymous_index = 0U;
-             anonymous_index < file->anonymous_data_count;
-             anonymous_index++) {
-            const PorpoiseAnonymousData *anonymous =
-                &file->anonymous_data[anonymous_index];
-            size_t byte_index;
-            data_fixup_count += anonymous->storage.fixup_count;
-            for (byte_index = 0U;
-                 byte_index < (size_t)anonymous->storage.size;
-                 byte_index++) {
-                if (anonymous->present[byte_index] != 0U) {
-                    anonymous_explicit_bytes++;
-                }
-            }
-        }
-    }
-    for (span_index = 0U;
-         span_index < context->program->data_span_count;
-         span_index++) {
-        const PorpoiseDataSpan *span =
-            &context->program->data_spans[span_index];
-        if (span->kind == PORPOISE_DATA_SPAN_INITIALIZED) {
-            initialized_data_bytes += (uint64_t)span->size;
-        } else if (span->kind == PORPOISE_DATA_SPAN_ZERO_FILL) {
-            zero_fill_data_bytes += (uint64_t)span->size;
-        }
-    }
-
-    fprintf(
-        output,
-        "{\n  \"schema_version\": 3,\n"
-        "  \"target\": {\"id\": ");
-    write_json_nullable_string(
-        output,
-        context->plan != NULL
-            ? porpoise_plan_target_id(context->plan)
-            : NULL);
-    fputs(", \"module\": ", output);
-    write_json_nullable_string(
-        output,
-        context->plan != NULL ? porpoise_plan_module(context->plan) : NULL);
-    fputs(", \"plan_digest\": ", output);
-    write_json_nullable_string(
-        output,
-        context->plan != NULL &&
-                (porpoise_plan_target_id(context->plan) != NULL ||
-                 porpoise_plan_module(context->plan) != NULL ||
-                 porpoise_plan_sdk_policy(context->plan) !=
-                     PORPOISE_SDK_POLICY_KEEP)
-            ? porpoise_plan_digest(context->plan)
-            : NULL);
-    fputs(", \"sdk_policy\": ", output);
-    porpoise_json_write_string(
-        output,
-        context->plan != NULL
-            ? porpoise_sdk_policy_name(
-                  porpoise_plan_sdk_policy(context->plan))
-            : "keep");
-    fprintf(
-        output,
-        "},\n"
-        "  \"data_model\": {\"source\": \"annotated_assembly\", "
-        "\"chunks\": %lu},\n"
-        "  \"files\": [\n",
-        (unsigned long)context->data_chunk_count);
-    for (file_index = 0U; file_index < context->program->file_count; file_index++) {
-        const PorpoiseSourceFile *file = &context->program->files[file_index];
-        fputs(file_index == 0U ? "    {\"input\": " : ",\n    {\"input\": ", output);
-        porpoise_json_write_string(output, file->relative_path);
-        fputs(", \"generated\": ", output);
-        {
-            char path[PORPOISE_PATH_CAPACITY];
-            porpoise_format(path, sizeof(path), "src/lifted/%s.c", file->output_stem);
-            porpoise_json_write_string(output, path);
-        }
-        fputc('}', output);
-    }
-    fputs("\n  ],\n  \"functions\": [\n", output);
-    first = true;
-    for (file_index = 0U; file_index < context->program->file_count; file_index++) {
-        const PorpoiseSourceFile *file = &context->program->files[file_index];
-        for (function_index = 0U; function_index < file->function_count; function_index++) {
-            const PorpoiseFunction *function = &file->functions[function_index];
-            const PorpoiseFunctionPlanView *view =
-                find_function_plan(context, function);
-            PorpoisePlanAction action = function_action(context, function);
-            PorpoisePlanAction requested_action =
-                view != NULL ? view->requested_action : action;
-            PorpoisePlanOrigin origin;
-            const PorpoiseAbiFunction *fallback_binding = NULL;
-            PorpoiseFunctionSignature fallback_signature;
-            const PorpoiseFunctionSignature *signature;
-            const char *status;
-            memset(&fallback_signature, 0, sizeof(fallback_signature));
-            if (view != NULL) {
-                origin = view->origin;
-                signature = &view->signature;
-            } else {
-                if (action == PORPOISE_PLAN_ACTION_DATA) {
-                    origin = PORPOISE_PLAN_ORIGIN_INPUT_DATA;
-                } else if (action == PORPOISE_PLAN_ACTION_IMPORT) {
-                    origin = PORPOISE_PLAN_ORIGIN_ABI_IMPORT;
-                    fallback_binding =
-                        function_import_binding(context, function);
-                } else if (action == PORPOISE_PLAN_ACTION_OMIT) {
-                    origin = PORPOISE_PLAN_ORIGIN_SKIP_LIST;
-                } else {
-                    origin = PORPOISE_PLAN_ORIGIN_DEFAULT;
-                }
-                (void)porpoise_signature_compute(
-                    context->program, function, &fallback_signature);
-                signature = &fallback_signature;
-            }
-            switch (action) {
-                case PORPOISE_PLAN_ACTION_LIFT: status = "lifted"; break;
-                case PORPOISE_PLAN_ACTION_DATA: status = "data"; break;
-                case PORPOISE_PLAN_ACTION_IMPORT: status = "imported"; break;
-                case PORPOISE_PLAN_ACTION_OMIT: status = "skipped"; break;
-                default: status = "unknown"; break;
-            }
-            fputs(first ? "    {\"symbol\": " : ",\n    {\"symbol\": ", output); first = false;
-            porpoise_json_write_string(output, function->name);
-            fputs(", \"c_symbol\": ", output); porpoise_json_write_string(output, function->c_name);
-            fputs(", \"file\": ", output); porpoise_json_write_string(output, file->relative_path);
-            fprintf(output, ", \"address\": %lu, \"size\": %lu, \"status\": \"%s\"",
-                    (unsigned long)function->start_address, (unsigned long)function->size,
-                    status);
-            fputs(", \"requested_action\": ", output);
-            porpoise_json_write_string(
-                output, porpoise_plan_action_name(requested_action));
-            fputs(", \"resolved_action\": ", output);
-            porpoise_json_write_string(
-                output, porpoise_plan_action_name(action));
-            fputs(", \"origin\": ", output);
-            porpoise_json_write_string(
-                output,
-                porpoise_plan_origin_name(origin));
-            fputs(", \"canonical_sdk_identity\": ", output);
-            write_json_nullable_string(
-                output,
-                view != NULL ? view->canonical_sdk_identity : NULL);
-            fputs(", \"sdk_category\": ", output);
-            if (view == NULL || !view->has_sdk_category) fputs("null", output);
-            else porpoise_json_write_string(
-                output, porpoise_sdk_category_name(view->sdk_category));
-            fputs(", \"confidence\": ", output);
-            porpoise_json_write_string(
-                output,
-                porpoise_match_confidence_name(
-                    view != NULL ? view->confidence
-                                 : PORPOISE_MATCH_CONFIDENCE_NONE));
-            fputs(", \"binding\": ", output);
-            write_json_nullable_string(
-                output,
-                view != NULL
-                    ? (view->contract_name != NULL
-                           ? view->contract_name
-                           : (view->binding != NULL
-                                  ? view->binding->symbol
-                                  : NULL))
-                    : (fallback_binding != NULL
-                           ? fallback_binding->symbol
-                           : NULL));
-            fputs(", \"fingerprint\": ", output);
-            write_json_nullable_string(
-                output,
-                signature->digest_hex);
-            fprintf(
-                output,
-                ", \"evidence_flags\": %u, \"conflict\": %s, "
-                "\"overridden\": %s, \"override_action\": ",
-                view != NULL ? view->evidence_flags : 0U,
-                view != NULL &&
-                        (view->evidence_flags &
-                         PORPOISE_PLAN_EVIDENCE_CONFLICT) != 0U
-                    ? "true" : "false",
-                view != NULL && view->overridden ? "true" : "false");
-            porpoise_json_write_string(
-                output,
-                porpoise_override_action_name(
-                    view != NULL ? view->override_action
-                                 : PORPOISE_OVERRIDE_AUTO));
-            fputs(", \"blocking_reason\": ", output);
-            write_json_nullable_string(
-                output,
-                view != NULL && view->blocked
-                    ? view->blocking_reason
-                    : NULL);
-            fputs(", \"provenance\": {\"map\": ", output);
-            if (view == NULL || view->map_symbol == NULL) {
-                fputs("null", output);
-            } else {
-                fputs("{\"path\": ", output);
-                write_json_nullable_string(
-                    output, view->map_symbol->provenance.path);
-                fprintf(
-                    output,
-                    ", \"line\": %lu, \"library\": ",
-                    (unsigned long)view->map_symbol->provenance.line);
-                write_json_nullable_string(output, view->map_symbol->library);
-                fputs(", \"object\": ", output);
-                write_json_nullable_string(output, view->map_symbol->object);
-                fputc('}', output);
-            }
-            fputs(", \"catalog\": ", output);
-            if (view == NULL || view->sdk_entry == NULL) {
-                fputs("null", output);
-            } else {
-                fputs("{\"source\": ", output);
-                porpoise_json_write_string(
-                    output,
-                    porpoise_sdk_catalog_source_kind_name(
-                        view->sdk_entry->provenance.source_kind));
-                fputs(", \"path\": ", output);
-                write_json_nullable_string(
-                    output, view->sdk_entry->provenance.path);
-                fprintf(
-                    output,
-                    ", \"line\": %lu}",
-                    (unsigned long)view->sdk_entry->provenance.line);
-            }
-            fputs("}}", output);
-        }
-    }
-    fputs("\n  ],\n  \"data_objects\": [\n", output);
-    first = true;
-    for (file_index = 0U; file_index < context->program->file_count; file_index++) {
-        const PorpoiseSourceFile *file = &context->program->files[file_index];
-        for (object_index = 0U;
-             object_index < file->data_object_count;
-             object_index++) {
-            const PorpoiseDataObject *object =
-                &file->data_objects[object_index];
-            fputs(first ? "    {\"symbol\": " : ",\n    {\"symbol\": ", output);
-            first = false;
-            porpoise_json_write_string(output, object->name);
-            fputs(", \"file\": ", output);
-            porpoise_json_write_string(output, file->relative_path);
-            fputs(", \"section\": ", output);
-            porpoise_json_write_string(output, object->section);
-            fprintf(
-                output,
-                ", \"binding\": \"%s\", \"metadata_line\": %lu, "
-                "\"line\": %lu, \"end_line\": %lu, "
-                "\"section_offset\": %lu, \"address\": %lu, "
-                "\"size\": %lu, \"fixups\": ",
-                object->is_global ? "global" : "local",
-                (unsigned long)object->metadata_line,
-                (unsigned long)object->source_line,
-                (unsigned long)object->end_source_line,
-                (unsigned long)object->section_offset,
-                (unsigned long)object->address,
-                (unsigned long)object->size);
-            write_data_fixups(output, object);
-            fputc('}', output);
-        }
-    }
-    fputs("\n  ],\n  \"anonymous_data\": [\n", output);
-    first = true;
-    for (file_index = 0U;
-         file_index < context->program->file_count;
-         file_index++) {
-        const PorpoiseSourceFile *file = &context->program->files[file_index];
-        for (anonymous_index = 0U;
-             anonymous_index < file->anonymous_data_count;
-             anonymous_index++) {
-            const PorpoiseAnonymousData *anonymous =
-                &file->anonymous_data[anonymous_index];
-            const PorpoiseDataObject *storage = &anonymous->storage;
-            size_t byte_index;
-            uint64_t explicit_bytes = 0U;
-            uint64_t initialized_bytes = 0U;
-            uint64_t zero_fill_bytes = 0U;
-            for (byte_index = 0U;
-                 byte_index < (size_t)storage->size;
-                 byte_index++) {
-                if (anonymous->present[byte_index] == 0U) continue;
-                explicit_bytes++;
-                if (storage->initialized[byte_index] != 0U) {
-                    initialized_bytes++;
-                } else {
-                    zero_fill_bytes++;
-                }
-            }
-            fputs(first ? "    {\"file\": " : ",\n    {\"file\": ", output);
-            first = false;
-            porpoise_json_write_string(output, file->relative_path);
-            fputs(", \"section\": ", output);
-            porpoise_json_write_string(output, storage->section);
-            fprintf(
-                output,
-                ", \"line\": %lu, \"address\": %lu, \"size\": %lu, "
-                "\"explicit_bytes\": %llu, \"initialized_bytes\": %llu, "
-                "\"zero_fill_bytes\": %llu, \"fixups\": ",
-                (unsigned long)storage->source_line,
-                (unsigned long)storage->address,
-                (unsigned long)storage->size,
-                (unsigned long long)explicit_bytes,
-                (unsigned long long)initialized_bytes,
-                (unsigned long long)zero_fill_bytes);
-            write_data_fixups(output, storage);
-            fputc('}', output);
-        }
-    }
-    fputs("\n  ],\n  \"data_spans\": [\n", output);
-    for (span_index = 0U;
-         span_index < context->program->data_span_count;
-         span_index++) {
-        const PorpoiseDataSpan *span =
-            &context->program->data_spans[span_index];
-        const PorpoiseSourceFile *source_file = NULL;
-        const PorpoiseDataObject *source_object = NULL;
-        if (span->source_file_index < context->program->file_count) {
-            source_file = &context->program->files[span->source_file_index];
-            if (span->data_object_index < source_file->data_object_count) {
-                source_object = &source_file->data_objects[span->data_object_index];
-            }
-        }
-        fputs(span_index == 0U ? "    {\"kind\": " : ",\n    {\"kind\": ", output);
-        porpoise_json_write_string(
-            output,
-            span->kind == PORPOISE_DATA_SPAN_INITIALIZED
-                ? "initialized"
-                : "zero_fill");
-        fprintf(
-            output,
-            ", \"address\": %lu, \"size\": %lu, \"file\": ",
-            (unsigned long)span->address,
-            (unsigned long)span->size);
-        if (source_file == NULL) {
-            fputs("null", output);
-        } else {
-            porpoise_json_write_string(output, source_file->relative_path);
-        }
-        fputs(", \"object\": ", output);
-        if (source_object == NULL) {
-            fputs("null", output);
-        } else {
-            porpoise_json_write_string(output, source_object->name);
-        }
-        fprintf(
-            output,
-            ", \"line\": %lu, \"contribution_padding\": %s}",
-            (unsigned long)span->source_line,
-            span->contribution_padding ? "true" : "false");
-    }
-    fputs("\n  ],\n  \"instructions\": [\n", output);
-    for (instruction_index = 0U; instruction_index < context->report->instruction_count; instruction_index++) {
-        const PorpoiseInstructionReport *item = &context->report->instructions[instruction_index];
-        fputs(instruction_index == 0U ? "    {\"file\": " : ",\n    {\"file\": ", output);
-        porpoise_json_write_string(output, item->file);
-        fprintf(output, ", \"line\": %lu, \"address\": %lu, \"mnemonic\": ",
-                (unsigned long)item->line, (unsigned long)item->address);
-        porpoise_json_write_string(output, item->mnemonic);
-        fputs(", \"status\": ", output); porpoise_json_write_string(output, porpoise_lowering_status_name(item->status));
-        fprintf(output, ", \"semantic_test\": %s, \"detail\": ", item->semantic_test ? "true" : "false");
-        porpoise_json_write_string(output, item->detail == NULL ? "" : item->detail);
-        fputc('}', output);
-    }
-    fputs("\n  ],\n  \"approximations\": [", output);
-    first = true;
-    for (instruction_index = 0U; instruction_index < context->report->instruction_count; instruction_index++) {
-        const PorpoiseInstructionReport *item = &context->report->instructions[instruction_index];
-        if (item->status == PORPOISE_APPROXIMATE) {
-            if (!first) fputc(',', output);
-            fputs("\n    {\"file\": ", output); porpoise_json_write_string(output, item->file);
-            fprintf(output, ", \"line\": %lu, \"address\": %lu, \"mnemonic\": ",
-                    (unsigned long)item->line, (unsigned long)item->address);
-            porpoise_json_write_string(output, item->mnemonic); fputc('}', output); first = false;
-        }
-    }
-    if (!first) fputc('\n', output);
-    fputs("  ],\n  \"diagnostics\": [", output);
-    for (diagnostic_index = 0U; diagnostic_index < context->diagnostics->count; diagnostic_index++) {
-        const PorpoiseDiagnostic *item = &context->diagnostics->items[diagnostic_index];
-        if (diagnostic_index != 0U) fputc(',', output);
-        fputs("\n    {\"severity\": ", output);
-        porpoise_json_write_string(output, item->severity == PORPOISE_SEVERITY_ERROR ? "error" :
-                                          item->severity == PORPOISE_SEVERITY_WARNING ? "warning" : "info");
-        fputs(", \"file\": ", output); porpoise_json_write_string(output, item->file);
-        fprintf(output, ", \"line\": %lu, \"address\": %lu, \"message\": ",
-                (unsigned long)item->line, (unsigned long)item->address);
-        porpoise_json_write_string(output, item->message); fputc('}', output);
-    }
-    if (context->diagnostics->count != 0U) fputc('\n', output);
-    fputs("  ],\n  \"summary\": {", output);
-    fprintf(output, "\"files\": %lu, \"functions\": %lu, \"data_words\": %lu, \"data_objects\": %lu, \"anonymous_contributions\": %lu, \"anonymous_explicit_bytes\": %llu, \"data_fixups\": %lu, \"data_spans\": %lu, \"initialized_data_bytes\": %llu, \"zero_fill_data_bytes\": %llu, \"data_chunks\": %lu, \"lowered\": %lu, \"host_equivalent_noop\": %lu, \"approximate\": %lu, \"unsupported\": %lu}",
-            (unsigned long)context->program->file_count,
-            (unsigned long)translated_function_count(context),
-            (unsigned long)data_word_count(context->program),
-            (unsigned long)data_object_count,
-            (unsigned long)anonymous_data_count,
-            (unsigned long long)anonymous_explicit_bytes,
-            (unsigned long)data_fixup_count,
-            (unsigned long)context->program->data_span_count,
-            (unsigned long long)initialized_data_bytes,
-            (unsigned long long)zero_fill_data_bytes,
-            (unsigned long)context->data_chunk_count,
-            (unsigned long)context->report->status_counts[PORPOISE_LOWERED],
-            (unsigned long)context->report->status_counts[PORPOISE_HOST_NOOP],
-            (unsigned long)context->report->status_counts[PORPOISE_APPROXIMATE],
-            (unsigned long)context->report->status_counts[PORPOISE_UNSUPPORTED]);
-    fputs("\n}\n", output);
-    return checked_close(output, full, context->diagnostics);
-}
 
 static bool write_project_readme(ProjectContext *context) {
     char full[PORPOISE_PATH_CAPACITY];
@@ -2311,7 +1797,8 @@ static bool generate_stage(ProjectContext *context) {
     if (!ok || porpoise_diagnostics_have_errors(context->diagnostics) ||
         project_cancelled(context)) return false;
     if (!write_entry(context) || !write_meson(context) ||
-        !write_report(context) || !write_project_readme(context) ||
+        !porpoise_project_write_report(context) ||
+        !write_project_readme(context) ||
         project_cancelled(context)) return false;
     porpoise_operation_progress(
         context->options->operation,
@@ -2322,458 +1809,24 @@ static bool generate_stage(ProjectContext *context) {
     return true;
 }
 
-static bool write_publish_journal(
-    const char *journal_path,
-    const char *state,
-    const ProjectPublishEntry *entries,
-    size_t entry_count,
-    PorpoiseDiagnostics *diagnostics) {
-    FILE *journal = fopen(journal_path, "wb");
-    size_t index;
-    if (journal == NULL) {
-        porpoise_diagnostics_add(
-            diagnostics, PORPOISE_SEVERITY_ERROR, journal_path, 0U, 0U,
-            "cannot create publication rollback journal: %s",
-            strerror(errno));
-        return false;
-    }
-    fputs("{\n  \"schema_version\": 1,\n  \"state\": ", journal);
-    porpoise_json_write_string(journal, state);
-    fputs(",\n  \"targets\": [", journal);
-    for (index = 0U; index < entry_count; index++) {
-        const ProjectPublishEntry *entry = &entries[index];
-        fputs(index == 0U ? "\n    {\"output\": " :
-                            ",\n    {\"output\": ", journal);
-        porpoise_json_write_string(
-            journal, entry->staged->output_path);
-        fputs(", \"stage\": ", journal);
-        porpoise_json_write_string(
-            journal, entry->staged->stage_path);
-        fputs(", \"backup\": ", journal);
-        if (entry->had_output) {
-            porpoise_json_write_string(journal, entry->backup_path);
-        } else {
-            fputs("null", journal);
-        }
-        fprintf(
-            journal,
-            ", \"backup_moved\": %s, \"output_published\": %s}",
-            entry->backup_moved ? "true" : "false",
-            entry->output_published ? "true" : "false");
-    }
-    fputs(entry_count == 0U ? "]\n}\n" : "\n  ]\n}\n", journal);
-    return checked_close(journal, journal_path, diagnostics);
+bool porpoise_project_generation_cancelled(ProjectContext *context) {
+    return project_cancelled(context);
 }
 
-static bool publish_batch_cancelled(
-    const ProjectPublishEntry *entries,
-    size_t entry_count) {
-    size_t index;
-    for (index = 0U; index < entry_count; index++) {
-        if (porpoise_operation_cancelled(entries[index].staged->operation)) {
-            return true;
-        }
-    }
-    return false;
+bool porpoise_project_prepare_generation(ProjectContext *context) {
+    return prepare_data_chunks(context);
 }
 
-static bool validate_publish_batch(
-    PorpoiseStagedProject *const *staged,
-    size_t staged_count,
-    PorpoiseDiagnostics *diagnostics) {
-    size_t left;
-    size_t right;
-    if (staged == NULL || staged_count == 0U) {
-        porpoise_diagnostics_add(
-            diagnostics, PORPOISE_SEVERITY_ERROR, NULL, 0U, 0U,
-            "publication batch contains no staged targets");
-        return false;
-    }
-    for (left = 0U; left < staged_count; left++) {
-        if (staged[left] == NULL || staged[left]->published ||
-            staged[left]->stage_path[0] == '\0' ||
-            staged[left]->output_path[0] == '\0' ||
-            !porpoise_path_is_directory(staged[left]->stage_path)) {
-            porpoise_diagnostics_add(
-                diagnostics, PORPOISE_SEVERITY_ERROR,
-                staged[left] == NULL ? NULL : staged[left]->stage_path,
-                0U, 0U,
-                "publication batch contains an invalid staged target");
-            return false;
-        }
-        for (right = 0U; right < left; right++) {
-            bool overlap = false;
-            if (!porpoise_path_trees_overlap(
-                    staged[left]->output_path,
-                    staged[right]->output_path,
-                    &overlap)) {
-                porpoise_diagnostics_add(
-                    diagnostics, PORPOISE_SEVERITY_ERROR,
-                    staged[left]->output_path, 0U, 0U,
-                    "cannot compare project output paths safely");
-                return false;
-            }
-            if (overlap) {
-                porpoise_diagnostics_add(
-                    diagnostics, PORPOISE_SEVERITY_ERROR,
-                    staged[left]->output_path, 0U, 0U,
-                    "project output paths overlap: %s",
-                    staged[right]->output_path);
-                return false;
-            }
-        }
-    }
-    return true;
+bool porpoise_project_generate_artifacts(ProjectContext *context) {
+    return generate_stage(context);
 }
 
-static bool rollback_publish_batch(
-    ProjectPublishEntry *entries,
-    size_t entry_count,
-    PorpoiseDiagnostics *diagnostics) {
-    bool restored = true;
-    size_t remaining = entry_count;
-    while (remaining != 0U) {
-        ProjectPublishEntry *entry = &entries[--remaining];
-        if (entry->output_published &&
-            porpoise_path_exists(entry->staged->output_path)) {
-            if (!porpoise_remove_tree(
-                    entry->staged->output_path, diagnostics)) {
-                restored = false;
-                continue;
-            }
-            entry->output_published = false;
-        }
-        if (entry->backup_moved) {
-            if (!porpoise_move_path(
-                    entry->backup_path,
-                    entry->staged->output_path,
-                    diagnostics)) {
-                porpoise_diagnostics_add(
-                    diagnostics, PORPOISE_SEVERITY_ERROR,
-                    entry->staged->output_path, 0U, 0U,
-                    "publication rollback could not restore the previous output from %s",
-                    entry->backup_path);
-                restored = false;
-            } else {
-                entry->backup_moved = false;
-            }
-        }
-    }
-    return restored;
-}
-
-static int prepare_project_output(ProjectContext *context) {
-    char base[PORPOISE_PATH_CAPACITY];
-    const PorpoiseProjectOptions *options = context->options;
-    PorpoiseDiagnostics *diagnostics = context->diagnostics;
-
-    if (porpoise_path_exists(options->output_path)) {
-        if (!porpoise_path_is_directory(options->output_path)) {
-            porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, options->output_path, 0U, 0U,
-                                     "output path exists and is not a directory");
-            return PORPOISE_EXIT_IO;
-        }
-        if (!porpoise_directory_is_empty(options->output_path) && !options->force) {
-            porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, options->output_path, 0U, 0U,
-                                     "output directory is not empty; use --force to replace it");
-            return PORPOISE_EXIT_USAGE;
-        }
-    }
-    if (!porpoise_path_basename(base, sizeof(base), options->output_path)) {
-        return PORPOISE_EXIT_INTERNAL;
-    }
-    porpoise_sanitize_identifier(
-        base, context->project_name, sizeof(context->project_name));
-    return PORPOISE_EXIT_OK;
-}
-
-static int stage_project_context(
-    ProjectContext *context,
-    PorpoiseStagedProject **staged_out) {
-    PorpoiseStagedProject *staged;
-    bool generated;
-    if (staged_out == NULL) return PORPOISE_EXIT_INTERNAL;
-    *staged_out = NULL;
-    if (project_cancelled(context)) return PORPOISE_EXIT_CANCELLED;
-    if (!prepare_data_chunks(context)) {
-        int result = context->failure_code != PORPOISE_EXIT_OK
-                         ? context->failure_code
-                         : PORPOISE_EXIT_INTERNAL;
-        free_data_chunks(context);
-        return result;
-    }
-    if (!make_unique_sibling(
-            context->options->output_path,
-            "stage",
-            context->stage,
-            context->diagnostics)) {
-        free_data_chunks(context);
-        return PORPOISE_EXIT_IO;
-    }
-    generated = generate_stage(context);
-    if (!generated) {
-        free(context->registry_shards);
-        free_data_chunks(context);
-        if (!porpoise_remove_tree(context->stage, context->diagnostics)) {
-            return PORPOISE_EXIT_IO;
-        }
-        return context->failure_code != PORPOISE_EXIT_OK
-                   ? context->failure_code
-                   : PORPOISE_EXIT_IO;
-    }
-    if (project_cancelled(context)) {
-        free(context->registry_shards);
-        context->registry_shards = NULL;
-        free_data_chunks(context);
-        if (!porpoise_remove_tree(context->stage, context->diagnostics)) {
-            return PORPOISE_EXIT_IO;
-        }
-        return PORPOISE_EXIT_CANCELLED;
-    }
+void porpoise_project_release_generation(ProjectContext *context) {
     free(context->registry_shards);
     context->registry_shards = NULL;
     free_data_chunks(context);
-    staged = (PorpoiseStagedProject *)calloc(1U, sizeof(*staged));
-    if (staged == NULL ||
-        !porpoise_copy_string(
-            staged->output_path, sizeof(staged->output_path),
-            context->options->output_path) ||
-        !porpoise_copy_string(
-            staged->stage_path, sizeof(staged->stage_path),
-            context->stage)) {
-        free(staged);
-        (void)porpoise_remove_tree(context->stage, context->diagnostics);
-        return PORPOISE_EXIT_INTERNAL;
-    }
-    staged->operation = context->options->operation;
-    *staged_out = staged;
-    return PORPOISE_EXIT_OK;
 }
 
-int porpoise_project_stage_plan(
-    const PorpoiseTranslationPlan *plan,
-    const PorpoiseProjectOptions *options,
-    PorpoiseReport *report,
-    PorpoiseStagedProject **staged_out,
-    PorpoiseDiagnostics *diagnostics) {
-    ProjectContext context;
-    const PorpoiseSession *session;
-    const PorpoiseFunctionPlanView *entry;
-    int result;
-
-    if (plan == NULL || options == NULL || options->output_path == NULL ||
-        options->runtime_directory == NULL || report == NULL ||
-        staged_out == NULL || diagnostics == NULL) {
-        return PORPOISE_EXIT_INTERNAL;
-    }
-    *staged_out = NULL;
-    result = porpoise_plan_validate(plan, diagnostics);
-    if (result != PORPOISE_EXIT_OK) return result;
-    session = porpoise_plan_session(plan);
-    if (session == NULL || porpoise_session_program(session) == NULL ||
-        porpoise_plan_effective_abi(plan) == NULL ||
-        porpoise_plan_analysis_snapshot(plan) == NULL) {
-        return PORPOISE_EXIT_INTERNAL;
-    }
-
-    memset(&context, 0, sizeof(context));
-    context.program = porpoise_session_program(session);
-    context.abi = porpoise_plan_effective_abi(plan);
-    context.options = options;
-    context.report = report;
-    context.diagnostics = diagnostics;
-    context.plan = plan;
-    context.analysis = porpoise_plan_analysis_snapshot(plan);
-    entry = porpoise_plan_entry(plan);
-    context.entry = entry == NULL ? NULL : entry->function;
-
-    result = prepare_project_output(&context);
-    if (result != PORPOISE_EXIT_OK) return result;
-    return stage_project_context(&context, staged_out);
-}
-
-const char *porpoise_staged_project_output_path(
-    const PorpoiseStagedProject *staged) {
-    return staged == NULL ? NULL : staged->output_path;
-}
-
-const char *porpoise_staged_project_stage_path(
-    const PorpoiseStagedProject *staged) {
-    return staged == NULL ? NULL : staged->stage_path;
-}
-
-int porpoise_project_publish_batch(
-    PorpoiseStagedProject *const *staged,
-    size_t staged_count,
-    PorpoiseDiagnostics *diagnostics) {
-    ProjectPublishEntry *entries;
-    char journal_path[PORPOISE_PATH_CAPACITY];
-    bool journal_written = false;
-    bool rollback_ok;
-    size_t index;
-    int failure = PORPOISE_EXIT_IO;
-
-    if (diagnostics == NULL) return PORPOISE_EXIT_INTERNAL;
-    if (!validate_publish_batch(staged, staged_count, diagnostics)) {
-        return PORPOISE_EXIT_USAGE;
-    }
-    entries = (ProjectPublishEntry *)calloc(staged_count, sizeof(*entries));
-    if (entries == NULL) return PORPOISE_EXIT_INTERNAL;
-    for (index = 0U; index < staged_count; index++) {
-        entries[index].staged = staged[index];
-        entries[index].had_output =
-            porpoise_path_exists(staged[index]->output_path);
-        if (entries[index].had_output &&
-            !make_unique_sibling(
-                staged[index]->output_path, "backup",
-                entries[index].backup_path, diagnostics)) {
-            free(entries);
-            return PORPOISE_EXIT_IO;
-        }
-    }
-    if (!make_unique_sibling(
-            staged[0]->output_path, "journal", journal_path,
-            diagnostics) ||
-        !write_publish_journal(
-            journal_path, "prepared", entries, staged_count,
-            diagnostics)) {
-        free(entries);
-        return PORPOISE_EXIT_IO;
-    }
-    journal_written = true;
-
-    if (publish_batch_cancelled(entries, staged_count)) {
-        failure = PORPOISE_EXIT_CANCELLED;
-        goto rollback;
-    }
-    porpoise_operation_progress(
-        entries[0].staged->operation,
-        PORPOISE_PHASE_PUBLISH, 0U, staged_count,
-        entries[0].staged->output_path);
-    for (index = 0U; index < staged_count; index++) {
-        if (entries[index].had_output) {
-            if (!porpoise_move_path(
-                    entries[index].staged->output_path,
-                    entries[index].backup_path, diagnostics)) {
-                goto rollback;
-            }
-            entries[index].backup_moved = true;
-            if (!write_publish_journal(
-                    journal_path, "backing_up", entries,
-                    staged_count, diagnostics)) {
-                goto rollback;
-            }
-        }
-        if (publish_batch_cancelled(entries, staged_count)) {
-            failure = PORPOISE_EXIT_CANCELLED;
-            goto rollback;
-        }
-    }
-
-    for (index = 0U; index < staged_count; index++) {
-        if (!porpoise_move_path(
-                entries[index].staged->stage_path,
-                entries[index].staged->output_path, diagnostics)) {
-            goto rollback;
-        }
-        entries[index].output_published = true;
-        if (!write_publish_journal(
-                journal_path, "publishing", entries, staged_count,
-                diagnostics)) {
-            goto rollback;
-        }
-        porpoise_operation_progress(
-            entries[0].staged->operation,
-            PORPOISE_PHASE_PUBLISH, index + 1U, staged_count,
-            entries[index].staged->output_path);
-        if (publish_batch_cancelled(entries, staged_count)) {
-            failure = PORPOISE_EXIT_CANCELLED;
-            goto rollback;
-        }
-    }
-
-    for (index = 0U; index < staged_count; index++) {
-        entries[index].staged->published = true;
-        porpoise_operation_progress(
-            entries[index].staged->operation,
-            PORPOISE_PHASE_PUBLISH, staged_count, staged_count,
-            entries[index].staged->output_path);
-    }
-    (void)write_publish_journal(
-        journal_path, "published", entries, staged_count, diagnostics);
-    for (index = 0U; index < staged_count; index++) {
-        if (entries[index].backup_moved) {
-            PorpoiseDiagnostics cleanup_diagnostics;
-            porpoise_diagnostics_init(&cleanup_diagnostics);
-            if (!porpoise_remove_tree(
-                    entries[index].backup_path,
-                    &cleanup_diagnostics)) {
-                porpoise_diagnostics_add(
-                    diagnostics, PORPOISE_SEVERITY_WARNING,
-                    entries[index].backup_path, 0U, 0U,
-                    "generated output was published, but its recoverable backup could not be removed");
-            }
-            porpoise_diagnostics_free(&cleanup_diagnostics);
-        }
-    }
-    if (remove(journal_path) != 0) {
-        porpoise_diagnostics_add(
-            diagnostics, PORPOISE_SEVERITY_WARNING, journal_path,
-            0U, 0U,
-            "outputs were published, but the completed rollback journal could not be removed");
-    }
-    free(entries);
-    return PORPOISE_EXIT_OK;
-
-rollback:
-    if (failure == PORPOISE_EXIT_CANCELLED) {
-        porpoise_diagnostics_add(
-            diagnostics, PORPOISE_SEVERITY_INFO, journal_path,
-            0U, 0U,
-            "multi-target publication was cancelled; restoring previous outputs");
-    }
-    rollback_ok = rollback_publish_batch(
-        entries, staged_count, diagnostics);
-    if (journal_written && rollback_ok) {
-        (void)write_publish_journal(
-            journal_path, "rolled_back", entries, staged_count,
-            diagnostics);
-        if (remove(journal_path) != 0) {
-            porpoise_diagnostics_add(
-                diagnostics, PORPOISE_SEVERITY_WARNING, journal_path,
-                0U, 0U,
-                "publication was rolled back, but its completed journal could not be removed");
-        }
-    } else if (!rollback_ok) {
-        porpoise_diagnostics_add(
-            diagnostics, PORPOISE_SEVERITY_ERROR, journal_path,
-            0U, 0U,
-            "publication rollback is incomplete; preserve this journal and its backup paths for recovery");
-    }
-    free(entries);
-    return rollback_ok ? failure : PORPOISE_EXIT_IO;
-}
-
-int porpoise_project_publish_staged(
-    PorpoiseStagedProject *staged,
-    PorpoiseDiagnostics *diagnostics) {
-    PorpoiseStagedProject *batch[1];
-    batch[0] = staged;
-    return porpoise_project_publish_batch(batch, 1U, diagnostics);
-}
-
-void porpoise_staged_project_free(PorpoiseStagedProject *staged) {
-    if (staged == NULL) return;
-    if (!staged->published && staged->stage_path[0] != '\0' &&
-        porpoise_path_exists(staged->stage_path)) {
-        PorpoiseDiagnostics cleanup_diagnostics;
-        porpoise_diagnostics_init(&cleanup_diagnostics);
-        (void)porpoise_remove_tree(
-            staged->stage_path, &cleanup_diagnostics);
-        porpoise_diagnostics_free(&cleanup_diagnostics);
-    }
-    free(staged);
-}
 
 int porpoise_project_generate_plan(
     const PorpoiseTranslationPlan *plan,
@@ -2812,7 +1865,7 @@ int porpoise_project_generate(
     context.options = options;
     context.report = report;
     context.diagnostics = diagnostics;
-    result = prepare_project_output(&context);
+    result = porpoise_project_prepare_output(&context);
     if (result != PORPOISE_EXIT_OK) return result;
 
     porpoise_analysis_init(&analysis);
@@ -2824,7 +1877,7 @@ int porpoise_project_generate(
     }
     context.analysis = &analysis;
     context.entry = analysis.entry;
-    result = stage_project_context(&context, &staged);
+    result = porpoise_project_stage_context(&context, &staged);
     porpoise_analysis_free(&analysis);
     if (result == PORPOISE_EXIT_OK) {
         result = porpoise_project_publish_staged(staged, diagnostics);

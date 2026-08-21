@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -114,16 +115,115 @@ def candidate(
     identity: str = "gx.a/example.c/Example",
     category: str = "nintendo_dolphin",
     contract: str | None = "ExampleContract",
+    address: int | None = 0x80001000,
 ):
     return catalog_tool.Candidate(
         symbol=symbol,
         canonical_identity=identity,
         category=category,
         contract=contract,
+        address=address,
     )
 
 
 class SignatureConversionTests(unittest.TestCase):
+    def test_normalizes_dtk_high_relocation_spelling(self):
+        text = dtk_yaml("Example").replace("kind: ha", "kind: hi", 1)
+        record = catalog_tool._parse_dtk_yaml(text, "Example")
+        result = catalog_tool.convert_dtk_signature(record, "Example")
+        self.assertEqual(result.relocation_count, 2)
+        self.assertEqual(
+            result.sha256,
+            "e69e9a79ede5d444aaba2c0d4ce737050b7ada4252bacb68d36e6e946dc71f53",
+        )
+
+    def test_masks_absolute_branch_without_dtk_relocation(self):
+        record = catalog_tool._parse_dtk_yaml(dtk_yaml("Example"), "Example")
+        blob = bytearray(base64.b64decode(record.encoded_signature))
+        # DTK 1.8.3 leaves this fully fixed because it emits no relocation;
+        # Porpoise independently validates the branch form and masks its field.
+        struct.pack_into(">II", blob, 3 * 8, 0x48000063, 0xFFFFFFFF)
+        changed = catalog_tool._DtkRecord(
+            primary_symbol=record.primary_symbol,
+            dtk_hash=hashlib.sha1(blob).hexdigest(),
+            encoded_signature=base64.b64encode(blob).decode("ascii"),
+            symbols=record.symbols,
+            relocations=record.relocations[1:],
+        )
+        result = catalog_tool.convert_dtk_signature(
+            changed, "Example", function_address=0x80001000
+        )
+        self.assertEqual(result.external_branch_count, 1)
+        self.assertEqual(result.relocation_count, 2)
+
+    def test_absolute_branch_uses_function_layout_for_internal_control_flow(self):
+        record = catalog_tool._parse_dtk_yaml(dtk_yaml("Example"), "Example")
+        blob = bytearray(base64.b64decode(record.encoded_signature))
+        # Absolute branch to 0x2c. It is internal for a function starting at
+        # 0x20, but external for the identical bytes loaded at 0x100.
+        struct.pack_into(">II", blob, 3 * 8, 0x4800002E, 0xFFFFFFFF)
+        changed = catalog_tool._DtkRecord(
+            primary_symbol=record.primary_symbol,
+            dtk_hash=hashlib.sha1(blob).hexdigest(),
+            encoded_signature=base64.b64encode(blob).decode("ascii"),
+            symbols=record.symbols,
+            relocations=record.relocations[1:],
+        )
+        internal = catalog_tool.convert_dtk_signature(
+            changed, "Example", function_address=0x20
+        )
+        external = catalog_tool.convert_dtk_signature(
+            changed, "Example", function_address=0x100
+        )
+        self.assertEqual(
+            (internal.internal_branch_count, internal.external_branch_count),
+            (2, 0),
+        )
+        self.assertEqual(
+            (external.internal_branch_count, external.external_branch_count),
+            (1, 1),
+        )
+        self.assertNotEqual(internal.sha256, external.sha256)
+
+    def test_addressless_absolute_branch_is_rejected(self):
+        record = catalog_tool._parse_dtk_yaml(dtk_yaml("Example"), "Example")
+        blob = bytearray(base64.b64decode(record.encoded_signature))
+        struct.pack_into(">II", blob, 3 * 8, 0x48000062, 0xFFFFFFFF)
+        changed = catalog_tool._DtkRecord(
+            primary_symbol=record.primary_symbol,
+            dtk_hash=hashlib.sha1(blob).hexdigest(),
+            encoded_signature=base64.b64encode(blob).decode("ascii"),
+            symbols=record.symbols,
+            relocations=record.relocations[1:],
+        )
+        with self.assertRaisesRegex(
+            catalog_tool.CatalogError, "absolute branch.*no function layout address"
+        ):
+            catalog_tool.convert_dtk_signature(changed, "Example")
+
+    def test_external_absolute_addresses_share_linker_masked_identity(self):
+        record = catalog_tool._parse_dtk_yaml(dtk_yaml("Example"), "Example")
+        results = []
+        for target in (0x60, 0xA0):
+            blob = bytearray(base64.b64decode(record.encoded_signature))
+            struct.pack_into(
+                ">II", blob, 3 * 8, 0x48000002 | target, 0xFFFFFFFF
+            )
+            changed = catalog_tool._DtkRecord(
+                primary_symbol=record.primary_symbol,
+                dtk_hash=hashlib.sha1(blob).hexdigest(),
+                encoded_signature=base64.b64encode(blob).decode("ascii"),
+                symbols=record.symbols,
+                relocations=record.relocations[1:],
+            )
+            results.append(
+                catalog_tool.convert_dtk_signature(
+                    changed, "Example", function_address=0x80001000
+                )
+            )
+        self.assertEqual(results[0].sha256, results[1].sha256)
+        self.assertEqual(results[0].external_branch_count, 1)
+
     def test_converts_dtk_signature_to_exact_ppsig_v1_metadata(self):
         record = catalog_tool._parse_dtk_yaml(dtk_yaml("Example", crlf=True), "Example")
         result = catalog_tool.convert_dtk_signature(record, "Example")
@@ -163,6 +263,12 @@ class SignatureConversionTests(unittest.TestCase):
         with self.assertRaisesRegex(catalog_tool.CatalogError, "validated mask"):
             catalog_tool.convert_dtk_signature(changed, "Example")
 
+    def test_rejects_unsupported_relocation_kind(self):
+        text = dtk_yaml("Example").replace("kind: ha", "kind: absolute", 1)
+        record = catalog_tool._parse_dtk_yaml(text, "Example")
+        with self.assertRaisesRegex(catalog_tool.CatalogError, "unsupported kind"):
+            catalog_tool.convert_dtk_signature(record, "Example")
+
     def test_rejects_unknown_yaml_root_fields(self):
         text = dtk_yaml("Example").replace("  symbols:\n", "  surprise: 1\n  symbols:\n")
         with self.assertRaisesRegex(catalog_tool.CatalogError, "unknown fields"):
@@ -182,6 +288,7 @@ class InputTests(unittest.TestCase):
                                 "symbol": "LooksLikeGXButIsExplicitlyRuntime",
                                 "canonical_identity": "runtime/example",
                                 "category": "runtime",
+                                "address": 0x80001000,
                             }
                         ],
                     }
@@ -191,12 +298,22 @@ class InputTests(unittest.TestCase):
             loaded = catalog_tool.load_allowlist(path)
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0].category, "runtime")
+            self.assertEqual(loaded[0].address, 0x80001000)
 
             path.write_text(
                 '{"schema_version":1,"entries":[],"unknown":true}',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(catalog_tool.CatalogError, "unknown key"):
+                catalog_tool.load_allowlist(path)
+
+            path.write_text(
+                '{"schema_version":1,"entries":[{"symbol":"Bad",'
+                '"canonical_identity":"explicit/Bad","category":"runtime",'
+                '"address":3}]}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(catalog_tool.CatalogError, "aligned uint32"):
                 catalog_tool.load_allowlist(path)
 
     def test_allowlist_rejects_one_dtk_selector_for_distinct_identities(self):
@@ -252,14 +369,45 @@ class InputTests(unittest.TestCase):
             path.write_text(map_text, encoding="utf-8")
             loaded = catalog_tool.load_codewarrior_map(path)
         self.assertEqual(
-            [(item.symbol, item.category) for item in loaded],
+            [(item.symbol, item.category, item.address) for item in loaded],
             [
-                ("TotallyOrdinary", "nintendo_dolphin"),
-                ("DemoRoutine", "demo"),
-                ("DebugRoutine", "nintendo_dolphin"),
-                ("StubRoutine", "stub"),
+                ("TotallyOrdinary", "nintendo_dolphin", 0x80001020),
+                ("DemoRoutine", "demo", 0x80001040),
+                ("DebugRoutine", "nintendo_dolphin", 0x80001060),
+                ("StubRoutine", "stub", 0x80001080),
             ],
         )
+
+    def test_builtin_contract_attachment_requires_exact_owned_sdk_leaf(self):
+        map_text = """.text section layout
+  00000000 000020 80001000  4 OSReport gx.a os.c
+  00000020 000020 80001020  4 GXInit runtime.PPCEABI.H.a runtime.c
+  00000040 000020 80001040  4 OSReportExtra gx.a os.c
+  00000060 000020 80001060  4 VIConfigure demo.a demo.c
+  00000080 000020 80001080  4 ARInit title.o
+.data section layout
+"""
+        with tempfile.TemporaryDirectory(prefix="porpoise-catalog-test-") as temporary:
+            path = Path(temporary) / "sample.map"
+            path.write_text(map_text, encoding="utf-8")
+            loaded = catalog_tool.load_codewarrior_map(path)
+        self.assertEqual(
+            [(item.symbol, item.category, item.contract) for item in loaded],
+            [
+                ("OSReport", "nintendo_dolphin", "OSReport"),
+                ("GXInit", "runtime", None),
+                ("OSReportExtra", "nintendo_dolphin", None),
+                ("VIConfigure", "demo", None),
+            ],
+        )
+
+    def test_builtin_contract_names_match_the_c_registry(self):
+        source = (ROOT / "src" / "sdk_contract.c").read_text(encoding="utf-8")
+        names = re.findall(
+            r'SDK_CONTRACT\(\s*"[^"]+"\s*,\s*"([^"]+)"', source
+        )
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(frozenset(names), catalog_tool._BUILTIN_SDK_CONTRACTS)
 
     def test_custom_map_archive_is_an_exact_explicit_assignment(self):
         map_text = """.text section layout
@@ -276,10 +424,11 @@ class InputTests(unittest.TestCase):
             )
         self.assertEqual([item.symbol for item in loaded], ["Ordinary"])
 
-    def test_map_name_collision_keeps_only_first_owner_with_diagnostics(self):
+    def test_map_name_collision_excludes_every_equal_size_owner(self):
         map_text = """.text section layout
   00000000 000020 80001000  4 Local gx.a first.c
-  00000020 000040 80001020  4 Local gx.a second.c
+  00000020 000020 80001020  4 Local gx.a second.c
+  00000040 000020 80001040  4 Unique gx.a unique.c
 .data section layout
 """
         diagnostics = []
@@ -289,11 +438,28 @@ class InputTests(unittest.TestCase):
             loaded = catalog_tool.load_codewarrior_map(
                 path, skipped_ambiguous=diagnostics
             )
-        self.assertEqual([item.canonical_identity for item in loaded], ["gx.a/first.c/Local"])
-        self.assertEqual(len(diagnostics), 1)
-        self.assertEqual(diagnostics[0]["selected_identity"], "gx.a/first.c/Local")
-        self.assertEqual(diagnostics[0]["skipped_identity"], "gx.a/second.c/Local")
-        self.assertEqual(diagnostics[0]["reason"], "dtk_name_selector_is_ambiguous")
+        self.assertEqual(
+            [item.canonical_identity for item in loaded],
+            ["gx.a/unique.c/Unique"],
+        )
+        self.assertEqual(len(diagnostics), 2)
+        self.assertEqual(
+            [item["excluded_identity"] for item in diagnostics],
+            ["gx.a/first.c/Local", "gx.a/second.c/Local"],
+        )
+        self.assertEqual(
+            [item["excluded_address"] for item in diagnostics],
+            [0x80001000, 0x80001020],
+        )
+        self.assertTrue(
+            all(item["group_size"] == 2 for item in diagnostics)
+        )
+        self.assertTrue(
+            all(
+                item["reason"] == "dtk_name_selector_is_ambiguous"
+                for item in diagnostics
+            )
+        )
 
 
 class CatalogBuildTests(unittest.TestCase):
@@ -470,7 +636,7 @@ class CliTests(unittest.TestCase):
             map_path.write_text(
                 """.text section layout
   00000000 000020 80001000  4 Example gx.a first.c
-  00000020 000040 80001020  4 Example gx.a second.c
+  00000020 000020 80001020  4 Example gx.a second.c
 .data section layout
 """,
                 encoding="utf-8",
@@ -495,11 +661,21 @@ class CliTests(unittest.TestCase):
                     runner=FakeRunner(),
                 )
             self.assertEqual(result, 0, stderr.getvalue())
-            self.assertIn("skipping unreachable", stderr.getvalue())
+            self.assertEqual(stderr.getvalue().count("excluding"), 2)
             document = json.loads(diagnostics.read_text(encoding="utf-8"))
-            self.assertEqual(document["skipped_ambiguous_count"], 1)
+            self.assertEqual(document["skipped_ambiguous_count"], 2)
             self.assertEqual(document["skipped_ambiguous"][0]["symbol"], "Example")
-            self.assertEqual(len(json.loads(output.read_text(encoding="utf-8"))["entries"]), 1)
+            self.assertEqual(
+                [
+                    item["excluded_identity"]
+                    for item in document["skipped_ambiguous"]
+                ],
+                ["gx.a/first.c/Example", "gx.a/second.c/Example"],
+            )
+            self.assertEqual(
+                len(json.loads(output.read_text(encoding="utf-8"))["entries"]),
+                0,
+            )
 
 
 if __name__ == "__main__":

@@ -91,9 +91,87 @@ static bool create_catalog(
         "{\"schema_version\":1,\"signature_algorithm_version\":1,"
         "\"entries\":[",
         file);
-    write_signature(file, "GXInit", "GXInit", gx, true);
-    write_signature(file, "UnknownSdk", NULL, unknown, false);
+    write_signature(file, "gx.a/GXInit.c/GXInit", "GXInit", gx, true);
+    write_signature(
+        file, "gx.a/UnknownSdk.c/UnknownSdk", NULL, unknown, false);
     fputs("]}\n", file);
+    return fclose(file) == 0;
+}
+
+static bool create_direct_contract_catalog(
+    const char *path,
+    const char *identity,
+    const char *contract,
+    const PorpoiseFunctionSignature *signature) {
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    fputs(
+        "{\"schema_version\":1,\"signature_algorithm_version\":1,"
+        "\"entries\":[",
+        file);
+    write_signature(file, identity, contract, signature, true);
+    fputs("]}\n", file);
+    return fclose(file) == 0;
+}
+
+static bool create_ambiguous_catalog(
+    const char *path,
+    const PorpoiseFunctionSignature *signature) {
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    fputs(
+        "{\"schema_version\":1,\"signature_algorithm_version\":1,"
+        "\"entries\":[",
+        file);
+    write_signature(
+        file, "gx.a/GXInit.c/GXInit", "GXInit", signature, true);
+    write_signature(
+        file, "gx.a/GXInitAlt.c/GXInitAlt", NULL, signature, false);
+    fputs("]}\n", file);
+    return fclose(file) == 0;
+}
+
+static bool create_direct_abi(const char *path) {
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    fputs(
+        "{\"schema_version\":1,\"functions\":[{"
+        "\"kind\":\"import\","
+        "\"symbol\":\"gx_direct_contract\","
+        "\"wrapper\":\"host_gx_direct\","
+        "\"header\":\"porpoise/gx_direct.h\","
+        "\"return\":{\"type\":\"void\"},"
+        "\"arguments\":[]}]}\n",
+        file);
+    return fclose(file) == 0;
+}
+
+static bool create_path_bearing_map(const char *path) {
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    fputs(
+        "Link map of EntryPoint\n"
+        "  1] GXInit (func,global) found in C:\\SDK\\Libraries\\GX.A source\\GXInit.c\n"
+        "  2] UnknownSdk (func,global) found in C:\\SDK\\Libraries\\DEMO.A source\\UnknownSdk.c\n"
+        "\n"
+        ".text section layout\n"
+        "  Starting        Virtual\n"
+        "  address  Size   address\n"
+        "  -----------------------\n"
+        "  00000000 000020 80010000  4 GXInit C:\\SDK\\Libraries\\GX.A source\\GXInit.c\n"
+        "  00000100 000020 80010100  4 UnknownSdk C:\\SDK\\Libraries\\DEMO.A source\\UnknownSdk.c\n"
+        "  00000200 000008 80010200  4 title_main title.o\n",
+        file);
+    return fclose(file) == 0;
+}
+
+static bool create_section_collision_symbols(const char *path) {
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    fputs(
+        "GXInit = .init:0x80010000; // type:function size:0x20 scope:global\n"
+        "TextSectionOwner = .text:0x80010000; // type:function size:0x20 scope:global\n",
+        file);
     return fclose(file) == 0;
 }
 
@@ -148,6 +226,23 @@ static int open_session(
     return porpoise_session_open(&options, session, diagnostics);
 }
 
+static int open_session_with_abi(
+    const char *input,
+    const char *catalog,
+    const char *abi,
+    PorpoiseSession **session,
+    PorpoiseDiagnostics *diagnostics) {
+    PorpoiseSessionOpenOptions options;
+    const char *catalogs[1];
+    porpoise_session_open_options_init(&options);
+    options.input_path = input;
+    options.abi_path = abi;
+    catalogs[0] = catalog;
+    options.sdk_catalog_paths = catalogs;
+    options.sdk_catalog_path_count = catalog == NULL ? 0U : 1U;
+    return porpoise_session_open(&options, session, diagnostics);
+}
+
 static void collect_signatures(
     const char *input,
     PorpoiseFunctionSignature *gx,
@@ -186,6 +281,257 @@ static PorpoiseTranslationPlan *build_plan(
     CHECK(porpoise_plan_build(
         session, &options, &plan, diagnostics) == PORPOISE_EXIT_OK);
     return plan;
+}
+
+static PorpoiseTranslationPlan *build_plan_with_hints(
+    PorpoiseSession *session,
+    PorpoiseSdkPolicy policy,
+    const PorpoisePlanMatchHint *hints,
+    size_t hint_count,
+    size_t *hint_used_count,
+    PorpoiseDiagnostics *diagnostics) {
+    PorpoisePlanOptions options;
+    PorpoiseTranslationPlan *plan = NULL;
+    porpoise_plan_options_init(&options);
+    options.entry_symbol = "title_main";
+    options.target_id = "sample";
+    options.module = "main";
+    options.sdk_policy = policy;
+    options.match_hints = hints;
+    options.match_hint_count = hint_count;
+    options.match_hint_used_count_out = hint_used_count;
+    CHECK(porpoise_plan_build(
+        session, &options, &plan, diagnostics) == PORPOISE_EXIT_OK);
+    return plan;
+}
+
+static void check_exact_fallback(
+    PorpoiseSession *session,
+    const PorpoisePlanMatchHint *hint,
+    const char *expected_digest,
+    PorpoiseDiagnostics *diagnostics) {
+    size_t hint_used_count = SIZE_MAX;
+    PorpoiseTranslationPlan *plan = build_plan_with_hints(
+        session, PORPOISE_SDK_POLICY_KEEP, hint, 1U,
+        &hint_used_count, diagnostics);
+    const PorpoiseFunctionPlanView *view =
+        porpoise_plan_find_function(plan, "GXInit");
+    CHECK(view != NULL && view->sdk_entry != NULL);
+    CHECK(view != NULL &&
+          (view->evidence_flags & PORPOISE_PLAN_EVIDENCE_SIGNATURE) != 0U);
+    CHECK(hint_used_count == 0U);
+    CHECK(strcmp(porpoise_plan_digest(plan), expected_digest) == 0);
+    CHECK(porpoise_plan_validate(plan, diagnostics) == PORPOISE_EXIT_OK);
+    porpoise_plan_free(plan);
+}
+
+static void test_match_hints(
+    const char *source_root,
+    const char *input,
+    const char *catalog,
+    const char *structural_catalog,
+    const char *ambiguous_catalog,
+    const PorpoiseFunctionSignature *gx_signature) {
+    PorpoiseSession *session = NULL;
+    PorpoiseTranslationPlan *baseline = NULL;
+    PorpoiseTranslationPlan *hinted = NULL;
+    PorpoisePlanMatchHint hint;
+    PorpoisePlanMatchHint invalid;
+    PorpoiseDiagnostics diagnostics;
+    const PorpoiseFunctionPlanView *view;
+    const PorpoiseFunctionPlanView *baseline_view;
+    char baseline_digest[PORPOISE_SHA256_HEX_SIZE];
+    char runtime[PORPOISE_PATH_CAPACITY];
+    char report_path[PORPOISE_PATH_CAPACITY];
+    const char *output = ".porpoise-sdk-hint-parity-output";
+    PorpoiseProjectOptions project_options;
+    PorpoiseReport report;
+    PorpoiseDiagnostics baseline_generation_diagnostics;
+    PorpoiseDiagnostics hinted_generation_diagnostics;
+    char *baseline_report = NULL;
+    char *hinted_report = NULL;
+    size_t hint_used_count = 0U;
+    PorpoiseSdkPolicy policy;
+
+    porpoise_diagnostics_init(&diagnostics);
+    CHECK(open_session(input, catalog, NULL, &session, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    memset(&hint, 0, sizeof(hint));
+    hint.target_id = "sample";
+    hint.module = "main";
+    hint.address = UINT32_C(0x80010000);
+    hint.size = UINT32_C(0x20);
+    hint.normalized_fingerprint = gx_signature->digest_hex;
+    hint.canonical_identity = "gx.a/GXInit.c/GXInit";
+    hint.contract_name = "GXInit";
+
+    baseline = build_plan(
+        session, PORPOISE_SDK_POLICY_KEEP, NULL, &diagnostics);
+    CHECK(porpoise_copy_string(
+        baseline_digest, sizeof(baseline_digest),
+        porpoise_plan_digest(baseline)));
+    baseline_view = porpoise_plan_find_function(baseline, "GXInit");
+    hinted = build_plan_with_hints(
+        session, PORPOISE_SDK_POLICY_KEEP, &hint, 1U,
+        &hint_used_count, &diagnostics);
+    view = porpoise_plan_find_function(hinted, "GXInit");
+    CHECK(view != NULL && view->sdk_entry != NULL);
+    CHECK(hint_used_count == 1U);
+    CHECK(view != NULL && baseline_view != NULL &&
+          view->evidence_flags == baseline_view->evidence_flags);
+    CHECK(strcmp(porpoise_plan_digest(hinted), baseline_digest) == 0);
+    CHECK(porpoise_plan_validate(hinted, &diagnostics) == PORPOISE_EXIT_OK);
+
+    CHECK(path_join(runtime, sizeof(runtime), source_root, "runtime"));
+    CHECK(path_join(
+        report_path, sizeof(report_path), output, "porpoise-report.json"));
+    CHECK(porpoise_remove_tree(output, &diagnostics));
+    porpoise_project_options_init(&project_options);
+    project_options.output_path = output;
+    project_options.runtime_directory = runtime;
+    project_options.entry_symbol = "title_main";
+    project_options.force = true;
+    porpoise_report_init(&report);
+    porpoise_diagnostics_init(&baseline_generation_diagnostics);
+    CHECK(porpoise_project_generate_plan(
+              baseline, &project_options, &report,
+              &baseline_generation_diagnostics) ==
+          PORPOISE_EXIT_OK);
+    baseline_report = read_file(report_path);
+    porpoise_report_free(&report);
+    porpoise_report_init(&report);
+    porpoise_diagnostics_init(&hinted_generation_diagnostics);
+    CHECK(porpoise_project_generate_plan(
+              hinted, &project_options, &report,
+              &hinted_generation_diagnostics) ==
+          PORPOISE_EXIT_OK);
+    hinted_report = read_file(report_path);
+    CHECK(baseline_report != NULL && hinted_report != NULL &&
+          strcmp(baseline_report, hinted_report) == 0);
+    free(hinted_report);
+    free(baseline_report);
+    porpoise_report_free(&report);
+    porpoise_diagnostics_free(&hinted_generation_diagnostics);
+    porpoise_diagnostics_free(&baseline_generation_diagnostics);
+    CHECK(porpoise_remove_tree(output, &diagnostics));
+    porpoise_plan_free(hinted);
+    porpoise_plan_free(baseline);
+
+    for (policy = PORPOISE_SDK_POLICY_IMPORTED;
+         policy <= PORPOISE_SDK_POLICY_OMIT;
+         policy = (PorpoiseSdkPolicy)((int)policy + 1)) {
+        baseline = build_plan(session, policy, NULL, &diagnostics);
+        hinted = build_plan_with_hints(
+            session, policy, &hint, 1U,
+            &hint_used_count, &diagnostics);
+        CHECK(hint_used_count == 1U);
+        CHECK(strcmp(
+                  porpoise_plan_digest(baseline),
+                  porpoise_plan_digest(hinted)) == 0);
+        CHECK(porpoise_plan_validate(baseline, &diagnostics) ==
+              PORPOISE_EXIT_OK);
+        CHECK(porpoise_plan_validate(hinted, &diagnostics) ==
+              PORPOISE_EXIT_OK);
+        porpoise_plan_free(hinted);
+        porpoise_plan_free(baseline);
+    }
+
+    {
+        PorpoisePlanMatchHint mixed_hints[2];
+        mixed_hints[0] = hint;
+        mixed_hints[0].canonical_identity = "gx.a/Missing.c/Missing";
+        mixed_hints[1] = hint;
+        hinted = build_plan_with_hints(
+            session, PORPOISE_SDK_POLICY_KEEP,
+            mixed_hints, 2U, &hint_used_count, &diagnostics);
+        CHECK(hint_used_count == 1U);
+        CHECK(strcmp(porpoise_plan_digest(hinted), baseline_digest) == 0);
+        porpoise_plan_free(hinted);
+
+        mixed_hints[0] = hint;
+        mixed_hints[1] = hint;
+        hinted = build_plan_with_hints(
+            session, PORPOISE_SDK_POLICY_KEEP,
+            mixed_hints, 2U, &hint_used_count, &diagnostics);
+        CHECK(hint_used_count == 1U);
+        CHECK(strcmp(porpoise_plan_digest(hinted), baseline_digest) == 0);
+        porpoise_plan_free(hinted);
+    }
+
+    hint_used_count = SIZE_MAX;
+    baseline = build_plan_with_hints(
+        session, PORPOISE_SDK_POLICY_KEEP, NULL, 0U,
+        &hint_used_count, &diagnostics);
+    view = porpoise_plan_find_function(baseline, "GXInit");
+    CHECK(hint_used_count == 0U);
+    CHECK(view != NULL && view->sdk_entry != NULL);
+    CHECK(strcmp(porpoise_plan_digest(baseline), baseline_digest) == 0);
+    porpoise_plan_free(baseline);
+
+    invalid = hint;
+    invalid.target_id = "other-target";
+    check_exact_fallback(session, &invalid, baseline_digest, &diagnostics);
+    invalid = hint;
+    invalid.module = "other";
+    check_exact_fallback(session, &invalid, baseline_digest, &diagnostics);
+    invalid = hint;
+    invalid.address += 4U;
+    check_exact_fallback(session, &invalid, baseline_digest, &diagnostics);
+    invalid = hint;
+    invalid.size -= 4U;
+    check_exact_fallback(session, &invalid, baseline_digest, &diagnostics);
+    invalid = hint;
+    invalid.normalized_fingerprint =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    check_exact_fallback(session, &invalid, baseline_digest, &diagnostics);
+    invalid = hint;
+    invalid.canonical_identity = "gx.a/Missing.c/Missing";
+    check_exact_fallback(session, &invalid, baseline_digest, &diagnostics);
+    invalid = hint;
+    invalid.contract_name = "NotGXInit";
+    check_exact_fallback(session, &invalid, baseline_digest, &diagnostics);
+    invalid = hint;
+    invalid.contract_name = "";
+    check_exact_fallback(session, &invalid, baseline_digest, &diagnostics);
+    porpoise_session_close(session);
+
+    session = NULL;
+    CHECK(open_session(
+              input, structural_catalog, NULL, &session, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    hinted = build_plan_with_hints(
+        session, PORPOISE_SDK_POLICY_KEEP, &hint, 1U,
+        &hint_used_count, &diagnostics);
+    view = porpoise_plan_find_function(hinted, "GXInit");
+    CHECK(view != NULL && view->sdk_entry == NULL);
+    CHECK(view != NULL &&
+          (view->evidence_flags & PORPOISE_PLAN_EVIDENCE_SIGNATURE) == 0U);
+    CHECK(hint_used_count == 0U);
+    porpoise_plan_free(hinted);
+    porpoise_session_close(session);
+
+    session = NULL;
+    CHECK(open_session(
+              input, ambiguous_catalog, NULL, &session, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    baseline = build_plan(
+        session, PORPOISE_SDK_POLICY_KEEP, NULL, &diagnostics);
+    hinted = build_plan_with_hints(
+        session, PORPOISE_SDK_POLICY_KEEP, &hint, 1U,
+        &hint_used_count, &diagnostics);
+    view = porpoise_plan_find_function(hinted, "GXInit");
+    CHECK(view != NULL && view->sdk_entry == NULL);
+    CHECK(view != NULL &&
+          (view->evidence_flags &
+           PORPOISE_PLAN_EVIDENCE_AMBIGUOUS_SIGNATURE) != 0U);
+    CHECK(hint_used_count == 0U);
+    CHECK(strcmp(
+              porpoise_plan_digest(hinted),
+              porpoise_plan_digest(baseline)) == 0);
+    porpoise_plan_free(hinted);
+    porpoise_plan_free(baseline);
+    porpoise_session_close(session);
+    porpoise_diagnostics_free(&diagnostics);
 }
 
 static void test_policies(
@@ -345,13 +691,193 @@ static void test_conflicts_and_overrides(
     porpoise_diagnostics_free(&diagnostics);
 }
 
+static void test_direct_contract_resolution(
+    const char *input,
+    const char *catalog,
+    const char *abi,
+    const PorpoiseFunctionSignature *gx_signature) {
+    PorpoiseSession *session = NULL;
+    PorpoiseTranslationPlan *plan;
+    PorpoiseFunctionOverride override;
+    PorpoiseDiagnostics diagnostics;
+    const PorpoiseFunctionPlanView *view;
+
+    porpoise_diagnostics_init(&diagnostics);
+    CHECK(open_session_with_abi(
+              input, catalog, abi, &session, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+
+    plan = build_plan(
+        session, PORPOISE_SDK_POLICY_IMPORTED, NULL, &diagnostics);
+    view = porpoise_plan_find_function(plan, "GXInit");
+    CHECK(view != NULL && view->action == PORPOISE_PLAN_ACTION_IMPORT);
+    CHECK(view != NULL &&
+          view->origin == PORPOISE_PLAN_ORIGIN_SDK_POLICY);
+    CHECK(view != NULL && view->binding != NULL);
+    CHECK(view != NULL && view->binding != NULL &&
+          strcmp(view->binding->symbol, "gx_direct_contract") == 0);
+    CHECK(view != NULL && view->binding != NULL &&
+          strcmp(view->binding->wrapper, "host_gx_direct") == 0);
+    CHECK(view != NULL && view->binding != NULL &&
+          view->binding->adapter == NULL);
+    CHECK(view != NULL && view->contract_name != NULL &&
+          strcmp(view->contract_name, "gx_direct_contract") == 0);
+    CHECK(porpoise_plan_validate(plan, &diagnostics) == PORPOISE_EXIT_OK);
+    porpoise_plan_free(plan);
+
+    memset(&override, 0, sizeof(override));
+    override.module = "main";
+    override.address = UINT32_C(0x80010000);
+    override.size = UINT32_C(0x20);
+    override.normalized_fingerprint = gx_signature->digest_hex;
+    override.action = PORPOISE_OVERRIDE_IMPORT;
+    override.contract_name = "gx_direct_contract";
+    plan = build_plan(
+        session, PORPOISE_SDK_POLICY_KEEP, &override, &diagnostics);
+    view = porpoise_plan_find_function(plan, "GXInit");
+    CHECK(view != NULL && view->overridden);
+    CHECK(view != NULL && view->action == PORPOISE_PLAN_ACTION_IMPORT);
+    CHECK(view != NULL &&
+          view->origin == PORPOISE_PLAN_ORIGIN_MANUAL_OVERRIDE);
+    CHECK(view != NULL && view->binding != NULL &&
+          strcmp(view->binding->symbol, "gx_direct_contract") == 0);
+    CHECK(view != NULL && view->binding != NULL &&
+          view->binding->adapter == NULL);
+    CHECK(view != NULL && view->contract_name != NULL &&
+          strcmp(view->contract_name, "gx_direct_contract") == 0);
+    CHECK(porpoise_plan_validate(plan, &diagnostics) == PORPOISE_EXIT_OK);
+    porpoise_plan_free(plan);
+
+    override.contract_name = "missing_direct_contract";
+    plan = build_plan(
+        session, PORPOISE_SDK_POLICY_KEEP, &override, &diagnostics);
+    view = porpoise_plan_find_function(plan, "GXInit");
+    CHECK(view != NULL && view->blocked);
+    CHECK(view != NULL && view->action == PORPOISE_PLAN_ACTION_LIFT);
+    CHECK(porpoise_plan_validate(plan, &diagnostics) ==
+          PORPOISE_EXIT_TRANSLATION);
+    porpoise_plan_free(plan);
+    porpoise_session_close(session);
+    porpoise_diagnostics_free(&diagnostics);
+}
+
+static void test_path_bearing_map_ownership(
+    const char *input,
+    const char *catalog,
+    const char *map) {
+    PorpoiseSession *session = NULL;
+    PorpoiseTranslationPlan *plan;
+    PorpoiseDiagnostics diagnostics;
+    const PorpoiseFunctionPlanView *gx;
+    const PorpoiseFunctionPlanView *unknown;
+
+    porpoise_diagnostics_init(&diagnostics);
+    CHECK(open_session(input, catalog, map, &session, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    plan = build_plan(
+        session, PORPOISE_SDK_POLICY_IMPORTED, NULL, &diagnostics);
+    gx = porpoise_plan_find_function(plan, "GXInit");
+    CHECK(gx != NULL && gx->map_symbol != NULL);
+    CHECK(gx != NULL && gx->map_symbol != NULL &&
+          strcmp(
+              gx->map_symbol->library,
+              "C:\\SDK\\Libraries\\GX.A") == 0);
+    CHECK(gx != NULL && gx->map_symbol != NULL &&
+          strcmp(gx->map_symbol->object, "source\\GXInit.c") == 0);
+    CHECK(gx != NULL && gx->canonical_sdk_identity != NULL &&
+          strcmp(
+              gx->canonical_sdk_identity,
+              "gx.a/source/GXInit.c/GXInit") == 0);
+    CHECK(gx != NULL &&
+          (gx->evidence_flags & PORPOISE_PLAN_EVIDENCE_CONFLICT) == 0U);
+    CHECK(gx != NULL && gx->action == PORPOISE_PLAN_ACTION_IMPORT);
+
+    unknown = porpoise_plan_find_function(plan, "UnknownSdk");
+    CHECK(unknown != NULL && unknown->sdk_entry == NULL);
+    CHECK(unknown != NULL && unknown->has_sdk_category);
+    CHECK(unknown != NULL &&
+          unknown->sdk_category == PORPOISE_SDK_CATEGORY_DEMO);
+    CHECK(unknown != NULL && unknown->canonical_sdk_identity != NULL &&
+          strcmp(
+              unknown->canonical_sdk_identity,
+              "DEMO.A/source/UnknownSdk.c/UnknownSdk") == 0);
+    CHECK(unknown != NULL && unknown->action == PORPOISE_PLAN_ACTION_LIFT);
+    CHECK(porpoise_plan_validate(plan, &diagnostics) == PORPOISE_EXIT_OK);
+    porpoise_plan_free(plan);
+    porpoise_session_close(session);
+    porpoise_diagnostics_free(&diagnostics);
+}
+
+static void test_dtk_section_aware_map_selection(
+    const char *input,
+    const char *symbols_path) {
+    PorpoiseSessionOpenOptions session_options;
+    PorpoiseSessionSymbolSource symbol_source;
+    PorpoisePlanOptions plan_options;
+    PorpoiseSession *session = NULL;
+    PorpoiseTranslationPlan *plan = NULL;
+    PorpoiseDiagnostics diagnostics;
+    const PorpoiseFunctionPlanView *view;
+
+    porpoise_diagnostics_init(&diagnostics);
+    porpoise_session_open_options_init(&session_options);
+    memset(&symbol_source, 0, sizeof(symbol_source));
+    session_options.input_path = input;
+    symbol_source.kind = PORPOISE_SYMBOL_SOURCE_DTK_SYMBOLS;
+    symbol_source.path = symbols_path;
+    symbol_source.module = "rel:sample";
+    session_options.symbol_sources = &symbol_source;
+    session_options.symbol_source_count = 1U;
+    CHECK(porpoise_session_open(
+              &session_options, &session, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+
+    porpoise_plan_options_init(&plan_options);
+    plan_options.entry_symbol = "title_main";
+    plan_options.target_id = "sample-rel";
+    plan_options.module = "rel:sample";
+    CHECK(porpoise_plan_build(
+              session, &plan_options, &plan, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    CHECK(porpoise_plan_validate(plan, &diagnostics) == PORPOISE_EXIT_OK);
+    view = porpoise_plan_find_function(plan, "GXInit");
+    CHECK(view != NULL && view->map_symbol != NULL);
+    CHECK(view != NULL && view->map_symbol != NULL &&
+          strcmp(view->map_symbol->name, "TextSectionOwner") == 0);
+    CHECK(view != NULL && view->map_symbol != NULL &&
+          strcmp(view->map_symbol->section, ".text") == 0);
+    CHECK(view != NULL && view->map_symbol != NULL &&
+          strcmp(view->map_symbol->module, "rel:sample") == 0);
+    CHECK(view != NULL && view->map_symbol != NULL &&
+          view->map_symbol->provenance.kind ==
+              PORPOISE_SYMBOL_SOURCE_DTK_SYMBOLS);
+    CHECK(view != NULL &&
+          (view->evidence_flags & PORPOISE_PLAN_EVIDENCE_MAP) != 0U);
+
+    porpoise_plan_free(plan);
+    porpoise_session_close(session);
+    porpoise_diagnostics_free(&diagnostics);
+}
+
 int main(int argc, char **argv) {
     const char *catalog = ".porpoise-sdk-policy-catalog.json";
+    const char *direct_catalog =
+        ".porpoise-sdk-policy-direct-catalog.json";
+    const char *direct_abi = ".porpoise-sdk-policy-direct-abi.json";
+    const char *path_catalog = ".porpoise-sdk-policy-path-catalog.json";
+    const char *path_map = ".porpoise-sdk-policy-path.map";
+    const char *section_symbols =
+        ".porpoise-sdk-policy-section-symbols.txt";
+    const char *structural_catalog =
+        ".porpoise-sdk-policy-structural-catalog.json";
+    const char *ambiguous_catalog =
+        ".porpoise-sdk-policy-ambiguous-catalog.json";
     char input[PORPOISE_PATH_CAPACITY];
     char matching_map[PORPOISE_PATH_CAPACITY];
     char conflicting_map[PORPOISE_PATH_CAPACITY];
     PorpoiseFunctionSignature gx;
     PorpoiseFunctionSignature unknown;
+    PorpoiseFunctionSignature structurally_changed_gx;
     if (argc != 2) return 2;
     CHECK(path_join(
         input, sizeof(input), argv[1], "tests/fixtures/sdk_policy/input.s"));
@@ -363,9 +889,37 @@ int main(int argc, char **argv) {
         "tests/fixtures/sdk_policy/conflicting.map"));
     collect_signatures(input, &gx, &unknown);
     CHECK(create_catalog(catalog, &gx, &unknown));
+    CHECK(create_direct_contract_catalog(
+        direct_catalog, "gx.a/GXInit.c/GXInit",
+        "gx_direct_contract", &gx));
+    CHECK(create_direct_abi(direct_abi));
+    CHECK(create_direct_contract_catalog(
+        path_catalog, "gx.a/source/GXInit.c/GXInit", "GXInit", &gx));
+    CHECK(create_path_bearing_map(path_map));
+    CHECK(create_section_collision_symbols(section_symbols));
+    structurally_changed_gx = gx;
+    structurally_changed_gx.meaningful_fixed_instruction_count--;
+    CHECK(create_direct_contract_catalog(
+        structural_catalog, "gx.a/GXInit.c/GXInit", "GXInit",
+        &structurally_changed_gx));
+    CHECK(create_ambiguous_catalog(ambiguous_catalog, &gx));
     test_policies(argv[1], input, catalog, matching_map);
     test_conflicts_and_overrides(input, catalog, conflicting_map, &gx);
+    test_direct_contract_resolution(
+        input, direct_catalog, direct_abi, &gx);
+    test_path_bearing_map_ownership(input, path_catalog, path_map);
+    test_dtk_section_aware_map_selection(input, section_symbols);
+    test_match_hints(
+        argv[1], input, catalog, structural_catalog,
+        ambiguous_catalog, &gx);
     CHECK(remove(catalog) == 0);
+    CHECK(remove(direct_catalog) == 0);
+    CHECK(remove(direct_abi) == 0);
+    CHECK(remove(path_catalog) == 0);
+    CHECK(remove(path_map) == 0);
+    CHECK(remove(section_symbols) == 0);
+    CHECK(remove(structural_catalog) == 0);
+    CHECK(remove(ambiguous_catalog) == 0);
     if (failures != 0U) {
         fprintf(stderr, "%u SDK policy test(s) failed\n", failures);
         return 1;

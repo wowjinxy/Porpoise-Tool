@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static unsigned int failures = 0U;
 
@@ -26,6 +27,9 @@ static unsigned int failures = 0U;
 typedef enum FakeDtkMode {
     FAKE_DTK_VALID = 0,
     FAKE_DTK_OLD_VERSION,
+    FAKE_DTK_RENAMED_VERSION,
+    FAKE_DTK_UNRELATED_VERSION,
+    FAKE_DTK_UNSAFE_VERSION,
     FAKE_DTK_BAD_INFO,
     FAKE_DTK_PROCESS_FAILURE,
     FAKE_DTK_ESCAPE_LINK_ORDER,
@@ -49,6 +53,7 @@ typedef struct FakeDtk {
     bool stages_were_fresh;
     bool cancel_after_disasm;
     OperationState *operation;
+    char executable_path[PORPOISE_PATH_CAPACITY];
 } FakeDtk;
 
 static void test_progress(
@@ -141,7 +146,7 @@ static bool fake_write_valid_tree(
         !write_text(
             link_order_path,
             mode == FAKE_DTK_ESCAPE_LINK_ORDER ?
-                "../escape.s\n" : "asm/main.s\nasm/helper.s\n")) {
+                "../escape.s\n" : "main.o\nhelper.o\n")) {
         return false;
     }
     if (mode == FAKE_DTK_METADATA_INJECTION) {
@@ -165,15 +170,36 @@ static int fake_dtk_runner(
     FakeDtk *fake = (FakeDtk *)user_data;
     (void)working_directory;
     (void)operation;
+    if (fake->executable_path[0] == '\0') {
+        if (!porpoise_copy_string(
+                fake->executable_path, sizeof(fake->executable_path),
+                argv[0])) {
+            return PORPOISE_EXIT_INTERNAL;
+        }
+    } else if (strcmp(fake->executable_path, argv[0]) != 0) {
+        return PORPOISE_EXIT_INTERNAL;
+    }
     porpoise_dtk_process_result_init(result);
     result->standard_error = porpoise_strdup("");
     if (result->standard_error == NULL) return PORPOISE_EXIT_INTERNAL;
 
     if (argv[1] != NULL && strcmp(argv[1], "--version") == 0) {
         fake->version_calls++;
-        result->standard_output = porpoise_strdup(
-            fake->mode == FAKE_DTK_OLD_VERSION ?
-                "dtk 1.7.9 old\n" : "dtk 1.8.3 fixture\n");
+        if (fake->mode == FAKE_DTK_OLD_VERSION) {
+            result->standard_output = porpoise_strdup("dtk 1.7.9 old\n");
+        } else if (fake->mode == FAKE_DTK_RENAMED_VERSION) {
+            result->standard_output = porpoise_strdup(
+                "dtk-porpoise.exe 1.8.3 fixture\n");
+        } else if (fake->mode == FAKE_DTK_UNRELATED_VERSION) {
+            result->standard_output = porpoise_strdup(
+                "dtkhelper.exe 1.8.3 fixture\n");
+        } else if (fake->mode == FAKE_DTK_UNSAFE_VERSION) {
+            result->standard_output = porpoise_strdup(
+                "dtk-../evil.exe 1.8.3 fixture\n");
+        } else {
+            result->standard_output = porpoise_strdup(
+                "dtk 1.8.3 fixture\n");
+        }
     } else if (argv[1] != NULL && strcmp(argv[1], "--no-color") == 0 &&
                argv[3] != NULL && strcmp(argv[3], "info") == 0) {
         fake->info_calls++;
@@ -487,6 +513,267 @@ static void test_validation_failures(
     CHECK(fake.disasm_calls == 0U);
 }
 
+static void test_version_product_names(
+    const char *source_root,
+    const char *temporary) {
+    static const FakeDtkMode rejected_modes[] = {
+        FAKE_DTK_UNRELATED_VERSION,
+        FAKE_DTK_UNSAFE_VERSION
+    };
+    char input[PORPOISE_PATH_CAPACITY];
+    char tool[PORPOISE_PATH_CAPACITY];
+    char cache[PORPOISE_PATH_CAPACITY];
+    PorpoiseDtkImportOptions options;
+    PorpoiseDtkImportResult result;
+    PorpoiseDiagnostics diagnostics;
+    FakeDtk fake;
+    size_t index;
+
+    porpoise_diagnostics_init(&diagnostics);
+    CHECK(fixture_path(input, sizeof(input), source_root, "input.elf"));
+    CHECK(fixture_path(tool, sizeof(tool), source_root, "fake-dtk.bin"));
+    CHECK(porpoise_path_join(
+        cache, sizeof(cache), temporary, "version-product-cache"));
+
+    memset(&fake, 0, sizeof(fake));
+    fake.mode = FAKE_DTK_RENAMED_VERSION;
+    fake.stages_were_fresh = true;
+    configure_managed(
+        &options, input, tool, cache, "renamed-version", &fake, NULL);
+    options.allow_cache_reuse = false;
+    CHECK(porpoise_dtk_import_run(
+              &options, &result, &diagnostics) == PORPOISE_EXIT_OK);
+    CHECK(strcmp(
+        result.metadata.dtk_version,
+        "dtk-porpoise.exe 1.8.3 fixture") == 0);
+    CHECK(fake.version_calls == 1U);
+    CHECK(fake.info_calls == 1U);
+    CHECK(fake.disasm_calls == 1U);
+    CHECK(porpoise_remove_tree(cache, &diagnostics));
+
+    for (index = 0U;
+         index < sizeof(rejected_modes) / sizeof(rejected_modes[0]);
+         index++) {
+        porpoise_diagnostics_free(&diagnostics);
+        porpoise_diagnostics_init(&diagnostics);
+        memset(&fake, 0, sizeof(fake));
+        fake.mode = rejected_modes[index];
+        fake.stages_were_fresh = true;
+        configure_managed(
+            &options, input, tool, cache, "rejected-version", &fake, NULL);
+        CHECK(porpoise_dtk_import_run(
+                  &options, &result, &diagnostics) == PORPOISE_EXIT_USAGE);
+        CHECK(fake.version_calls == 1U);
+        CHECK(fake.info_calls == 0U);
+        CHECK(fake.disasm_calls == 0U);
+        CHECK(!porpoise_path_exists(cache));
+    }
+    porpoise_diagnostics_free(&diagnostics);
+}
+
+static bool test_set_environment(
+    const char *name,
+    const char *value) {
+#ifdef _WIN32
+    return _putenv_s(name, value == NULL ? "" : value) == 0;
+#else
+    return value == NULL ? unsetenv(name) == 0 : setenv(name, value, 1) == 0;
+#endif
+}
+
+static bool test_make_executable(const char *path) {
+    if (!write_text(path, "fake DTK discovery fixture\n")) return false;
+#ifdef _WIN32
+    return true;
+#else
+    return chmod(path, 0755) == 0;
+#endif
+}
+
+static bool test_resolved_path_equal(
+    const char *resolved,
+    const char *expected) {
+    char normalized[PORPOISE_PATH_CAPACITY];
+    if (!porpoise_path_normalize_lexical(
+            normalized, sizeof(normalized), expected)) {
+        return false;
+    }
+#ifdef _WIN32
+    return _stricmp(resolved, normalized) == 0;
+#else
+    return strcmp(resolved, normalized) == 0;
+#endif
+}
+
+static bool test_diagnostics_contain(
+    const PorpoiseDiagnostics *diagnostics,
+    const char *fragment) {
+    size_t index;
+    for (index = 0U; index < diagnostics->count; index++) {
+        if (strstr(diagnostics->items[index].message, fragment) != NULL)
+            return true;
+    }
+    return false;
+}
+
+static void test_reset_diagnostics(PorpoiseDiagnostics *diagnostics) {
+    porpoise_diagnostics_free(diagnostics);
+    porpoise_diagnostics_init(diagnostics);
+}
+
+static void test_tool_discovery(
+    const char *source_root,
+    const char *temporary) {
+#ifdef _WIN32
+    static const char path_tool_name[] = "dtk.exe";
+    static const char explicit_tool_name[] = "explicit-dtk.exe";
+    static const char environment_tool_name[] = "environment-dtk.exe";
+#else
+    static const char path_tool_name[] = "dtk";
+    static const char explicit_tool_name[] = "explicit-dtk";
+    static const char environment_tool_name[] = "environment-dtk";
+#endif
+    const char *original_path_value = getenv("PATH");
+    const char *original_dtk_value = getenv("PORPOISE_DTK");
+    bool had_original_path = original_path_value != NULL;
+    bool had_original_dtk = original_dtk_value != NULL;
+    char *original_path = original_path_value == NULL ?
+        NULL : porpoise_strdup(original_path_value);
+    char *original_dtk = original_dtk_value == NULL ?
+        NULL : porpoise_strdup(original_dtk_value);
+    char root[PORPOISE_PATH_CAPACITY];
+    char path_directory[PORPOISE_PATH_CAPACITY];
+    char missing_directory[PORPOISE_PATH_CAPACITY];
+    char input[PORPOISE_PATH_CAPACITY];
+    char explicit_tool[PORPOISE_PATH_CAPACITY];
+    char environment_tool[PORPOISE_PATH_CAPACITY];
+    char path_tool[PORPOISE_PATH_CAPACITY];
+    char missing_tool[PORPOISE_PATH_CAPACITY];
+    char cache[PORPOISE_PATH_CAPACITY];
+    PorpoiseDtkImportOptions options;
+    PorpoiseDtkImportResult result;
+    PorpoiseDiagnostics diagnostics;
+    FakeDtk fake;
+
+    if ((had_original_path && original_path == NULL) ||
+        (had_original_dtk && original_dtk == NULL)) {
+        CHECK(false);
+        free(original_path);
+        free(original_dtk);
+        return;
+    }
+    if (!porpoise_path_join(
+            root, sizeof(root), temporary, "tool-discovery") ||
+        !porpoise_path_join(
+            path_directory, sizeof(path_directory), root, "path") ||
+        !porpoise_path_join(
+            missing_directory, sizeof(missing_directory), root, "missing") ||
+        !porpoise_path_join(
+            explicit_tool, sizeof(explicit_tool), root, explicit_tool_name) ||
+        !porpoise_path_join(
+            environment_tool, sizeof(environment_tool), root,
+            environment_tool_name) ||
+        !porpoise_path_join(
+            path_tool, sizeof(path_tool), path_directory, path_tool_name) ||
+        !porpoise_path_join(
+            missing_tool, sizeof(missing_tool), missing_directory,
+            explicit_tool_name) ||
+        !fixture_path(input, sizeof(input), source_root, "input.elf")) {
+        CHECK(false);
+        free(original_path);
+        free(original_dtk);
+        return;
+    }
+    porpoise_diagnostics_init(&diagnostics);
+    CHECK(porpoise_make_directories(path_directory, &diagnostics));
+    CHECK(porpoise_make_directories(missing_directory, &diagnostics));
+    CHECK(test_make_executable(explicit_tool));
+    CHECK(test_make_executable(environment_tool));
+    CHECK(test_make_executable(path_tool));
+
+    /* PORPOISE_DTK wins over a different executable available on PATH. */
+    CHECK(test_set_environment("PATH", path_directory));
+    CHECK(test_set_environment("PORPOISE_DTK", environment_tool));
+    CHECK(porpoise_path_join(cache, sizeof(cache), root, "cache-env"));
+    memset(&fake, 0, sizeof(fake));
+    fake.mode = FAKE_DTK_VALID;
+    fake.stages_were_fresh = true;
+    configure_managed(
+        &options, input, NULL, cache, "discovery-env", &fake, NULL);
+    options.allow_cache_reuse = false;
+    CHECK(porpoise_dtk_import_run(
+              &options, &result, &diagnostics) == PORPOISE_EXIT_OK);
+    CHECK(test_resolved_path_equal(fake.executable_path, environment_tool));
+
+    /* Without an override, the platform-appropriate dtk name is found on PATH. */
+    CHECK(test_set_environment("PORPOISE_DTK", NULL));
+    CHECK(porpoise_path_join(cache, sizeof(cache), root, "cache-path"));
+    memset(&fake, 0, sizeof(fake));
+    fake.mode = FAKE_DTK_VALID;
+    fake.stages_were_fresh = true;
+    configure_managed(
+        &options, input, NULL, cache, "discovery-path", &fake, NULL);
+    options.allow_cache_reuse = false;
+    CHECK(porpoise_dtk_import_run(
+              &options, &result, &diagnostics) == PORPOISE_EXIT_OK);
+    CHECK(test_resolved_path_equal(fake.executable_path, path_tool));
+
+    /* An explicit selection wins over both PORPOISE_DTK and PATH. */
+    CHECK(test_set_environment("PORPOISE_DTK", environment_tool));
+    CHECK(porpoise_path_join(cache, sizeof(cache), root, "cache-explicit"));
+    memset(&fake, 0, sizeof(fake));
+    fake.mode = FAKE_DTK_VALID;
+    fake.stages_were_fresh = true;
+    configure_managed(
+        &options, input, explicit_tool, cache,
+        "discovery-explicit", &fake, NULL);
+    options.allow_cache_reuse = false;
+    CHECK(porpoise_dtk_import_run(
+              &options, &result, &diagnostics) == PORPOISE_EXIT_OK);
+    CHECK(test_resolved_path_equal(fake.executable_path, explicit_tool));
+
+    /* A bad explicit selection is authoritative and does not fall through. */
+    test_reset_diagnostics(&diagnostics);
+    CHECK(porpoise_path_join(
+        cache, sizeof(cache), root, "cache-explicit-missing"));
+    memset(&fake, 0, sizeof(fake));
+    fake.mode = FAKE_DTK_VALID;
+    fake.stages_were_fresh = true;
+    configure_managed(
+        &options, input, missing_tool, cache,
+        "discovery-explicit-missing", &fake, NULL);
+    CHECK(porpoise_dtk_import_run(
+              &options, &result, &diagnostics) == PORPOISE_EXIT_USAGE);
+    CHECK(fake.version_calls == 0U);
+    CHECK(test_diagnostics_contain(&diagnostics, "explicit DTK selection"));
+    CHECK(test_diagnostics_contain(&diagnostics, "PORPOISE_DTK"));
+
+    /* A completely missing default reports every supported selection route. */
+    test_reset_diagnostics(&diagnostics);
+    CHECK(test_set_environment("PORPOISE_DTK", NULL));
+    CHECK(test_set_environment("PATH", missing_directory));
+    CHECK(porpoise_path_join(cache, sizeof(cache), root, "cache-missing"));
+    memset(&fake, 0, sizeof(fake));
+    fake.mode = FAKE_DTK_VALID;
+    fake.stages_were_fresh = true;
+    configure_managed(
+        &options, input, NULL, cache, "discovery-missing", &fake, NULL);
+    CHECK(porpoise_dtk_import_run(
+              &options, &result, &diagnostics) == PORPOISE_EXIT_USAGE);
+    CHECK(fake.version_calls == 0U);
+    CHECK(test_diagnostics_contain(&diagnostics, "--dtk FILE"));
+    CHECK(test_diagnostics_contain(&diagnostics, "PORPOISE_DTK"));
+    CHECK(test_diagnostics_contain(&diagnostics, "PATH"));
+
+    CHECK(test_set_environment(
+        "PATH", had_original_path ? original_path : NULL));
+    CHECK(test_set_environment(
+        "PORPOISE_DTK", had_original_dtk ? original_dtk : NULL));
+    porpoise_diagnostics_free(&diagnostics);
+    free(original_path);
+    free(original_dtk);
+}
+
 static void test_default_runner(
     const char *executable,
     PorpoiseDiagnostics *diagnostics) {
@@ -553,6 +840,8 @@ int main(int argc, char **argv) {
     test_failure_and_cancellation_preserve_cache(
         argv[1], temporary, &diagnostics);
     test_validation_failures(argv[1], temporary, &diagnostics);
+    test_version_product_names(argv[1], temporary);
+    test_tool_discovery(argv[1], temporary);
     test_default_runner(argv[0], &diagnostics);
     CHECK(!directory_has_import_artifact(temporary));
 

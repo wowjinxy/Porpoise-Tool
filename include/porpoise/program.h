@@ -61,6 +61,19 @@ typedef struct PorpoiseDataLocalLabel {
     uint32_t offset;
 } PorpoiseDataLocalLabel;
 
+/*
+ * A zero-size DTK `.sym` contribution in a data or executable section.
+ * Unlike an instruction alias, its address comes from the immediately
+ * preceding contribution comment and it does not own any source bytes.
+ */
+typedef struct PorpoiseDataAlias {
+    char *name;
+    char *section;
+    bool is_global;
+    size_t source_line;
+    uint32_t address;
+} PorpoiseDataAlias;
+
 typedef enum PorpoiseDataFixupKind {
     PORPOISE_DATA_FIXUP_ABSOLUTE_32 = 0,
     /* The `.rel BASE, TARGET` dialect stores TARGET's absolute address. */
@@ -138,6 +151,9 @@ typedef struct PorpoiseSourceFile {
     PorpoiseDataWord *data_words;
     size_t data_word_count;
     size_t data_word_capacity;
+    PorpoiseDataAlias *data_aliases;
+    size_t data_alias_count;
+    size_t data_alias_capacity;
     PorpoiseDataObject *data_objects;
     size_t data_object_count;
     size_t data_object_capacity;
@@ -166,6 +182,7 @@ typedef struct PorpoiseProgramDataSymbolIndexEntry {
     const char *name;
     const PorpoiseSourceFile *file;
     const PorpoiseDataObject *object;
+    const PorpoiseDataAlias *alias;
 } PorpoiseProgramDataSymbolIndexEntry;
 
 typedef struct PorpoiseProgram {

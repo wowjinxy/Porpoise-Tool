@@ -37,6 +37,11 @@ int porpoise_project_generate_plan(
     PorpoiseReport *report,
     PorpoiseDiagnostics *diagnostics);
 
+/*
+ * Staging copies the PorpoiseOperationCallbacks table for later publication.
+ * The caller still owns anything referenced by operation->user_data and must
+ * keep it valid until publication has returned.
+ */
 int porpoise_project_stage_plan(
     const PorpoiseTranslationPlan *plan,
     const PorpoiseProjectOptions *options,

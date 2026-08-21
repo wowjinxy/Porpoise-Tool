@@ -23,6 +23,10 @@ typedef struct PorpoiseAsmDataParser {
     PorpoiseDataObject *current_object;
     uint8_t *current_presence;
     size_t current_offset;
+    char selected_section[PORPOISE_NAME_CAPACITY];
+    bool have_selected_section;
+    bool selected_section_executable;
+    bool executable_symbol_data;
 } PorpoiseAsmDataParser;
 
 typedef enum PorpoiseAsmDataLineResult {
@@ -33,6 +37,13 @@ typedef enum PorpoiseAsmDataLineResult {
 } PorpoiseAsmDataLineResult;
 
 void porpoise_asm_data_parser_init(PorpoiseAsmDataParser *parser);
+
+/* True while an executable-section `.sym` owns following annotated words. */
+bool porpoise_asm_data_accepts_annotated_words(
+    const PorpoiseAsmDataParser *parser);
+
+/* A real `.fn` always ends any preceding symbol-delimited data region. */
+void porpoise_asm_data_begin_function(PorpoiseAsmDataParser *parser);
 
 /*
  * Recognize a decomp-toolkit contribution metadata comment. `recognized` is

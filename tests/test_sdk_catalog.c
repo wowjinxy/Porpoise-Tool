@@ -88,6 +88,15 @@ static void test_strict_load_and_lookup(const char *root) {
         CHECK(match.status == PORPOISE_SDK_CATALOG_MATCH_UNIQUE);
         CHECK(match.match_count == 1U);
         CHECK(match.entry == entry);
+        CHECK(porpoise_sdk_catalog_find_identity(
+                  &catalog, "sdk:OSReport") == entry);
+        match = porpoise_sdk_catalog_lookup_identity_exact(
+            &catalog, "sdk:OSReport", &entry->signature);
+        CHECK(match.status == PORPOISE_SDK_CATALOG_MATCH_UNIQUE);
+        CHECK(match.entry == entry);
+        match = porpoise_sdk_catalog_lookup_identity_exact(
+            &catalog, "sdk:missing", &entry->signature);
+        CHECK(match.status == PORPOISE_SDK_CATALOG_MATCH_NONE);
 
         changed = entry->signature;
         changed.internal_branch_count++;
@@ -95,6 +104,9 @@ static void test_strict_load_and_lookup(const char *root) {
         CHECK(match.status == PORPOISE_SDK_CATALOG_MATCH_NONE);
         CHECK(match.entry == NULL);
         CHECK(match.match_count == 0U);
+        match = porpoise_sdk_catalog_lookup_identity_exact(
+            &catalog, "sdk:OSReport", &changed);
+        CHECK(match.status == PORPOISE_SDK_CATALOG_MATCH_NONE);
     }
 
     /* Re-loading an identical additive catalog coalesces all identities. */
@@ -193,6 +205,11 @@ static void test_programmatic_coalescing_and_ambiguity(void) {
               &catalog, &alias, &diagnostics) == PORPOISE_EXIT_OK);
     CHECK(catalog.entry_count == 2U);
     match = porpoise_sdk_catalog_lookup_exact(&catalog, &first.signature);
+    CHECK(match.status == PORPOISE_SDK_CATALOG_MATCH_AMBIGUOUS);
+    CHECK(match.match_count == 2U);
+    CHECK(match.entry == NULL);
+    match = porpoise_sdk_catalog_lookup_identity_exact(
+        &catalog, "sdk:first", &first.signature);
     CHECK(match.status == PORPOISE_SDK_CATALOG_MATCH_AMBIGUOUS);
     CHECK(match.match_count == 2U);
     CHECK(match.entry == NULL);

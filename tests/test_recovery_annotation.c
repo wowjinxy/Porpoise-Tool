@@ -1,4 +1,5 @@
 #include "porpoise/recovery_annotation.h"
+#include "porpoise/signature.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -57,8 +58,8 @@ static void set_annotation(
     annotation->module = (char *)"main";
     annotation->address = address;
     annotation->size = size;
-    annotation->normalized_fingerprint = (char *)fingerprint;
     hash_bytes(bytes, size, exact_hash);
+    annotation->normalized_fingerprint = exact_hash;
     annotation->exact_bytes_sha256 = exact_hash;
     annotation->interpretation = interpretation;
     annotation->element_count = count;
@@ -81,6 +82,8 @@ static void check_annotation_opens(
     CHECK(view.byte_view.size == annotation->size);
     CHECK(view.element_width == expected_width);
     CHECK(view.decoded_element_count == annotation->element_count);
+    CHECK(strcmp(view.normalized_fingerprint,
+                 annotation->normalized_fingerprint) == 0);
     CHECK(strcmp(view.exact_bytes_sha256,
                  annotation->exact_bytes_sha256) == 0);
     porpoise_recovery_annotation_view_free(&view);
@@ -312,7 +315,7 @@ static void test_invalid_annotations_and_coverage(void) {
     CHECK(diagnostics_contain(&diagnostics, "fingerprint"));
     reset_diagnostics(&diagnostics);
 
-    annotation.normalized_fingerprint = (char *)fingerprint;
+    annotation.normalized_fingerprint = hash;
     annotation.exact_bytes_sha256 = (char *)"ABC";
     result = porpoise_recovery_annotation_view_open(
         &program, &annotation, "target", "main", &view, &diagnostics);
@@ -324,8 +327,24 @@ static void test_invalid_annotations_and_coverage(void) {
     result = porpoise_recovery_annotation_view_open(
         &program, &annotation, "target", "main", &view, &diagnostics);
     CHECK(result == PORPOISE_EXIT_TRANSLATION);
-    CHECK(diagnostics_contain(&diagnostics, "stale"));
+    CHECK(diagnostics_contain(&diagnostics, "exact-byte hash is stale"));
     CHECK(view.byte_view.bytes == retained_view_bytes);
+    reset_diagnostics(&diagnostics);
+
+    annotation.exact_bytes_sha256 = hash;
+    annotation.normalized_fingerprint = (char *)fingerprint;
+    result = porpoise_recovery_annotation_view_open(
+        &program, &annotation, "target", "main", &view, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_TRANSLATION);
+    CHECK(diagnostics_contain(
+        &diagnostics, "normalized fingerprint is stale"));
+    CHECK(view.byte_view.bytes == retained_view_bytes);
+    reset_diagnostics(&diagnostics);
+    result = porpoise_recovery_annotations_validate(
+        &program, &annotation, 1U, "target", "main", &diagnostics);
+    CHECK(result == PORPOISE_EXIT_TRANSLATION);
+    CHECK(diagnostics_contain(
+        &diagnostics, "normalized fingerprint is stale"));
     reset_diagnostics(&diagnostics);
 
     set_annotation(&annotation, UINT32_C(0x2001), 2U,
@@ -447,9 +466,84 @@ static void test_invalid_annotations_and_coverage(void) {
     porpoise_diagnostics_free(&diagnostics);
 }
 
+static void test_code_fingerprint_validation(void) {
+    PorpoiseAsmItem instruction;
+    PorpoiseFunction function;
+    PorpoiseSourceFile file;
+    PorpoiseProgram program;
+    PorpoiseFunctionSignature signature;
+    PorpoiseRecoveryAnnotation annotation;
+    PorpoiseRecoveryAnnotationView view;
+    PorpoiseDiagnostics diagnostics;
+    char exact_hash[PORPOISE_SHA256_HEX_SIZE];
+    char computed[PORPOISE_SHA256_HEX_SIZE];
+    const uint8_t bytes[] = {0x4eU, 0x80U, 0x00U, 0x20U};
+    int result;
+
+    memset(&instruction, 0, sizeof(instruction));
+    instruction.kind = PORPOISE_ASM_INSTRUCTION;
+    instruction.address = UINT32_C(0x3000);
+    instruction.word = UINT32_C(0x4e800020);
+    instruction.mnemonic = (char *)"blr";
+    instruction.operands = (char *)"";
+    memset(&function, 0, sizeof(function));
+    function.name = (char *)"fingerprinted_code";
+    function.section = (char *)".text";
+    function.start_address = UINT32_C(0x3000);
+    function.size = 4U;
+    function.items = &instruction;
+    function.item_count = 1U;
+    function.instruction_count = 1U;
+    memset(&file, 0, sizeof(file));
+    file.path = (char *)"fingerprint.s";
+    file.functions = &function;
+    file.function_count = 1U;
+    memset(&program, 0, sizeof(program));
+    program.files = &file;
+    program.file_count = 1U;
+
+    CHECK(porpoise_signature_compute(&program, &function, &signature));
+    set_annotation(
+        &annotation, UINT32_C(0x3000), 4U,
+        PORPOISE_RECOVERY_ANNOTATION_RAW_BYTES, 4U, NULL,
+        exact_hash, bytes);
+    annotation.normalized_fingerprint = signature.digest_hex;
+
+    porpoise_diagnostics_init(&diagnostics);
+    porpoise_recovery_annotation_view_init(&view);
+    result = porpoise_recovery_normalized_fingerprint_compute(
+        &program, annotation.address, annotation.size, computed,
+        &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    CHECK(strcmp(computed, signature.digest_hex) == 0);
+    result = porpoise_recovery_annotation_view_open(
+        &program, &annotation, "target", "main", &view, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    CHECK(strcmp(view.normalized_fingerprint, signature.digest_hex) == 0);
+
+    reset_diagnostics(&diagnostics);
+    annotation.normalized_fingerprint = (char *)fingerprint;
+    result = porpoise_recovery_annotation_view_open(
+        &program, &annotation, "target", "main", &view, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_TRANSLATION);
+    CHECK(diagnostics_contain(
+        &diagnostics, "normalized fingerprint is stale"));
+
+    reset_diagnostics(&diagnostics);
+    result = porpoise_recovery_annotations_validate(
+        &program, &annotation, 1U, "target", "main", &diagnostics);
+    CHECK(result == PORPOISE_EXIT_TRANSLATION);
+    CHECK(diagnostics_contain(
+        &diagnostics, "normalized fingerprint is stale"));
+
+    porpoise_recovery_annotation_view_free(&view);
+    porpoise_diagnostics_free(&diagnostics);
+}
+
 int main(void) {
     test_valid_views_and_interpretations();
     test_invalid_annotations_and_coverage();
+    test_code_fingerprint_validation();
     if (failures != 0U) {
         fprintf(stderr, "%u recovery annotation test(s) failed\n", failures);
         return 1;

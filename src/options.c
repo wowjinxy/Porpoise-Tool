@@ -19,6 +19,7 @@
 typedef struct CliValues {
     PorpoiseOptions values;
     bool project_seen;
+    bool dtk_seen;
     bool target_seen;
     bool analyze_only_seen;
     bool report_seen;
@@ -158,6 +159,7 @@ void porpoise_options_print_help(FILE *stream, const char *program_name) {
             "\n"
             "Options:\n"
             "  --project FILE        Load a schema-version 1 .porpoise.json project\n"
+            "  --dtk FILE            DTK executable for managed ELF imports\n"
             "  --target ID           Select a project target (repeatable, max %u)\n"
             "  --analyze-only        Build and validate plans without generation\n"
             "  --report FILE         Write the project-mode aggregate report\n"
@@ -233,6 +235,11 @@ static PorpoiseExitCode parse_cli(CliValues *cli,
             target_capacity = sizeof(cli->values.project_path);
             description = "project path";
             seen = &cli->project_seen;
+        } else if (!positional_only && strcmp(argument, "--dtk") == 0) {
+            target = cli->values.dtk_path;
+            target_capacity = sizeof(cli->values.dtk_path);
+            description = "DTK executable path";
+            seen = &cli->dtk_seen;
         } else if (!positional_only && strcmp(argument, "--target") == 0) {
             size_t selector_index;
             if (index + 1 >= argc) {
@@ -480,6 +487,9 @@ static PorpoiseExitCode parse_cli(CliValues *cli,
     }
     if (cli->target_seen) {
         return option_error(error_stream, "--target requires --project FILE");
+    }
+    if (cli->dtk_seen) {
+        return option_error(error_stream, "--dtk requires --project FILE");
     }
     if (cli->analyze_only_seen) {
         return option_error(

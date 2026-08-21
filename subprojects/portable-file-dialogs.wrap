@@ -1,0 +1,9 @@
+[wrap-git]
+directory = portable-file-dialogs-c12ea8c
+url = https://github.com/samhocevar/portable-file-dialogs.git
+revision = c12ea8c9a727f5320a2b4570aee863bbede2a204
+depth = 1
+patch_directory = portable-file-dialogs
+
+[provide]
+portable-file-dialogs = portable_file_dialogs_dep

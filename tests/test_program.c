@@ -764,6 +764,118 @@ static void test_dtk_data_directives(const char *source_root) {
     porpoise_program_free(&program);
 }
 
+static void test_dtk_data_symbols(const char *source_root) {
+    char path[PORPOISE_PATH_CAPACITY];
+    PorpoiseProgram program;
+    PorpoiseDiagnostics diagnostics;
+    const PorpoiseSourceFile *file;
+    const PorpoiseDataObject *pointer_pair;
+    uint32_t address = 0U;
+    size_t index;
+    int result;
+
+    CHECK(make_fixture_path(
+        path, sizeof(path), source_root, "dtk_data_symbols.s"));
+    porpoise_program_init(&program);
+    porpoise_diagnostics_init(&diagnostics);
+    result = porpoise_program_load(&program, path, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    CHECK(!porpoise_diagnostics_have_errors(&diagnostics));
+    CHECK(program.file_count == 1U);
+    file = program.file_count == 1U ? &program.files[0] : NULL;
+    CHECK(file != NULL);
+    if (file != NULL) {
+        CHECK(file->function_count == 2U);
+        CHECK(file->data_word_count == 3U);
+        CHECK(file->data_alias_count == 5U);
+        CHECK(file->data_object_count == 3U);
+        for (index = 0U; index < file->data_word_count; index++) {
+            CHECK(strcmp(file->data_words[index].directive, ".4byte") == 0);
+            CHECK(file->data_words[index].address ==
+                  UINT32_C(0x80002000) + (uint32_t)(index * 4U));
+        }
+        CHECK(file->data_words[0].word == UINT32_C(0x4D657472));
+        CHECK(file->data_words[1].word == UINT32_C(0x6F776572));
+        CHECK(file->data_words[2].word == UINT32_C(0x6B732054));
+        pointer_pair = &file->data_objects[0];
+        CHECK(strcmp(pointer_pair->name, "pointer_pair") == 0);
+        CHECK(pointer_pair->size == 8U);
+        CHECK(pointer_pair->bytes[4] == 0x80U);
+        CHECK(pointer_pair->bytes[5] == 0x00U);
+        CHECK(pointer_pair->bytes[6] == 0x30U);
+        CHECK(pointer_pair->bytes[7] == 0x00U);
+        CHECK(porpoise_program_resolve_raw_address(
+            &program, file, pointer_pair, "...data.0", &address));
+        CHECK(address == UINT32_C(0x80003000));
+        CHECK(porpoise_program_resolve_raw_address(
+            &program, file, &file->data_objects[1], "...bss.0", &address));
+        CHECK(address == UINT32_C(0x80004000));
+        CHECK(strcmp(
+                  file->data_objects[2].name,
+                  "implicit_section_pointer") == 0);
+        CHECK(file->data_objects[2].bytes[0] == 0x80U);
+        CHECK(file->data_objects[2].bytes[1] == 0x00U);
+        CHECK(file->data_objects[2].bytes[2] == 0x50U);
+        CHECK(file->data_objects[2].bytes[3] == 0x04U);
+        CHECK(porpoise_program_resolve_raw_address(
+            &program, file, &file->data_objects[2], "...rodata.0",
+            &address));
+        CHECK(address == UINT32_C(0x80005000));
+    }
+    CHECK(porpoise_program_resolve_raw_address(
+        &program, file, NULL, "executable_blob", &address));
+    CHECK(address == UINT32_C(0x80002000));
+    CHECK(porpoise_program_resolve_raw_address(
+        &program, file, NULL, "executable_blob_end", &address));
+    CHECK(address == UINT32_C(0x8000200C));
+    CHECK(porpoise_program_find_function(
+              &program, "executable_blob") == NULL);
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_program_free(&program);
+}
+
+static void test_same_tu_local_function_names(const char *source_root) {
+    char path[PORPOISE_PATH_CAPACITY];
+    PorpoiseProgram program;
+    PorpoiseDiagnostics diagnostics;
+    const PorpoiseSourceFile *file;
+    const PorpoiseFunction *owner = NULL;
+    const PorpoiseAddressAlias *alias = NULL;
+    uint32_t address = 0U;
+    int result;
+
+    CHECK(make_fixture_path(
+        path, sizeof(path), source_root, "local_function_same_tu.s"));
+    porpoise_program_init(&program);
+    porpoise_diagnostics_init(&diagnostics);
+    result = porpoise_program_load(&program, path, &diagnostics);
+    CHECK(result == PORPOISE_EXIT_OK);
+    CHECK(!porpoise_diagnostics_have_errors(&diagnostics));
+    CHECK(program.file_count == 1U);
+    file = program.file_count == 1U ? &program.files[0] : NULL;
+    CHECK(file != NULL && file->function_count == 3U);
+    if (file != NULL && file->function_count == 3U) {
+        CHECK(strcmp(
+                  file->functions[1].c_name,
+                  file->functions[2].c_name) != 0);
+        CHECK(strstr(file->functions[1].c_name, "80012100") != NULL);
+        CHECK(strstr(file->functions[2].c_name, "80012200") != NULL);
+        CHECK(!porpoise_program_resolve_symbol_scoped(
+            &program, file, &file->functions[0], ".text",
+            "repeated_local", &owner, &alias, &address));
+        CHECK(owner == NULL);
+        CHECK(alias == NULL);
+        CHECK(address == 0U);
+        CHECK(porpoise_program_resolve_symbol_scoped(
+            &program, file, &file->functions[0], ".text",
+            file->functions[1].c_name, &owner, &alias, &address));
+        CHECK(owner == &file->functions[1]);
+        CHECK(address == UINT32_C(0x80012100));
+    }
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_program_free(&program);
+}
+
 static void test_exact_duplicate_functions(const char *source_root) {
     char path[PORPOISE_PATH_CAPACITY];
     char skip_path[PORPOISE_PATH_CAPACITY];
@@ -956,6 +1068,8 @@ int main(int argc, char **argv) {
     test_weak_function_scope(argv[1]);
     test_multiline_comments(argv[1]);
     test_dtk_data_directives(argv[1]);
+    test_dtk_data_symbols(argv[1]);
+    test_same_tu_local_function_names(argv[1]);
     test_exact_duplicate_functions(argv[1]);
     test_coalesced_alias_diagnostic_provenance(argv[1]);
     test_gap_duplicate_precedence(argv[1]);
@@ -1013,6 +1127,24 @@ int main(int argc, char **argv) {
     test_invalid_program(
         argv[1], "data_directives_dtk_overflow_signed.s",
         "overflowing 8-byte data operand");
+    test_invalid_program(
+        argv[1], "dtk_data_symbol_nonzero.s",
+        "requires zero-size contribution metadata");
+    test_invalid_program(
+        argv[1], "dtk_data_symbol_inside_without_metadata.s",
+        "missing fresh zero-size contribution metadata");
+    test_invalid_program(
+        argv[1], "dtk_data_symbol_inside_nonzero_metadata.s",
+        "contribution metadata appears inside data object");
+    test_invalid_program(
+        argv[1], "dtk_section_base_ambiguous.s",
+        "ambiguous DTK section base");
+    test_invalid_program(
+        argv[1], "dtk_section_base_unknown.s",
+        "unresolved, ambiguous, or overflowing data expression ...rodata.0");
+    test_invalid_program(
+        argv[1], "global_function_duplicate.s",
+        "duplicate or colliding function symbol repeated_global");
     if (failures != 0U) {
         fprintf(stderr, "%u parser test(s) failed\n", failures);
         return 1;

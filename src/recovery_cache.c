@@ -1146,6 +1146,94 @@ static int recovery_cache_store_matches(
     return PORPOISE_EXIT_OK;
 }
 
+int porpoise_recovery_target_cache_matches_plan(
+    const PorpoiseRecoveryTarget *target,
+    const PorpoiseTranslationPlan *plan,
+    bool *matches_out,
+    PorpoiseDiagnostics *diagnostics) {
+    PorpoiseRecoveryTargetCache candidate;
+    PorpoiseRecoveryCacheValidation validation;
+    bool *used = NULL;
+    const char *plan_target;
+    size_t left;
+    int result;
+
+    if (matches_out != NULL) *matches_out = false;
+    if (target == NULL || plan == NULL || matches_out == NULL) {
+        return recovery_cache_error(
+            diagnostics, PORPOISE_EXIT_INTERNAL, "",
+            "recovery-cache match comparison arguments are invalid");
+    }
+    plan_target = porpoise_plan_target_id(plan);
+    if (target->id == NULL || plan_target == NULL ||
+        strcmp(target->id, plan_target) != 0) {
+        return recovery_cache_error(
+            diagnostics, PORPOISE_EXIT_USAGE, "",
+            "recovery-cache target does not match the validated plan");
+    }
+    if (target->cache.match_count != 0U &&
+        target->cache.matches == NULL) {
+        return recovery_cache_error(
+            diagnostics, PORPOISE_EXIT_USAGE, "",
+            "recovery cache contains an incomplete exact match set");
+    }
+    for (left = 0U; left < target->cache.match_count; left++) {
+        const PorpoiseRecoveryMatchCacheEntry *match =
+            &target->cache.matches[left];
+        if (match->module == NULL ||
+            match->normalized_fingerprint == NULL ||
+            match->canonical_identity == NULL) {
+            return recovery_cache_error(
+                diagnostics, PORPOISE_EXIT_USAGE, "",
+                "recovery cache contains an incomplete exact match record");
+        }
+    }
+    porpoise_recovery_cache_validation_init(&validation);
+    result = recovery_cache_validate_match_records(
+        &target->cache, &validation, diagnostics);
+    if (result != PORPOISE_EXIT_OK) return result;
+
+    memset(&candidate, 0, sizeof(candidate));
+    result = recovery_cache_store_matches(&candidate, plan, diagnostics);
+    if (result != PORPOISE_EXIT_OK) {
+        porpoise_recovery_target_cache_clear(&candidate);
+        return result;
+    }
+    if (candidate.match_count != target->cache.match_count) {
+        porpoise_recovery_target_cache_clear(&candidate);
+        return PORPOISE_EXIT_OK;
+    }
+    if (candidate.match_count != 0U) {
+        used = (bool *)calloc(candidate.match_count, sizeof(*used));
+        if (used == NULL) {
+            porpoise_recovery_target_cache_clear(&candidate);
+            return PORPOISE_EXIT_INTERNAL;
+        }
+    }
+    for (left = 0U; left < target->cache.match_count; left++) {
+        size_t right;
+        bool found = false;
+        for (right = 0U; right < candidate.match_count; right++) {
+            if (!used[right] && recovery_cache_match_equal(
+                    &target->cache.matches[left],
+                    &candidate.matches[right])) {
+                used[right] = true;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            free(used);
+            porpoise_recovery_target_cache_clear(&candidate);
+            return PORPOISE_EXIT_OK;
+        }
+    }
+    free(used);
+    porpoise_recovery_target_cache_clear(&candidate);
+    *matches_out = true;
+    return PORPOISE_EXIT_OK;
+}
+
 int porpoise_recovery_target_cache_rebuild(
     PorpoiseRecoveryTarget *target,
     const PorpoiseRecoveryCacheInputs *inputs,

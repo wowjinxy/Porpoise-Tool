@@ -175,6 +175,11 @@ static void free_file(PorpoiseSourceFile *file) {
         free(file->data_words[index].directive);
     }
     free(file->data_words);
+    for (index = 0U; index < file->data_alias_count; index++) {
+        free(file->data_aliases[index].name);
+        free(file->data_aliases[index].section);
+    }
+    free(file->data_aliases);
     for (index = 0U; index < file->data_object_count; index++) {
         porpoise_asm_data_free_object(&file->data_objects[index]);
     }
@@ -1016,6 +1021,7 @@ static bool parse_file(
                 ok = false;
                 break;
             }
+            porpoise_asm_data_begin_function(&data_parser);
             have_previous_instruction = false;
             continue;
         }
@@ -1075,15 +1081,20 @@ static bool parse_file(
             continue;
         }
         if (current == NULL) {
-            if (in_data_section &&
-                parse_instruction(line, &address, &word, mnemonic, sizeof(mnemonic), operands, sizeof(operands)) &&
-                mnemonic[0] == '.') {
+            bool executable_data =
+                porpoise_asm_data_accepts_annotated_words(&data_parser);
+            if ((in_data_section || executable_data) &&
+                parse_instruction(line, &address, &word, mnemonic,
+                                  sizeof(mnemonic), operands,
+                                  sizeof(operands)) &&
+                (executable_data || mnemonic[0] == '.')) {
                 PorpoiseDataWord *data_word = file_add_data_word(file);
                 if (data_word == NULL) { ok = false; break; }
                 data_word->source_line = line_number;
                 data_word->address = address;
                 data_word->word = word;
-                data_word->directive = porpoise_strdup(mnemonic);
+                data_word->directive = porpoise_strdup(
+                    executable_data ? ".4byte" : mnemonic);
                 if (data_word->directive == NULL) {
                     file_rollback_last_data_word(file, data_word);
                     ok = false;
@@ -2484,6 +2495,17 @@ static bool ensure_unique_symbols(
                 }
                 if (left->kind == PORPOISE_VALIDATION_FUNCTION &&
                     right->kind == PORPOISE_VALIDATION_FUNCTION) {
+                    /*
+                     * DTK may preserve multiple local functions with the
+                     * same source spelling in one TU/section.  Their C names
+                     * already include TU, section, and address.  Bare source
+                     * lookups remain ambiguous in the scoped resolver; only
+                     * the generated identities are accepted automatically.
+                     */
+                    if (!name_validation_is_global(left) &&
+                        !name_validation_is_global(right)) {
+                        continue;
+                    }
                     porpoise_diagnostics_add(
                         diagnostics, PORPOISE_SEVERITY_ERROR,
                         right->file->path, 0U,

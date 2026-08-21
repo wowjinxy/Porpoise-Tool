@@ -148,6 +148,8 @@ int porpoise_recovery_project_load(
 /*
  * Write canonical schema-v1 JSON. Paths are rebased against path when both
  * locations share a volume/root; foreign or cross-volume paths stay absolute.
+ * Serialization is completed in an adjacent file before an atomic filesystem
+ * replacement, so a failed save leaves an existing project unchanged.
  */
 int porpoise_recovery_project_save(
     const PorpoiseRecoveryProject *project,

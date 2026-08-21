@@ -14,6 +14,13 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#ifndef PORPOISE_RUNTIME_DIR
+#define PORPOISE_RUNTIME_DIR "runtime"
+#endif
+#ifndef PORPOISE_INSTALLED_RUNTIME_DIR
+#define PORPOISE_INSTALLED_RUNTIME_DIR "runtime"
+#endif
+
 #ifdef _WIN32
 #include <direct.h>
 #define WIN32_LEAN_AND_MEAN
@@ -28,6 +35,23 @@
 
 static bool porpoise_is_separator(char value) {
     return value == '/' || value == '\\';
+}
+
+const char *porpoise_default_runtime_directory(void) {
+    const char *candidates[] = {
+        PORPOISE_RUNTIME_DIR,
+        PORPOISE_INSTALLED_RUNTIME_DIR
+    };
+    char probe[PORPOISE_PATH_CAPACITY];
+    size_t index;
+    for (index = 0U; index < sizeof(candidates) / sizeof(candidates[0]); index++) {
+        if (porpoise_path_join(probe, sizeof(probe), candidates[index],
+                               "include/porpoise_lifted.h") &&
+            porpoise_path_exists(probe)) {
+            return candidates[index];
+        }
+    }
+    return PORPOISE_RUNTIME_DIR;
 }
 
 char *porpoise_strdup(const char *value) {
@@ -267,11 +291,7 @@ static bool porpoise_windows_final_path(
     DWORD attributes = GetFileAttributesA(path);
     HANDLE handle;
     DWORD length;
-    if (attributes == INVALID_FILE_ATTRIBUTES) {
-        DWORD error = GetLastError();
-        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) return false;
-        return _fullpath(destination, path, capacity) != NULL;
-    }
+    if (attributes == INVALID_FILE_ATTRIBUTES) return false;
     handle = CreateFileA(
         path,
         0,
@@ -297,18 +317,76 @@ static bool porpoise_windows_final_path(
 }
 #endif
 
+static bool porpoise_resolution_parent(
+    char *destination,
+    size_t capacity,
+    const char *path) {
+    if (!porpoise_path_parent(destination, capacity, path)) return false;
+#ifdef _WIN32
+    if (strlen(destination) == 2U && destination[1] == ':' &&
+        isalpha((unsigned char)destination[0])) {
+        if (capacity < 4U) return false;
+        destination[2] = '\\';
+        destination[3] = '\0';
+    }
+#endif
+    return true;
+}
+
+static bool porpoise_resolve_existing_path(
+    char *destination,
+    size_t capacity,
+    const char *path) {
+#ifdef _WIN32
+    return porpoise_windows_final_path(destination, capacity, path);
+#else
+    (void)capacity;
+    return realpath(path, destination) != NULL;
+#endif
+}
+
 static bool porpoise_absolute_normalized_path(
     char *destination,
     size_t capacity,
     const char *path) {
+    char lexical[PORPOISE_PATH_CAPACITY];
+    char ancestor[PORPOISE_PATH_CAPACITY];
+    char parent[PORPOISE_PATH_CAPACITY];
+    char resolved[PORPOISE_PATH_CAPACITY];
+    char combined[PORPOISE_PATH_CAPACITY];
+    const char *suffix;
+    size_t ancestor_length;
     if (destination == NULL || capacity == 0U || path == NULL || path[0] == '\0') return false;
-#ifdef _WIN32
-    return porpoise_windows_final_path(destination, capacity, path);
-#else
-    if (realpath(path, destination) != NULL) return true;
-    if (errno != ENOENT && errno != ENOTDIR) return false;
-    return porpoise_normalize_missing_posix_path(destination, capacity, path);
-#endif
+    if (!porpoise_path_normalize_lexical(
+            lexical, sizeof(lexical), path) ||
+        !porpoise_copy_string(ancestor, sizeof(ancestor), lexical)) {
+        return false;
+    }
+    while (!porpoise_path_exists(ancestor)) {
+        if (!porpoise_resolution_parent(
+                parent, sizeof(parent), ancestor) ||
+            strcmp(parent, ancestor) == 0 ||
+            !porpoise_copy_string(ancestor, sizeof(ancestor), parent)) {
+            return false;
+        }
+    }
+    if (!porpoise_resolve_existing_path(
+            resolved, sizeof(resolved), ancestor)) {
+        return false;
+    }
+    ancestor_length = strlen(ancestor);
+    suffix = lexical + ancestor_length;
+    while (porpoise_is_separator(*suffix)) suffix++;
+    if (*suffix == '\0') {
+        return porpoise_path_normalize_lexical(
+            destination, capacity, resolved);
+    }
+    if (!porpoise_path_join(
+            combined, sizeof(combined), resolved, suffix)) {
+        return false;
+    }
+    return porpoise_path_normalize_lexical(
+        destination, capacity, combined);
 }
 
 bool porpoise_path_normalize_lexical(char *destination, size_t capacity, const char *path) {
@@ -364,26 +442,94 @@ static bool porpoise_path_contains(const char *parent, const char *child) {
            porpoise_is_separator(child[parent_length]);
 }
 
+static bool porpoise_existing_paths_same_object(
+    const char *left,
+    const char *right) {
+#ifdef _WIN32
+    BY_HANDLE_FILE_INFORMATION left_information;
+    BY_HANDLE_FILE_INFORMATION right_information;
+    DWORD left_attributes = GetFileAttributesA(left);
+    DWORD right_attributes = GetFileAttributesA(right);
+    HANDLE left_handle;
+    HANDLE right_handle;
+    bool same = false;
+    if (left_attributes == INVALID_FILE_ATTRIBUTES ||
+        right_attributes == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    left_handle = CreateFileA(
+        left, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING,
+        (left_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0U
+            ? FILE_FLAG_BACKUP_SEMANTICS : 0U,
+        NULL);
+    if (left_handle == INVALID_HANDLE_VALUE) return false;
+    right_handle = CreateFileA(
+        right, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING,
+        (right_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0U
+            ? FILE_FLAG_BACKUP_SEMANTICS : 0U,
+        NULL);
+    if (right_handle != INVALID_HANDLE_VALUE &&
+        GetFileInformationByHandle(left_handle, &left_information) &&
+        GetFileInformationByHandle(right_handle, &right_information)) {
+        same = left_information.dwVolumeSerialNumber ==
+                   right_information.dwVolumeSerialNumber &&
+               left_information.nFileIndexHigh ==
+                   right_information.nFileIndexHigh &&
+               left_information.nFileIndexLow ==
+                   right_information.nFileIndexLow;
+    }
+    if (right_handle != INVALID_HANDLE_VALUE) CloseHandle(right_handle);
+    CloseHandle(left_handle);
+    return same;
+#else
+    struct stat left_status;
+    struct stat right_status;
+    return stat(left, &left_status) == 0 &&
+           stat(right, &right_status) == 0 &&
+           left_status.st_dev == right_status.st_dev &&
+           left_status.st_ino == right_status.st_ino;
+#endif
+}
+
 bool porpoise_path_contains_path(const char *parent, const char *child, bool *contains) {
+    char lexical_parent[PORPOISE_PATH_CAPACITY];
+    char lexical_child[PORPOISE_PATH_CAPACITY];
     char normalized_parent[PORPOISE_PATH_CAPACITY];
     char normalized_child[PORPOISE_PATH_CAPACITY];
     if (contains == NULL) return false;
     *contains = false;
-    if (!porpoise_absolute_normalized_path(normalized_parent, sizeof(normalized_parent), parent) ||
+    if (!porpoise_path_normalize_lexical(
+            lexical_parent, sizeof(lexical_parent), parent) ||
+        !porpoise_path_normalize_lexical(
+            lexical_child, sizeof(lexical_child), child) ||
+        !porpoise_absolute_normalized_path(normalized_parent, sizeof(normalized_parent), parent) ||
         !porpoise_absolute_normalized_path(normalized_child, sizeof(normalized_child), child)) return false;
-    *contains = porpoise_path_contains(normalized_parent, normalized_child);
+    *contains = porpoise_path_contains(lexical_parent, lexical_child) ||
+                porpoise_path_contains(normalized_parent, normalized_child) ||
+                porpoise_existing_paths_same_object(parent, child);
     return true;
 }
 
 bool porpoise_path_trees_overlap(const char *left, const char *right, bool *overlap) {
+    char lexical_left[PORPOISE_PATH_CAPACITY];
+    char lexical_right[PORPOISE_PATH_CAPACITY];
     char normalized_left[PORPOISE_PATH_CAPACITY];
     char normalized_right[PORPOISE_PATH_CAPACITY];
     if (overlap == NULL) return false;
     *overlap = false;
-    if (!porpoise_absolute_normalized_path(normalized_left, sizeof(normalized_left), left) ||
+    if (!porpoise_path_normalize_lexical(
+            lexical_left, sizeof(lexical_left), left) ||
+        !porpoise_path_normalize_lexical(
+            lexical_right, sizeof(lexical_right), right) ||
+        !porpoise_absolute_normalized_path(normalized_left, sizeof(normalized_left), left) ||
         !porpoise_absolute_normalized_path(normalized_right, sizeof(normalized_right), right)) return false;
-    *overlap = porpoise_path_contains(normalized_left, normalized_right) ||
-               porpoise_path_contains(normalized_right, normalized_left);
+    *overlap = porpoise_path_contains(lexical_left, lexical_right) ||
+               porpoise_path_contains(lexical_right, lexical_left) ||
+               porpoise_path_contains(normalized_left, normalized_right) ||
+               porpoise_path_contains(normalized_right, normalized_left) ||
+               porpoise_existing_paths_same_object(left, right);
     return true;
 }
 

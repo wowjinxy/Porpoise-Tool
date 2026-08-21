@@ -81,6 +81,245 @@ static int dtk_diagnostic(
     return result;
 }
 
+typedef enum DtkExecutableSelection {
+    DTK_EXECUTABLE_EXPLICIT = 0,
+    DTK_EXECUTABLE_ENVIRONMENT,
+    DTK_EXECUTABLE_PATH
+} DtkExecutableSelection;
+
+static bool dtk_selection_has_path(const char *selection) {
+    if (selection == NULL) return false;
+#ifdef _WIN32
+    return strchr(selection, '/') != NULL ||
+           strchr(selection, '\\') != NULL ||
+           (isalpha((unsigned char)selection[0]) && selection[1] == ':');
+#else
+    return strchr(selection, '/') != NULL;
+#endif
+}
+
+static bool dtk_canonical_executable(
+    const char *candidate,
+    bool require_execute_permission,
+    char resolved[PORPOISE_PATH_CAPACITY]) {
+#ifdef _WIN32
+    DWORD attributes;
+    HANDLE handle;
+    DWORD length;
+    (void)require_execute_permission;
+    attributes = GetFileAttributesA(candidate);
+    if (attributes == INVALID_FILE_ATTRIBUTES ||
+        (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0U) {
+        return false;
+    }
+    handle = CreateFileA(
+        candidate, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, 0U, NULL);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    length = GetFinalPathNameByHandleA(
+        handle, resolved, PORPOISE_PATH_CAPACITY, FILE_NAME_NORMALIZED);
+    CloseHandle(handle);
+    if (length == 0U || length >= PORPOISE_PATH_CAPACITY) return false;
+    if (length >= 8U && strncmp(resolved, "\\\\?\\UNC\\", 8U) == 0) {
+        size_t remainder = (size_t)length - 8U;
+        if (remainder + 3U > PORPOISE_PATH_CAPACITY) return false;
+        memmove(resolved + 2U, resolved + 8U, remainder + 1U);
+        resolved[0] = '\\';
+        resolved[1] = '\\';
+    } else if (length >= 4U && strncmp(resolved, "\\\\?\\", 4U) == 0) {
+        memmove(resolved, resolved + 4U, (size_t)length - 3U);
+    }
+    return true;
+#else
+    struct stat status;
+    if (realpath(candidate, resolved) == NULL ||
+        stat(resolved, &status) != 0 || !S_ISREG(status.st_mode)) {
+        return false;
+    }
+    return !require_execute_permission || access(resolved, X_OK) == 0;
+#endif
+}
+
+static bool dtk_try_path_entry(
+    const char *directory,
+    const char *name,
+    bool require_execute_permission,
+    char resolved[PORPOISE_PATH_CAPACITY]) {
+    char candidate[PORPOISE_PATH_CAPACITY];
+    if (!porpoise_path_join(
+            candidate, sizeof(candidate), directory, name)) {
+        return false;
+    }
+    return dtk_canonical_executable(
+        candidate, require_execute_permission, resolved);
+}
+
+#ifdef _WIN32
+static bool dtk_valid_pathext(
+    const char *extension,
+    size_t length) {
+    size_t index;
+    if (length < 2U || length >= 32U || extension[0] != '.') return false;
+    for (index = 1U; index < length; index++) {
+        unsigned char character = (unsigned char)extension[index];
+        if (!(isalnum(character) || character == '_' || character == '-' ||
+              character == '.')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool dtk_try_windows_extensions(
+    const char *directory,
+    const char *command,
+    const char *extensions,
+    bool require_execute_permission,
+    char resolved[PORPOISE_PATH_CAPACITY]) {
+    const char *cursor = extensions;
+    while (cursor != NULL && *cursor != '\0') {
+        const char *separator = strchr(cursor, ';');
+        size_t length = separator == NULL ?
+            strlen(cursor) : (size_t)(separator - cursor);
+        if (dtk_valid_pathext(cursor, length)) {
+            char name[PORPOISE_NAME_CAPACITY];
+            size_t command_length = strlen(command);
+            if (command_length + length < sizeof(name)) {
+                memcpy(name, command, command_length);
+                memcpy(name + command_length, cursor, length);
+                name[command_length + length] = '\0';
+                if (dtk_try_path_entry(
+                        directory, name, require_execute_permission,
+                        resolved)) {
+                    return true;
+                }
+            }
+        }
+        if (separator == NULL) break;
+        cursor = separator + 1U;
+    }
+    return false;
+}
+#endif
+
+static bool dtk_try_command_in_directory(
+    const char *directory,
+    const char *command,
+    bool require_execute_permission,
+    char resolved[PORPOISE_PATH_CAPACITY]) {
+    if (dtk_try_path_entry(
+            directory, command, require_execute_permission, resolved)) {
+        return true;
+    }
+#ifdef _WIN32
+    if (strchr(command, '.') == NULL) {
+        const char *extensions = getenv("PATHEXT");
+        if (extensions != NULL && extensions[0] != '\0' &&
+            dtk_try_windows_extensions(
+                directory, command, extensions, require_execute_permission,
+                resolved)) {
+            return true;
+        }
+        return dtk_try_windows_extensions(
+            directory, command, ".COM;.EXE", require_execute_permission,
+            resolved);
+    }
+#endif
+    return false;
+}
+
+static bool dtk_search_path(
+    const char *command,
+    bool require_execute_permission,
+    char resolved[PORPOISE_PATH_CAPACITY]) {
+    const char *path = getenv("PATH");
+    const char *cursor;
+#ifdef _WIN32
+    const char separator_character = ';';
+#else
+    const char separator_character = ':';
+#endif
+    if (path == NULL) return false;
+    cursor = path;
+    for (;;) {
+        const char *separator = strchr(cursor, separator_character);
+        const char *start = cursor;
+        size_t length = separator == NULL ?
+            strlen(cursor) : (size_t)(separator - cursor);
+        char directory[PORPOISE_PATH_CAPACITY];
+#ifdef _WIN32
+        if (length >= 2U && start[0] == '"' && start[length - 1U] == '"') {
+            start++;
+            length -= 2U;
+        }
+#endif
+        if (length == 0U) {
+            if (dtk_try_command_in_directory(
+                    ".", command, require_execute_permission, resolved)) {
+                return true;
+            }
+        } else if (length < sizeof(directory)) {
+            memcpy(directory, start, length);
+            directory[length] = '\0';
+            if (dtk_try_command_in_directory(
+                    directory, command, require_execute_permission,
+                    resolved)) {
+                return true;
+            }
+        }
+        if (separator == NULL) break;
+        cursor = separator + 1U;
+    }
+    return false;
+}
+
+static int dtk_resolve_executable(
+    const char *explicit_path,
+    bool require_execute_permission,
+    char resolved[PORPOISE_PATH_CAPACITY],
+    PorpoiseDiagnostics *diagnostics) {
+    const char *selection = explicit_path;
+    DtkExecutableSelection source = DTK_EXECUTABLE_EXPLICIT;
+    bool found;
+    if (selection == NULL || selection[0] == '\0') {
+        selection = getenv("PORPOISE_DTK");
+        source = DTK_EXECUTABLE_ENVIRONMENT;
+    }
+    if (selection == NULL || selection[0] == '\0') {
+        selection = "dtk";
+        source = DTK_EXECUTABLE_PATH;
+    }
+    if (dtk_selection_has_path(selection)) {
+        found = dtk_canonical_executable(
+            selection, require_execute_permission, resolved);
+    } else {
+        found = dtk_search_path(
+            selection, require_execute_permission, resolved);
+    }
+    if (found) return PORPOISE_EXIT_OK;
+    if (source == DTK_EXECUTABLE_EXPLICIT) {
+        return dtk_diagnostic(
+            diagnostics, PORPOISE_SEVERITY_ERROR, PORPOISE_EXIT_USAGE,
+            selection,
+            "explicit DTK selection '%s' did not resolve to an executable file; "
+            "PORPOISE_DTK and the default dtk fallback were not used",
+            selection);
+    }
+    if (source == DTK_EXECUTABLE_ENVIRONMENT) {
+        return dtk_diagnostic(
+            diagnostics, PORPOISE_SEVERITY_ERROR, PORPOISE_EXIT_USAGE,
+            selection,
+            "PORPOISE_DTK selects '%s', but it did not resolve to an executable "
+            "file; the default dtk PATH fallback was not used",
+            selection);
+    }
+    return dtk_diagnostic(
+        diagnostics, PORPOISE_SEVERITY_ERROR, PORPOISE_EXIT_USAGE,
+        selection,
+        "cannot find DTK executable 'dtk' on PATH; use --dtk FILE, set "
+        "PORPOISE_DTK, or add DTK to PATH");
+}
+
 void porpoise_dtk_process_result_init(PorpoiseDtkProcessResult *result) {
     if (result != NULL) memset(result, 0, sizeof(*result));
 }
@@ -877,7 +1116,33 @@ static int dtk_hash_tree(
 
 static bool dtk_has_asm_extension(const char *path) {
     size_t length = strlen(path);
-    return length >= 2U && path[length - 2U] == '.' && path[length - 1U] == 's';
+    return length >= 2U && path[length - 2U] == '.' &&
+           (path[length - 1U] == 's' || path[length - 1U] == 'S');
+}
+
+static bool dtk_link_order_assembly_path(
+    const char *path,
+    char *output,
+    size_t output_size) {
+    static const char prefix[] = "asm/";
+    size_t length = strlen(path);
+    size_t prefix_length = sizeof(prefix) - 1U;
+    if (dtk_has_asm_extension(path)) {
+        if (length + 1U > output_size) return false;
+        memcpy(output, path, length + 1U);
+        return true;
+    }
+    if (length < 2U || path[length - 2U] != '.' ||
+        path[length - 1U] != 'o' ||
+        prefix_length > SIZE_MAX - length ||
+        prefix_length + length >= output_size) {
+        return false;
+    }
+    memcpy(output, prefix, prefix_length);
+    memcpy(output + prefix_length, path, length - 1U);
+    output[prefix_length + length - 1U] = 's';
+    output[prefix_length + length] = '\0';
+    return true;
 }
 
 static const DtkTreeEntry *dtk_tree_find(
@@ -924,6 +1189,7 @@ static int dtk_validate_link_order(
     }
     while (fgets(line, sizeof(line), file) != NULL) {
         char normalized[PORPOISE_PATH_CAPACITY];
+        char assembly_path[PORPOISE_PATH_CAPACITY];
         size_t index;
         const DtkTreeEntry *entry;
         line_number++;
@@ -947,7 +1213,17 @@ static int dtk_validate_link_order(
                 "link_order.txt line %lu contains an unsafe path",
                 (unsigned long)line_number);
         }
-        entry = dtk_tree_find(tree, normalized);
+        if (!dtk_link_order_assembly_path(
+                normalized, assembly_path, sizeof(assembly_path))) {
+            fclose(file);
+            free(listed);
+            return dtk_diagnostic(
+                diagnostics, PORPOISE_SEVERITY_ERROR, PORPOISE_EXIT_USAGE,
+                order->full_path,
+                "link_order.txt line %lu is not a DTK object or assembly path",
+                (unsigned long)line_number);
+        }
+        entry = dtk_tree_find(tree, assembly_path);
         if (entry == NULL || entry->directory ||
             !dtk_has_asm_extension(entry->relative_path)) {
             fclose(file);
@@ -1171,6 +1447,45 @@ static bool dtk_version_at_least(
     return patch >= options->minimum_dtk_patch;
 }
 
+static bool dtk_product_identifies_dtk(const char *product) {
+    size_t length = strlen(product);
+    size_t index;
+    if (length >= 4U &&
+        dtk_ascii_equal_ignore_case(product + length - 4U, ".exe")) {
+        length -= 4U;
+    }
+    if (length == 3U) {
+        return (product[0] == 'd' || product[0] == 'D') &&
+               (product[1] == 't' || product[1] == 'T') &&
+               (product[2] == 'k' || product[2] == 'K');
+    }
+    if (length < 5U ||
+        !(product[0] == 'd' || product[0] == 'D') ||
+        !(product[1] == 't' || product[1] == 'T') ||
+        !(product[2] == 'k' || product[2] == 'K') ||
+        product[3] != '-') {
+        return false;
+    }
+    for (index = 4U; index < length; index++) {
+        unsigned char character = (unsigned char)product[index];
+        bool alphanumeric =
+            (character >= 'a' && character <= 'z') ||
+            (character >= 'A' && character <= 'Z') ||
+            (character >= '0' && character <= '9');
+        if (alphanumeric) continue;
+        if ((character == '-' || character == '_') &&
+            index != 4U && index + 1U != length) {
+            continue;
+        }
+        if (character == '.' && index != 4U && index + 1U != length &&
+            product[index - 1U] != '.' && product[index + 1U] != '.') {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 static int dtk_parse_version(
     const char *output,
     const PorpoiseDtkImportOptions *options,
@@ -1214,8 +1529,7 @@ static int dtk_parse_version(
         product[product_length++] = *cursor++;
     }
     product[product_length] = '\0';
-    if (!(dtk_ascii_equal_ignore_case(product, "dtk") ||
-          dtk_ascii_equal_ignore_case(product, "dtk.exe"))) {
+    if (!dtk_product_identifies_dtk(product)) {
         return dtk_diagnostic(
             diagnostics, PORPOISE_SEVERITY_ERROR, PORPOISE_EXIT_USAGE,
             options->dtk_path, "tool version output does not identify DTK");
@@ -2134,7 +2448,16 @@ int porpoise_dtk_import_run(
             diagnostics, PORPOISE_SEVERITY_ERROR, PORPOISE_EXIT_USAGE,
             options->input_path, "unknown DTK import source kind");
     }
-    return dtk_import_managed(options, result, diagnostics);
+    {
+        PorpoiseDtkImportOptions resolved_options = *options;
+        char resolved_dtk_path[PORPOISE_PATH_CAPACITY];
+        int resolve_result = dtk_resolve_executable(
+            options->dtk_path, options->runner == NULL,
+            resolved_dtk_path, diagnostics);
+        if (resolve_result != PORPOISE_EXIT_OK) return resolve_result;
+        resolved_options.dtk_path = resolved_dtk_path;
+        return dtk_import_managed(&resolved_options, result, diagnostics);
+    }
 }
 
 int porpoise_dtk_validate_prepared(

@@ -1,4 +1,5 @@
 #include "porpoise/recovery_annotation.h"
+#include "porpoise/signature.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -234,6 +235,76 @@ int porpoise_recovery_byte_view_extract(
     porpoise_recovery_byte_view_free(view);
     *view = candidate;
     return PORPOISE_EXIT_OK;
+}
+
+static const PorpoiseFunction *exact_code_function(
+    const PorpoiseProgram *program,
+    uint32_t address,
+    uint32_t size) {
+    size_t file_index;
+    for (file_index = 0U; file_index < program->file_count; file_index++) {
+        const PorpoiseSourceFile *file = &program->files[file_index];
+        size_t function_index;
+        for (function_index = 0U;
+             function_index < file->function_count;
+             function_index++) {
+            const PorpoiseFunction *function =
+                &file->functions[function_index];
+            if (!function->data_region &&
+                function->start_address == address &&
+                function->size == size) {
+                return function;
+            }
+        }
+    }
+    return NULL;
+}
+
+static int normalized_fingerprint_from_view(
+    const PorpoiseProgram *program,
+    uint32_t address,
+    uint32_t size,
+    const PorpoiseRecoveryByteView *byte_view,
+    char output[PORPOISE_SHA256_HEX_SIZE],
+    PorpoiseDiagnostics *diagnostics) {
+    const PorpoiseFunction *function =
+        exact_code_function(program, address, size);
+    if (function != NULL) {
+        PorpoiseFunctionSignature signature;
+        if (!porpoise_signature_compute(program, function, &signature)) {
+            return annotation_error(
+                diagnostics, PORPOISE_EXIT_TRANSLATION, NULL, address,
+                "could not recompute the annotation's normalized code fingerprint");
+        }
+        memcpy(output, signature.digest_hex, sizeof(signature.digest_hex));
+    } else {
+        uint8_t digest[PORPOISE_SHA256_DIGEST_SIZE];
+        porpoise_sha256(byte_view->bytes, byte_view->size, digest);
+        porpoise_sha256_hex(digest, output);
+    }
+    return PORPOISE_EXIT_OK;
+}
+
+int porpoise_recovery_normalized_fingerprint_compute(
+    const PorpoiseProgram *program,
+    uint32_t address,
+    uint32_t size,
+    char output[PORPOISE_SHA256_HEX_SIZE],
+    PorpoiseDiagnostics *diagnostics) {
+    PorpoiseRecoveryByteView byte_view;
+    int result;
+    if (program == NULL || output == NULL || diagnostics == NULL) {
+        return PORPOISE_EXIT_INTERNAL;
+    }
+    porpoise_recovery_byte_view_init(&byte_view);
+    result = porpoise_recovery_byte_view_extract(
+        program, address, size, &byte_view, diagnostics);
+    if (result == PORPOISE_EXIT_OK) {
+        result = normalized_fingerprint_from_view(
+            program, address, size, &byte_view, output, diagnostics);
+    }
+    porpoise_recovery_byte_view_free(&byte_view);
+    return result;
 }
 
 static bool encoding_equals(const char *encoding, const char *expected) {
@@ -591,6 +662,22 @@ int porpoise_recovery_annotation_view_open(
     porpoise_sha256(
         candidate.byte_view.bytes, candidate.byte_view.size, digest);
     porpoise_sha256_hex(digest, candidate.exact_bytes_sha256);
+    result = normalized_fingerprint_from_view(
+        program, annotation->address, annotation->size,
+        &candidate.byte_view, candidate.normalized_fingerprint,
+        diagnostics);
+    if (result != PORPOISE_EXIT_OK) {
+        porpoise_recovery_annotation_view_free(&candidate);
+        return result;
+    }
+    if (strcmp(candidate.normalized_fingerprint,
+               annotation->normalized_fingerprint) != 0) {
+        porpoise_recovery_annotation_view_free(&candidate);
+        return annotation_error(
+            diagnostics, PORPOISE_EXIT_TRANSLATION, annotation->target,
+            annotation->address,
+            "annotation normalized fingerprint is stale for the current Program code or data");
+    }
     if (strcmp(candidate.exact_bytes_sha256,
                annotation->exact_bytes_sha256) != 0) {
         porpoise_recovery_annotation_view_free(&candidate);

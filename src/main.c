@@ -10,28 +10,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#ifndef PORPOISE_RUNTIME_DIR
-#define PORPOISE_RUNTIME_DIR "runtime"
-#endif
-#ifndef PORPOISE_INSTALLED_RUNTIME_DIR
-#define PORPOISE_INSTALLED_RUNTIME_DIR "runtime"
-#endif
-
-static const char *select_runtime_directory(void) {
-    const char *candidates[] = {
-        PORPOISE_RUNTIME_DIR,
-        PORPOISE_INSTALLED_RUNTIME_DIR
-    };
-    char probe[PORPOISE_PATH_CAPACITY];
-    size_t index;
-    for (index = 0U; index < sizeof(candidates) / sizeof(candidates[0]); index++) {
-        if (porpoise_path_join(probe, sizeof(probe), candidates[index],
-                               "include/porpoise_lifted.h") &&
-            porpoise_path_exists(probe)) return candidates[index];
-    }
-    return PORPOISE_RUNTIME_DIR;
-}
-
 static void print_diagnostics(
     const PorpoiseDiagnostics *diagnostics,
     PorpoiseVerbosity verbosity) {
@@ -101,9 +79,12 @@ static int run_project_mode(
     run_options.target_id_count = options->target_id_count;
     run_options.analyze_only = options->analyze_only;
     run_options.force = options->force;
+    run_options.persist_refreshed_caches = true;
     run_options.report_path = options->report_path[0] == '\0'
         ? NULL : options->report_path;
-    run_options.runtime_directory = select_runtime_directory();
+    run_options.runtime_directory = porpoise_default_runtime_directory();
+    run_options.dtk_path = options->dtk_path[0] == '\0'
+        ? NULL : options->dtk_path;
     run_options.operation = &operation;
     result = porpoise_recovery_project_run(
         &project, &run_options, &run_result, diagnostics);
@@ -260,7 +241,7 @@ int main(int argc, char **argv) {
     if (result == PORPOISE_EXIT_OK) {
         porpoise_project_options_init(&project_options);
         project_options.output_path = options.output_path;
-        project_options.runtime_directory = select_runtime_directory();
+        project_options.runtime_directory = porpoise_default_runtime_directory();
         project_options.entry_symbol = options.entry_symbol;
         project_options.force = options.force;
         project_options.strict = options.strict;

@@ -81,6 +81,19 @@ int porpoise_recovery_target_cache_validate(
     PorpoiseDiagnostics *diagnostics);
 
 /*
+ * Compare the cache's exact SDK match records with a validated plan without
+ * mutating either object. This is intentionally separate from input/cache
+ * validation so a runner can validate dependencies before planning and then
+ * confirm the exact match set afterward. A runner may separately pass records
+ * from a validated cache hit to planning as non-authoritative match hints.
+ */
+int porpoise_recovery_target_cache_matches_plan(
+    const PorpoiseRecoveryTarget *target,
+    const PorpoiseTranslationPlan *plan,
+    bool *matches_out,
+    PorpoiseDiagnostics *diagnostics);
+
+/*
  * Validate session/plan coherence, measure all current dependencies, retain
  * only exact SDK identities, and transactionally replace target->cache. The
  * previous cache is unchanged on cancellation or failure.
