@@ -1,0 +1,6 @@
+.text section layout
+  Starting        Virtual
+  address  Size   address
+  -----------------------
+  00000000 not_hex 80001000 4 Broken object.o
+

@@ -18,11 +18,22 @@
 
 typedef struct CliValues {
     PorpoiseOptions values;
+    bool project_seen;
+    bool dtk_seen;
+    bool target_seen;
+    bool analyze_only_seen;
+    bool report_seen;
     bool input_seen;
     bool output_seen;
     bool config_seen;
     bool abi_seen;
     bool skip_list_seen;
+    bool map_seen;
+    bool dtk_symbols_seen;
+    bool dtk_splits_seen;
+    bool sdk_catalog_seen;
+    bool sdk_policy_seen;
+    bool module_seen;
     bool entry_seen;
     bool force_seen;
     bool strict_seen;
@@ -35,7 +46,13 @@ typedef enum ConfigKeyFlag {
     CONFIG_KEY_SKIP_LIST = 1U << 2,
     CONFIG_KEY_ENTRY = 1U << 3,
     CONFIG_KEY_STRICT = 1U << 4,
-    CONFIG_KEY_VERBOSITY = 1U << 5
+    CONFIG_KEY_VERBOSITY = 1U << 5,
+    CONFIG_KEY_MAP = 1U << 6,
+    CONFIG_KEY_DTK_SYMBOLS = 1U << 7,
+    CONFIG_KEY_DTK_SPLITS = 1U << 8,
+    CONFIG_KEY_SDK_CATALOG = 1U << 9,
+    CONFIG_KEY_SDK_POLICY = 1U << 10,
+    CONFIG_KEY_MODULE = 1U << 11
 } ConfigKeyFlag;
 
 static PorpoiseExitCode option_error(FILE *stream, const char *format, ...) {
@@ -100,6 +117,22 @@ void porpoise_options_init(PorpoiseOptions *options) {
     }
     memset(options, 0, sizeof(*options));
     options->verbosity = PORPOISE_VERBOSITY_NORMAL;
+    options->sdk_policy = PORPOISE_SDK_POLICY_KEEP;
+}
+
+static bool parse_sdk_policy(
+    const char *value,
+    PorpoiseSdkPolicy *policy_out) {
+    if (strcmp(value, "keep") == 0) {
+        *policy_out = PORPOISE_SDK_POLICY_KEEP;
+    } else if (strcmp(value, "imported") == 0) {
+        *policy_out = PORPOISE_SDK_POLICY_IMPORTED;
+    } else if (strcmp(value, "omit") == 0) {
+        *policy_out = PORPOISE_SDK_POLICY_OMIT;
+    } else {
+        return false;
+    }
+    return true;
 }
 
 void porpoise_options_print_help(FILE *stream, const char *program_name) {
@@ -114,18 +147,31 @@ void porpoise_options_print_help(FILE *stream, const char *program_name) {
 
     fprintf(stream,
             "Usage: %s INPUT --output DIR [OPTIONS]\n"
+            "       %s --project FILE [PROJECT OPTIONS]\n"
             "\n"
             "Translate one annotated PowerPC assembly file, or all .s files\n"
             "beneath an input directory, into a libPorpoise-backed C project.\n"
+            "Project mode processes every enabled target unless --target is used.\n"
             "\n"
             "Required:\n"
             "  INPUT                 Assembly file or directory to translate\n"
             "  --output DIR          Destination directory (must be empty)\n"
             "\n"
             "Options:\n"
+            "  --project FILE        Load a schema-version 1 .porpoise.json project\n"
+            "  --dtk FILE            DTK executable for managed ELF imports\n"
+            "  --target ID           Select a project target (repeatable, max %u)\n"
+            "  --analyze-only        Build and validate plans without generation\n"
+            "  --report FILE         Write the project-mode aggregate report\n"
             "  --config FILE         Load an explicit schema-version 1 JSON config\n"
             "  --abi FILE            ABI manifest for typed external calls\n"
             "  --skip-list FILE      List of functions not to translate\n"
+            "  --map FILE            Optional CodeWarrior DOL/REL map\n"
+            "  --dtk-symbols FILE    Optional DTK symbols.txt\n"
+            "  --dtk-splits FILE     DTK splits.txt paired with --dtk-symbols\n"
+            "  --sdk-catalog FILE    Add an exact local SDK signature catalog\n"
+            "  --sdk-policy POLICY   keep (default), imported, or omit\n"
+            "  --module NAME         Module identity used for map evidence\n"
             "  --entry SYMBOL        Lifted entry point used by DolphinMain\n"
             "  --force               Replace a nonempty destination atomically\n"
             "  --strict              Reject approximate instruction lowerings\n"
@@ -135,10 +181,11 @@ void porpoise_options_print_help(FILE *stream, const char *program_name) {
             "  -V, --version         Show version information and exit\n"
             "\n"
             "Config keys: schema_version (required and equal to 1), abi,\n"
-            "skip_list, entry, strict, and verbosity. Config-relative file\n"
+            "skip_list, map, dtk_symbols, dtk_splits, sdk_catalog,\n"
+            "sdk_policy, module, entry, strict, and verbosity. Config-relative file\n"
             "paths are resolved beside the config file; CLI values override\n"
             "config values. --force is accepted only on the command line.\n",
-            name);
+            name, name, (unsigned int)PORPOISE_TARGET_SELECTOR_LIMIT);
 }
 
 void porpoise_options_print_version(FILE *stream) {
@@ -183,7 +230,67 @@ static PorpoiseExitCode parse_cli(CliValues *cli,
                                 "%s must be used by itself", argument);
         }
 
-        if (!positional_only && strcmp(argument, "--output") == 0) {
+        if (!positional_only && strcmp(argument, "--project") == 0) {
+            target = cli->values.project_path;
+            target_capacity = sizeof(cli->values.project_path);
+            description = "project path";
+            seen = &cli->project_seen;
+        } else if (!positional_only && strcmp(argument, "--dtk") == 0) {
+            target = cli->values.dtk_path;
+            target_capacity = sizeof(cli->values.dtk_path);
+            description = "DTK executable path";
+            seen = &cli->dtk_seen;
+        } else if (!positional_only && strcmp(argument, "--target") == 0) {
+            size_t selector_index;
+            if (index + 1 >= argc) {
+                return option_error(
+                    error_stream, "option --target requires a value");
+            }
+            if (cli->values.target_id_count >=
+                PORPOISE_TARGET_SELECTOR_LIMIT) {
+                return option_error(
+                    error_stream,
+                    "option --target may be specified at most %u times",
+                    (unsigned int)PORPOISE_TARGET_SELECTOR_LIMIT);
+            }
+            index++;
+            for (selector_index = 0U;
+                 selector_index < cli->values.target_id_count;
+                 selector_index++) {
+                if (strcmp(
+                        cli->values.target_ids[selector_index],
+                        argv[index]) == 0) {
+                    return option_error(
+                        error_stream,
+                        "project target '%s' was selected more than once",
+                        argv[index]);
+                }
+            }
+            if (!copy_checked(
+                    cli->values.target_ids[cli->values.target_id_count],
+                    sizeof(cli->values.target_ids[0]), argv[index],
+                    "target selector", error_stream)) {
+                return PORPOISE_EXIT_USAGE;
+            }
+            cli->values.target_id_count++;
+            cli->target_seen = true;
+            continue;
+        } else if (!positional_only &&
+                   strcmp(argument, "--analyze-only") == 0) {
+            if (cli->analyze_only_seen) {
+                return option_error(
+                    error_stream,
+                    "option --analyze-only was specified more than once");
+            }
+            cli->analyze_only_seen = true;
+            cli->values.analyze_only = true;
+            continue;
+        } else if (!positional_only && strcmp(argument, "--report") == 0) {
+            target = cli->values.report_path;
+            target_capacity = sizeof(cli->values.report_path);
+            description = "report path";
+            seen = &cli->report_seen;
+        } else if (!positional_only && strcmp(argument, "--output") == 0) {
             target = cli->values.output_path;
             target_capacity = sizeof(cli->values.output_path);
             description = "output directory";
@@ -203,6 +310,54 @@ static PorpoiseExitCode parse_cli(CliValues *cli,
             target_capacity = sizeof(cli->values.skip_list_path);
             description = "skip-list path";
             seen = &cli->skip_list_seen;
+        } else if (!positional_only && strcmp(argument, "--map") == 0) {
+            target = cli->values.map_path;
+            target_capacity = sizeof(cli->values.map_path);
+            description = "CodeWarrior map path";
+            seen = &cli->map_seen;
+        } else if (!positional_only &&
+                   strcmp(argument, "--dtk-symbols") == 0) {
+            target = cli->values.dtk_symbols_path;
+            target_capacity = sizeof(cli->values.dtk_symbols_path);
+            description = "DTK symbols path";
+            seen = &cli->dtk_symbols_seen;
+        } else if (!positional_only &&
+                   strcmp(argument, "--dtk-splits") == 0) {
+            target = cli->values.dtk_splits_path;
+            target_capacity = sizeof(cli->values.dtk_splits_path);
+            description = "DTK splits path";
+            seen = &cli->dtk_splits_seen;
+        } else if (!positional_only &&
+                   strcmp(argument, "--sdk-catalog") == 0) {
+            target = cli->values.sdk_catalog_path;
+            target_capacity = sizeof(cli->values.sdk_catalog_path);
+            description = "SDK catalog path";
+            seen = &cli->sdk_catalog_seen;
+        } else if (!positional_only && strcmp(argument, "--module") == 0) {
+            target = cli->values.module;
+            target_capacity = sizeof(cli->values.module);
+            description = "module name";
+            seen = &cli->module_seen;
+        } else if (!positional_only &&
+                   strcmp(argument, "--sdk-policy") == 0) {
+            if (cli->sdk_policy_seen) {
+                return option_error(
+                    error_stream,
+                    "option --sdk-policy was specified more than once");
+            }
+            if (index + 1 >= argc) {
+                return option_error(
+                    error_stream, "option --sdk-policy requires a value");
+            }
+            cli->sdk_policy_seen = true;
+            index++;
+            if (!parse_sdk_policy(
+                    argv[index], &cli->values.sdk_policy)) {
+                return option_error(
+                    error_stream,
+                    "--sdk-policy must be 'keep', 'imported', or 'omit'");
+            }
+            continue;
         } else if (!positional_only && strcmp(argument, "--entry") == 0) {
             target = cli->values.entry_symbol;
             target_capacity = sizeof(cli->values.entry_symbol);
@@ -268,6 +423,81 @@ static PorpoiseExitCode parse_cli(CliValues *cli,
         }
     }
 
+    if (cli->project_seen) {
+        if (cli->input_seen) {
+            return option_error(
+                error_stream, "--project is mutually exclusive with INPUT");
+        }
+        if (cli->output_seen) {
+            return option_error(
+                error_stream, "--project is mutually exclusive with --output");
+        }
+        if (cli->config_seen) {
+            return option_error(
+                error_stream, "--project is mutually exclusive with --config");
+        }
+        if (cli->abi_seen) {
+            return option_error(
+                error_stream, "--project is mutually exclusive with --abi");
+        }
+        if (cli->skip_list_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --skip-list");
+        }
+        if (cli->map_seen) {
+            return option_error(
+                error_stream, "--project is mutually exclusive with --map");
+        }
+        if (cli->dtk_symbols_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --dtk-symbols");
+        }
+        if (cli->dtk_splits_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --dtk-splits");
+        }
+        if (cli->sdk_catalog_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --sdk-catalog");
+        }
+        if (cli->sdk_policy_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --sdk-policy");
+        }
+        if (cli->module_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --module");
+        }
+        if (cli->entry_seen) {
+            return option_error(
+                error_stream, "--project is mutually exclusive with --entry");
+        }
+        if (cli->strict_seen) {
+            return option_error(
+                error_stream,
+                "--project is mutually exclusive with --strict");
+        }
+        return PORPOISE_EXIT_SUCCESS;
+    }
+    if (cli->target_seen) {
+        return option_error(error_stream, "--target requires --project FILE");
+    }
+    if (cli->dtk_seen) {
+        return option_error(error_stream, "--dtk requires --project FILE");
+    }
+    if (cli->analyze_only_seen) {
+        return option_error(
+            error_stream, "--analyze-only requires --project FILE");
+    }
+    if (cli->report_seen) {
+        return option_error(error_stream, "--report requires --project FILE");
+    }
     if (!cli->input_seen) {
         return option_error(error_stream, "missing INPUT");
     }
@@ -843,6 +1073,18 @@ static PorpoiseExitCode parse_config(PorpoiseOptions *options,
             key_flag = CONFIG_KEY_STRICT;
         } else if (strcmp(key, "verbosity") == 0) {
             key_flag = CONFIG_KEY_VERBOSITY;
+        } else if (strcmp(key, "map") == 0) {
+            key_flag = CONFIG_KEY_MAP;
+        } else if (strcmp(key, "dtk_symbols") == 0) {
+            key_flag = CONFIG_KEY_DTK_SYMBOLS;
+        } else if (strcmp(key, "dtk_splits") == 0) {
+            key_flag = CONFIG_KEY_DTK_SPLITS;
+        } else if (strcmp(key, "sdk_catalog") == 0) {
+            key_flag = CONFIG_KEY_SDK_CATALOG;
+        } else if (strcmp(key, "sdk_policy") == 0) {
+            key_flag = CONFIG_KEY_SDK_POLICY;
+        } else if (strcmp(key, "module") == 0) {
+            key_flag = CONFIG_KEY_MODULE;
         } else {
             result = option_error(error_stream,
                                   "unknown key '%s' in config '%s'", key, path);
@@ -908,6 +1150,52 @@ static PorpoiseExitCode parse_config(PorpoiseOptions *options,
                     result = PORPOISE_EXIT_USAGE;
                     goto finished;
                 }
+            } else if (key_flag == CONFIG_KEY_MAP) {
+                if (!resolve_config_relative_path(
+                        path, decoded, options->map_path,
+                        sizeof(options->map_path), "CodeWarrior map path",
+                        error_stream)) {
+                    result = PORPOISE_EXIT_USAGE;
+                    goto finished;
+                }
+            } else if (key_flag == CONFIG_KEY_DTK_SYMBOLS) {
+                if (!resolve_config_relative_path(
+                        path, decoded, options->dtk_symbols_path,
+                        sizeof(options->dtk_symbols_path), "DTK symbols path",
+                        error_stream)) {
+                    result = PORPOISE_EXIT_USAGE;
+                    goto finished;
+                }
+            } else if (key_flag == CONFIG_KEY_DTK_SPLITS) {
+                if (!resolve_config_relative_path(
+                        path, decoded, options->dtk_splits_path,
+                        sizeof(options->dtk_splits_path), "DTK splits path",
+                        error_stream)) {
+                    result = PORPOISE_EXIT_USAGE;
+                    goto finished;
+                }
+            } else if (key_flag == CONFIG_KEY_SDK_CATALOG) {
+                if (!resolve_config_relative_path(
+                        path, decoded, options->sdk_catalog_path,
+                        sizeof(options->sdk_catalog_path), "SDK catalog path",
+                        error_stream)) {
+                    result = PORPOISE_EXIT_USAGE;
+                    goto finished;
+                }
+            } else if (key_flag == CONFIG_KEY_SDK_POLICY) {
+                if (!parse_sdk_policy(decoded, &options->sdk_policy)) {
+                    result = option_error(
+                        error_stream,
+                        "config key 'sdk_policy' must be 'keep', 'imported', or 'omit'");
+                    goto finished;
+                }
+            } else if (key_flag == CONFIG_KEY_MODULE) {
+                if (!copy_checked(
+                        options->module, sizeof(options->module), decoded,
+                        "module name", error_stream)) {
+                    result = PORPOISE_EXIT_USAGE;
+                    goto finished;
+                }
             } else {
                 if (strcmp(decoded, "quiet") == 0) {
                     options->verbosity = PORPOISE_VERBOSITY_QUIET;
@@ -929,6 +1217,13 @@ static PorpoiseExitCode parse_config(PorpoiseOptions *options,
         result = option_error(error_stream,
                               "config '%s' is missing required schema_version",
                               path);
+        goto finished;
+    }
+    if ((seen_keys & CONFIG_KEY_DTK_SPLITS) != 0U &&
+        (seen_keys & CONFIG_KEY_DTK_SYMBOLS) == 0U) {
+        result = option_error(
+            error_stream,
+            "config key 'dtk_splits' requires 'dtk_symbols'");
         goto finished;
     }
     result = PORPOISE_EXIT_SUCCESS;
@@ -972,6 +1267,10 @@ PorpoiseExitCode porpoise_options_parse(PorpoiseOptions *options,
         *options = cli.values;
         return PORPOISE_EXIT_SUCCESS;
     }
+    if (cli.project_seen) {
+        *options = cli.values;
+        return PORPOISE_EXIT_SUCCESS;
+    }
 
     porpoise_options_init(&parsed);
     if (cli.config_seen) {
@@ -996,6 +1295,26 @@ PorpoiseExitCode porpoise_options_parse(PorpoiseOptions *options,
         memcpy(parsed.skip_list_path, cli.values.skip_list_path,
                sizeof(parsed.skip_list_path));
     }
+    if (cli.map_seen) {
+        memcpy(parsed.map_path, cli.values.map_path,
+               sizeof(parsed.map_path));
+    }
+    if (cli.dtk_symbols_seen) {
+        memcpy(parsed.dtk_symbols_path, cli.values.dtk_symbols_path,
+               sizeof(parsed.dtk_symbols_path));
+    }
+    if (cli.dtk_splits_seen) {
+        memcpy(parsed.dtk_splits_path, cli.values.dtk_splits_path,
+               sizeof(parsed.dtk_splits_path));
+    }
+    if (cli.sdk_catalog_seen) {
+        memcpy(parsed.sdk_catalog_path, cli.values.sdk_catalog_path,
+               sizeof(parsed.sdk_catalog_path));
+    }
+    if (cli.module_seen) {
+        memcpy(parsed.module, cli.values.module, sizeof(parsed.module));
+    }
+    if (cli.sdk_policy_seen) parsed.sdk_policy = cli.values.sdk_policy;
     if (cli.entry_seen) {
         memcpy(parsed.entry_symbol, cli.values.entry_symbol,
                sizeof(parsed.entry_symbol));
@@ -1007,6 +1326,13 @@ PorpoiseExitCode porpoise_options_parse(PorpoiseOptions *options,
         parsed.verbosity = cli.values.verbosity;
     }
     parsed.force = cli.values.force;
+
+    if (parsed.dtk_splits_path[0] != '\0' &&
+        parsed.dtk_symbols_path[0] == '\0') {
+        return option_error(
+            error_stream,
+            "--dtk-splits requires --dtk-symbols");
+    }
 
     *options = parsed;
     return PORPOISE_EXIT_SUCCESS;

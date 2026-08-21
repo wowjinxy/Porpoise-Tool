@@ -1,0 +1,6 @@
+first.c:
+	.text start:0x00000100 end:0x00000180
+
+second.c:
+	.text start:0x00000140 end:0x00000200
+

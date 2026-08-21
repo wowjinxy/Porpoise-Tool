@@ -2170,6 +2170,194 @@ finished:
     return result;
 }
 
+static bool abi_nullable_string_equal(const char *left, const char *right) {
+    if (left == NULL || right == NULL) return left == right;
+    return strcmp(left, right) == 0;
+}
+
+static bool abi_value_equal(
+    const PorpoiseAbiValue *left,
+    const PorpoiseAbiValue *right) {
+    return left->type == right->type &&
+           left->register_class == right->register_class &&
+           left->register_index == right->register_index &&
+           abi_nullable_string_equal(left->name, right->name);
+}
+
+static bool abi_function_equal(
+    const PorpoiseAbiFunction *left,
+    const PorpoiseAbiFunction *right) {
+    size_t index;
+    if (left->kind != right->kind ||
+        !abi_nullable_string_equal(left->symbol, right->symbol) ||
+        !abi_nullable_string_equal(left->wrapper, right->wrapper) ||
+        !abi_nullable_string_equal(left->header, right->header) ||
+        !abi_nullable_string_equal(left->adapter, right->adapter) ||
+        !abi_value_equal(&left->result, &right->result) ||
+        left->argument_count != right->argument_count) {
+        return false;
+    }
+    for (index = 0U; index < left->argument_count; index++) {
+        if (!abi_value_equal(
+                &left->arguments[index], &right->arguments[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool abi_clone_value(
+    PorpoiseAbiValue *destination,
+    const PorpoiseAbiValue *source) {
+    *destination = *source;
+    destination->name = NULL;
+    if (source->name != NULL) {
+        destination->name = abi_duplicate_string(source->name);
+        if (destination->name == NULL) return false;
+    }
+    return true;
+}
+
+static bool abi_clone_function(
+    PorpoiseAbiFunction *destination,
+    const PorpoiseAbiFunction *source) {
+    size_t index;
+    memset(destination, 0, sizeof(*destination));
+    destination->kind = source->kind;
+    destination->symbol = source->symbol == NULL
+        ? NULL : abi_duplicate_string(source->symbol);
+    destination->wrapper = source->wrapper == NULL
+        ? NULL : abi_duplicate_string(source->wrapper);
+    destination->header = source->header == NULL
+        ? NULL : abi_duplicate_string(source->header);
+    destination->adapter = source->adapter == NULL
+        ? NULL : abi_duplicate_string(source->adapter);
+    if ((source->symbol != NULL && destination->symbol == NULL) ||
+        (source->wrapper != NULL && destination->wrapper == NULL) ||
+        (source->header != NULL && destination->header == NULL) ||
+        (source->adapter != NULL && destination->adapter == NULL) ||
+        !abi_clone_value(&destination->result, &source->result)) {
+        return false;
+    }
+    destination->argument_count = source->argument_count;
+    if (source->argument_count == 0U) return true;
+    if (source->argument_count > SIZE_MAX / sizeof(*destination->arguments)) {
+        return false;
+    }
+    destination->arguments = (PorpoiseAbiValue *)calloc(
+        source->argument_count, sizeof(*destination->arguments));
+    if (destination->arguments == NULL) return false;
+    for (index = 0U; index < source->argument_count; index++) {
+        if (!abi_clone_value(
+                &destination->arguments[index], &source->arguments[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int porpoise_abi_merge(
+    PorpoiseAbiManifest *destination,
+    const PorpoiseAbiManifest *source,
+    const char *source_identity,
+    PorpoiseDiagnostics *diagnostics) {
+    PorpoiseAbiManifest merged;
+    size_t source_index;
+    size_t capacity;
+    if (destination == NULL || source == NULL) {
+        (void)abi_add_file_diagnostic(
+            diagnostics, source_identity == NULL ? "" : source_identity,
+            "internal error: invalid ABI merge arguments");
+        return PORPOISE_EXIT_INTERNAL;
+    }
+    if (destination->function_count >
+        SIZE_MAX - source->function_count) {
+        return PORPOISE_EXIT_INTERNAL;
+    }
+    capacity = destination->function_count + source->function_count;
+    porpoise_abi_init(&merged);
+    if (capacity != 0U) {
+        merged.functions = (PorpoiseAbiFunction *)calloc(
+            capacity, sizeof(*merged.functions));
+        if (merged.functions == NULL) return PORPOISE_EXIT_INTERNAL;
+    }
+    for (source_index = 0U;
+         source_index < destination->function_count;
+         source_index++) {
+        PorpoiseAbiFunction *slot =
+            &merged.functions[merged.function_count++];
+        if (!abi_clone_function(
+                slot,
+                &destination->functions[source_index])) {
+            porpoise_abi_free(&merged);
+            (void)abi_add_file_diagnostic(
+                diagnostics,
+                source_identity == NULL ? "" : source_identity,
+                "out of memory while merging ABI contracts");
+            return PORPOISE_EXIT_INTERNAL;
+        }
+    }
+    for (source_index = 0U;
+         source_index < source->function_count;
+         source_index++) {
+        const PorpoiseAbiFunction *incoming =
+            &source->functions[source_index];
+        size_t existing_index;
+        const PorpoiseAbiFunction *existing = NULL;
+        for (existing_index = 0U;
+             existing_index < merged.function_count;
+             existing_index++) {
+            if (strcmp(
+                    merged.functions[existing_index].symbol,
+                    incoming->symbol) == 0) {
+                existing = &merged.functions[existing_index];
+                break;
+            }
+        }
+        if (existing != NULL) {
+            if (abi_function_equal(existing, incoming)) continue;
+            porpoise_abi_free(&merged);
+            (void)abi_add_file_diagnostic(
+                diagnostics,
+                source_identity == NULL ? "" : source_identity,
+                "ABI contract for symbol '%s' conflicts with an earlier contract",
+                incoming->symbol);
+            return PORPOISE_EXIT_USAGE;
+        }
+        {
+            PorpoiseAbiFunction *slot =
+                &merged.functions[merged.function_count++];
+            if (abi_clone_function(slot, incoming)) continue;
+            porpoise_abi_free(&merged);
+            (void)abi_add_file_diagnostic(
+                diagnostics,
+                source_identity == NULL ? "" : source_identity,
+                "out of memory while merging ABI contracts");
+            return PORPOISE_EXIT_INTERNAL;
+        }
+    }
+    porpoise_abi_free(destination);
+    *destination = merged;
+    return PORPOISE_EXIT_OK;
+}
+
+int porpoise_abi_load_additive(
+    PorpoiseAbiManifest *manifest,
+    const char *path,
+    PorpoiseDiagnostics *diagnostics) {
+    PorpoiseAbiManifest loaded;
+    int result;
+    if (manifest == NULL || path == NULL) return PORPOISE_EXIT_INTERNAL;
+    porpoise_abi_init(&loaded);
+    result = porpoise_abi_load(&loaded, path, diagnostics);
+    if (result == PORPOISE_EXIT_OK) {
+        result = porpoise_abi_merge(
+            manifest, &loaded, path, diagnostics);
+    }
+    porpoise_abi_free(&loaded);
+    return result;
+}
+
 const PorpoiseAbiFunction *porpoise_abi_find_import(
     const PorpoiseAbiManifest *manifest,
     const char *symbol) {

@@ -1,0 +1,2 @@
+RelFunction = .text:0x00000100; // type:function size:0x24 scope:global
+

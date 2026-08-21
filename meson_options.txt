@@ -2,5 +2,12 @@ option(
   'libporpoise_compat_path',
   type: 'string',
   value: '',
-  description: 'Opt-in path to a user-supplied libPorpoise checkout for a generated-project smoke test',
+  description: 'Opt-in path to a user-supplied libPorpoise checkout for a read-only compile-interface compatibility smoke test',
+)
+
+option(
+  'gui',
+  type: 'feature',
+  value: 'disabled',
+  description: 'Build the optional C++17 Porpoise Recovery Workbench desktop GUI',
 )

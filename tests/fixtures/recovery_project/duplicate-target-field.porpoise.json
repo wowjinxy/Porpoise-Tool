@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "sdk_catalogs": [],
+  "abi_contracts": [],
+  "targets": [
+    {
+      "id": "main",
+      "enabled": true,
+      "source_kind": "assembly",
+      "input": "asm",
+      "output": "out",
+      "entry": null,
+      "strict": false,
+      "strict": true,
+      "sdk_policy": "keep",
+      "symbol_sources": [],
+      "skip_list": null,
+      "overrides": [],
+      "annotations": [],
+      "cache": null
+    }
+  ]
+}

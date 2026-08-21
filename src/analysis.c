@@ -1,6 +1,8 @@
 #include "porpoise/analysis.h"
+#include "porpoise/sdk_contract.h"
 #include "porpoise/util.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 enum {
@@ -49,101 +51,41 @@ static bool lifted_function_name(const PorpoiseFunction *function,
 
 static bool abi_callable_name_is_reserved(const char *name) {
     static const char *const reserved_names[] = {
-        /* Generated project entry points and helpers. */
+        /* Entry points and public typedef names that do not use our prefixes. */
         "main",
         "DolphinMain",
-        "porpoise_call_address",
-        "porpoise_bind_export_state",
-        "porpoise_export_state",
-        "porpoise_initialize_data",
-
-        /* Public lifted-runtime functions. */
-        "porpoise_state_init",
-        "porpoise_state_clear_fault",
-        "porpoise_state_set_fault",
-        "porpoise_state_has_fault",
-        "porpoise_state_fault_message",
-        "porpoise_fault_string",
-        "porpoise_host_result_string",
-        "porpoise_cr_get_field",
-        "porpoise_cr_set_field",
-        "porpoise_cr_get_bit",
-        "porpoise_cr_set_bit",
-        "porpoise_shift_left32",
-        "porpoise_shift_right32",
-        "porpoise_sign_extend8",
-        "porpoise_sign_extend16",
-        "porpoise_count_leading_zeros32",
-        "porpoise_add_with_carry32",
-        "porpoise_arithmetic_shift_right32",
-        "porpoise_rotate_left32",
-        "porpoise_mask32",
-        "porpoise_set_cr0_result",
-        "porpoise_compare_signed",
-        "porpoise_compare_unsigned",
-        "porpoise_load_u8",
-        "porpoise_load_u16",
-        "porpoise_load_u32",
-        "porpoise_load_u64",
-        "porpoise_load_f32",
-        "porpoise_load_f64",
-        "porpoise_load_multiple_words",
-        "porpoise_store_u8",
-        "porpoise_store_u16",
-        "porpoise_store_u32",
-        "porpoise_store_u64",
-        "porpoise_store_f32",
-        "porpoise_store_f64",
-        "porpoise_store_multiple_words",
-        "porpoise_decode_pointer",
-        "porpoise_encode_pointer",
-        "porpoise_libporpoise_adapter_init",
-
-        /* Runtime ordinary-identifier namespace (typedefs and enumerators). */
         "PorpoisePpcState",
         "PorpoiseHostAdapter",
         "PorpoiseFpr",
         "PorpoiseHostResult",
         "PorpoiseFault",
         "PorpoiseExecutionStatus",
+        "PorpoiseFpFmaOperation",
+        "PorpoiseFpPrecision",
+        "PorpoiseTitleHostResultV3",
+        "PorpoiseTitleInitialWordV3",
+        "PorpoiseTitleRuntimeConfigV1",
+        "PorpoiseTitleEntryStateV3",
+        "PorpoiseHostPrepareRuntimeV1",
+        "PorpoiseHostPrepareTitleEntryV3",
         "PorpoiseHostReadBytesFn",
         "PorpoiseHostWriteBytesFn",
         "PorpoiseHostDecodePointerFn",
         "PorpoiseHostEncodePointerFn",
-        "PorpoiseLiftedFunction",
-        "PORPOISE_HOST_OK",
-        "PORPOISE_HOST_INVALID_ARGUMENT",
-        "PORPOISE_HOST_INVALID_POINTER",
-        "PORPOISE_HOST_UNMAPPED_ADDRESS",
-        "PORPOISE_HOST_UNSUPPORTED_MMIO",
-        "PORPOISE_HOST_ADDRESS_OVERFLOW",
-        "PORPOISE_HOST_IO_ERROR",
-        "PORPOISE_FAULT_NONE",
-        "PORPOISE_FAULT_INVALID_STATE",
-        "PORPOISE_FAULT_NO_HOST_ADAPTER",
-        "PORPOISE_FAULT_MISSING_HOST_CALLBACK",
-        "PORPOISE_FAULT_INVALID_ARGUMENT",
-        "PORPOISE_FAULT_INVALID_POINTER",
-        "PORPOISE_FAULT_UNMAPPED_ADDRESS",
-        "PORPOISE_FAULT_UNSUPPORTED_MMIO",
-        "PORPOISE_FAULT_ADDRESS_OVERFLOW",
-        "PORPOISE_FAULT_HOST_IO",
-        "PORPOISE_FAULT_UNSUPPORTED_OPERATION",
-        "PORPOISE_EXECUTION_READY",
-        "PORPOISE_EXECUTION_RUNNING",
-        "PORPOISE_EXECUTION_RETURNED",
-        "PORPOISE_EXECUTION_FAULTED",
-
-        /* Macros emitted by generated and runtime headers. */
-        "PORPOISE_FAULT_MESSAGE_CAPACITY",
-        "PORPOISE_LIFTED_H",
-        "PORPOISE_LIBPORPOISE_ADAPTER_H",
-        "PORPOISE_GENERATED_H",
-        "PORPOISE_DATA_H",
-        "PORPOISE_IMPORTS_H",
-        "PORPOISE_EXPORTS_H"
+        "PorpoiseHostReadTimeBaseFn",
+        "PorpoiseHostTrapFn",
+        "PorpoiseHostSystemCallFn",
+        "PorpoiseHostCallGuestFn",
+        "PorpoiseHostPollEventsFn",
+        "PorpoiseLiftedFunction"
     };
     size_t index;
+
+    /* Own these prefixes so future public helpers/constants cannot drift. */
+    if (strncmp(name, "porpoise_", 9U) == 0 ||
+        strncmp(name, "PORPOISE_", 9U) == 0) {
+        return true;
+    }
 
     for (index = 0U;
          index < sizeof(reserved_names) / sizeof(reserved_names[0]);
@@ -153,6 +95,196 @@ static bool abi_callable_name_is_reserved(const char *name) {
         }
     }
     return false;
+}
+
+static const PorpoiseSdkContract *builtin_adapter_contract(
+    const char *name) {
+    return porpoise_sdk_contract_find_by_host_callable(name);
+}
+
+static const PorpoiseSdkContract *builtin_native_callable_contract(
+    const char *name) {
+    return porpoise_sdk_contract_find_by_canonical_name(name);
+}
+
+static bool abi_value_matches_builtin(
+    const PorpoiseAbiValue *value,
+    const PorpoiseSdkAbiValue *expected) {
+    return value->type == expected->type &&
+           value->register_class == expected->register_class &&
+           value->register_index == expected->register_index;
+}
+
+static const char *abi_register_class_name(
+    PorpoiseAbiRegisterClass register_class) {
+    if (register_class == PORPOISE_ABI_REGISTER_GPR) return "r";
+    if (register_class == PORPOISE_ABI_REGISTER_FPR) return "f";
+    return "no register ";
+}
+
+static bool validate_builtin_runtime_adapter(
+    const PorpoiseAbiFunction *function,
+    PorpoiseDiagnostics *diagnostics) {
+    const PorpoiseSdkContract *contract =
+        builtin_adapter_contract(function->adapter);
+    const PorpoiseSdkAbiValue *expected_result;
+    const char *contract_name;
+    const char *contract_header;
+    size_t contract_argument_count;
+    bool valid = true;
+    size_t argument_index;
+
+    if (contract == NULL) return true;
+    contract_name = porpoise_sdk_contract_host_callable(contract);
+    contract_header = porpoise_sdk_contract_host_header(contract);
+    expected_result = porpoise_sdk_contract_result(contract);
+    contract_argument_count =
+        porpoise_sdk_contract_argument_count(contract);
+
+    if (function->kind != PORPOISE_ABI_IMPORT) {
+        porpoise_diagnostics_add(
+            diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            NULL,
+            0U,
+            0U,
+            "built-in adapter %s for %s must be an ABI import",
+            contract_name,
+            function->symbol);
+        valid = false;
+    }
+    if (function->header == NULL ||
+        strcmp(function->header, contract_header) != 0) {
+        porpoise_diagnostics_add(
+            diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            NULL,
+            0U,
+            0U,
+            "built-in adapter %s for %s must use header %s",
+            contract_name,
+            function->symbol,
+            contract_header);
+        valid = false;
+    }
+    if (!abi_value_matches_builtin(&function->result, expected_result)) {
+        porpoise_diagnostics_add(
+            diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            NULL,
+            0U,
+            0U,
+            "built-in adapter %s for %s has return mapping %s %s%u; expected %s %s%u",
+            contract_name,
+            function->symbol,
+            porpoise_abi_type_name(function->result.type),
+            abi_register_class_name(function->result.register_class),
+            function->result.register_index,
+            porpoise_abi_type_name(expected_result->type),
+            abi_register_class_name(expected_result->register_class),
+            expected_result->register_index);
+        valid = false;
+    }
+    if (function->argument_count != contract_argument_count) {
+        porpoise_diagnostics_add(
+            diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            NULL,
+            0U,
+            0U,
+            "built-in adapter %s for %s has %lu ABI arguments; expected %lu",
+            contract_name,
+            function->symbol,
+            (unsigned long)function->argument_count,
+            (unsigned long)contract_argument_count);
+        valid = false;
+    }
+
+    for (argument_index = 0U;
+         argument_index < function->argument_count &&
+         argument_index < contract_argument_count;
+         argument_index++) {
+        const PorpoiseAbiValue *argument =
+            &function->arguments[argument_index];
+        const PorpoiseSdkAbiValue *expected =
+            porpoise_sdk_contract_argument_at(contract, argument_index);
+
+        if (abi_value_matches_builtin(argument, expected)) continue;
+        porpoise_diagnostics_add(
+            diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            NULL,
+            0U,
+            0U,
+            "built-in adapter %s for %s has argument %lu mapping %s %s%u; expected %s %s%u",
+            contract_name,
+            function->symbol,
+            (unsigned long)(argument_index + 1U),
+            porpoise_abi_type_name(argument->type),
+            abi_register_class_name(argument->register_class),
+            argument->register_index,
+            porpoise_abi_type_name(expected->type),
+            abi_register_class_name(expected->register_class),
+            expected->register_index);
+        valid = false;
+    }
+    return valid;
+}
+
+static bool validate_builtin_runtime_containment(
+    const PorpoiseAbiFunction *function,
+    PorpoiseDiagnostics *diagnostics) {
+    const PorpoiseSdkContract *contract;
+    const char *callable;
+    const char *callable_role;
+
+    if (function->kind != PORPOISE_ABI_IMPORT) return true;
+
+    contract = builtin_native_callable_contract(function->symbol);
+    if (contract != NULL) {
+        if (function->adapter != NULL &&
+            strcmp(
+                function->adapter,
+                porpoise_sdk_contract_host_callable(contract)) == 0) {
+            return true;
+        }
+        porpoise_diagnostics_add(
+            diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            NULL,
+            0U,
+            0U,
+            "ABI import %s must use built-in adapter %s; typed wrappers and other adapters bypass required guest ABI marshalling",
+            function->symbol,
+            porpoise_sdk_contract_host_callable(contract));
+        return false;
+    }
+
+    callable = function->adapter != NULL
+                   ? function->adapter
+                   : function->wrapper;
+    contract = builtin_native_callable_contract(callable);
+    if (contract == NULL) return true;
+
+    callable_role = function->adapter != NULL ? "adapter" : "typed wrapper";
+    porpoise_diagnostics_add(
+        diagnostics,
+        PORPOISE_SEVERITY_ERROR,
+        NULL,
+        0U,
+        0U,
+        "ABI import %s cannot use protected native callable %s as its %s; use built-in adapter %s",
+        function->symbol,
+        porpoise_sdk_contract_canonical_name(contract),
+        callable_role,
+        porpoise_sdk_contract_host_callable(contract));
+    return false;
+}
+
+static bool abi_uses_builtin_runtime_adapter(
+    const PorpoiseAbiFunction *function) {
+    return function->kind == PORPOISE_ABI_IMPORT &&
+           builtin_adapter_contract(function->adapter) != NULL;
 }
 
 static int validate_abi_namespace(const PorpoiseProgram *program,
@@ -172,8 +304,20 @@ static int validate_abi_namespace(const PorpoiseProgram *program,
         size_t generated_index;
         size_t file_index;
 
+        if (!validate_builtin_runtime_adapter(function, diagnostics)) {
+            valid = false;
+        }
+        if (!validate_builtin_runtime_containment(function, diagnostics)) {
+            valid = false;
+        }
+
         if (function->kind == PORPOISE_ABI_IMPORT) {
             char bridge[PORPOISE_GENERATED_SYMBOL_CAPACITY];
+            const PorpoiseAddressAlias *declared_alias =
+                porpoise_program_find_declared_alias(
+                    program,
+                    function->symbol,
+                    NULL);
 
             if (porpoise_program_find_function(
                     program,
@@ -185,6 +329,18 @@ static int validate_abi_namespace(const PorpoiseProgram *program,
                     0U,
                     0U,
                     "ABI import %s conflicts with a translated function",
+                    function->symbol);
+                valid = false;
+            }
+            if (declared_alias != NULL &&
+                !declared_alias->is_function_name) {
+                porpoise_diagnostics_add(
+                    diagnostics,
+                    PORPOISE_SEVERITY_ERROR,
+                    declared_alias->source_path,
+                    declared_alias->source_line,
+                    declared_alias->address,
+                    "ABI import %s conflicts with an ordinary input address alias",
                     function->symbol);
                 valid = false;
             }
@@ -251,7 +407,8 @@ static int validate_abi_namespace(const PorpoiseProgram *program,
             continue;
         }
 
-        if (abi_callable_name_is_reserved(callable)) {
+        if (abi_callable_name_is_reserved(callable) &&
+            !abi_uses_builtin_runtime_adapter(function)) {
             porpoise_diagnostics_add(
                 diagnostics,
                 PORPOISE_SEVERITY_ERROR,
@@ -375,19 +532,163 @@ static int validate_abi_namespace(const PorpoiseProgram *program,
     return valid ? PORPOISE_EXIT_OK : PORPOISE_EXIT_USAGE;
 }
 
+static bool function_has_global_input_name(
+    const PorpoiseFunction *function,
+    const char *name) {
+    size_t alias_index;
+    if (function->is_global && strcmp(function->name, name) == 0) return true;
+    for (alias_index = 0U;
+         alias_index < function->alias_count;
+         alias_index++) {
+        const PorpoiseAddressAlias *alias = &function->aliases[alias_index];
+        if (alias->is_function_name && alias->is_global &&
+            strcmp(alias->name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void porpoise_analysis_init(PorpoiseAnalysis *analysis) {
+    if (analysis != NULL) memset(analysis, 0, sizeof(*analysis));
+}
+
+void porpoise_analysis_free(PorpoiseAnalysis *analysis) {
+    if (analysis == NULL) return;
+    free(analysis->import_bindings);
+    memset(analysis, 0, sizeof(*analysis));
+}
+
+static int build_import_bindings(
+    const PorpoiseProgram *program,
+    const PorpoiseAbiManifest *abi,
+    PorpoiseAnalysis *analysis,
+    PorpoiseDiagnostics *diagnostics) {
+    size_t function_index;
+    size_t binding_count = 0U;
+    size_t binding_index = 0U;
+    bool valid = true;
+
+    for (function_index = 0U;
+         function_index < abi->function_count;
+         function_index++) {
+        const PorpoiseAbiFunction *function = &abi->functions[function_index];
+        const PorpoiseFunction *owner = NULL;
+
+        if (function->kind != PORPOISE_ABI_IMPORT) continue;
+        if (!porpoise_program_resolve_declared_function(
+                program, function->symbol, &owner, NULL, NULL)) {
+            continue;
+        }
+        if (owner == NULL || !owner->skipped) {
+            porpoise_diagnostics_add(
+                diagnostics,
+                PORPOISE_SEVERITY_ERROR,
+                NULL,
+                0U,
+                owner == NULL ? 0U : owner->start_address,
+                "ABI import %s conflicts with a translated function",
+                function->symbol);
+            valid = false;
+            continue;
+        }
+        binding_count++;
+    }
+
+    if (!valid) return PORPOISE_EXIT_USAGE;
+    if (binding_count == 0U) return PORPOISE_EXIT_OK;
+    if (binding_count > SIZE_MAX / sizeof(*analysis->import_bindings)) {
+        porpoise_diagnostics_add(
+            diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            NULL,
+            0U,
+            0U,
+            "too many skipped ABI import bindings");
+        return PORPOISE_EXIT_INTERNAL;
+    }
+    analysis->import_bindings = (PorpoiseImportBinding *)calloc(
+        binding_count, sizeof(*analysis->import_bindings));
+    if (analysis->import_bindings == NULL) {
+        porpoise_diagnostics_add(
+            diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            NULL,
+            0U,
+            0U,
+            "out of memory while binding skipped ABI imports");
+        return PORPOISE_EXIT_INTERNAL;
+    }
+
+    for (function_index = 0U;
+         function_index < abi->function_count;
+         function_index++) {
+        const PorpoiseAbiFunction *function = &abi->functions[function_index];
+        const PorpoiseFunction *owner = NULL;
+        const PorpoiseAddressAlias *alias = NULL;
+        uint32_t guest_address = 0U;
+        size_t previous;
+
+        if (function->kind != PORPOISE_ABI_IMPORT) continue;
+        if (!porpoise_program_resolve_declared_function(
+                program,
+                function->symbol,
+                &owner,
+                &alias,
+                &guest_address) ||
+            owner == NULL || !owner->skipped) {
+            continue;
+        }
+
+        for (previous = 0U; previous < binding_index; previous++) {
+            const PorpoiseImportBinding *candidate =
+                &analysis->import_bindings[previous];
+            if (candidate->guest_address != guest_address) continue;
+            porpoise_diagnostics_add(
+                diagnostics,
+                PORPOISE_SEVERITY_ERROR,
+                NULL,
+                0U,
+                guest_address,
+                "ABI imports %s and %s bind to the same skipped guest address",
+                candidate->import->symbol,
+                function->symbol);
+            valid = false;
+            break;
+        }
+        if (!valid) continue;
+
+        analysis->import_bindings[binding_index].import = function;
+        analysis->import_bindings[binding_index].owner = owner;
+        analysis->import_bindings[binding_index].alias = alias;
+        analysis->import_bindings[binding_index].guest_address = guest_address;
+        binding_index++;
+    }
+
+    if (!valid) {
+        free(analysis->import_bindings);
+        analysis->import_bindings = NULL;
+        return PORPOISE_EXIT_USAGE;
+    }
+    analysis->import_binding_count = binding_index;
+    return PORPOISE_EXIT_OK;
+}
+
 int porpoise_analyze_program(
     const PorpoiseProgram *program,
     const PorpoiseAbiManifest *abi,
     const char *requested_entry,
     PorpoiseAnalysis *analysis,
     PorpoiseDiagnostics *diagnostics) {
+    PorpoiseAnalysis candidate;
     size_t file_index;
     size_t function_index;
     int namespace_result;
+    int binding_result;
     bool valid = true;
     if (program == NULL || abi == NULL || analysis == NULL || diagnostics == NULL)
         return PORPOISE_EXIT_INTERNAL;
-    memset(analysis, 0, sizeof(*analysis));
+    porpoise_analysis_init(&candidate);
     namespace_result = validate_abi_namespace(program, abi, diagnostics);
     if (namespace_result != PORPOISE_EXIT_OK) {
         return namespace_result;
@@ -396,26 +697,11 @@ int porpoise_analyze_program(
         const PorpoiseSourceFile *file = &program->files[file_index];
         for (function_index = 0U; function_index < file->function_count; function_index++) {
             const PorpoiseFunction *function = &file->functions[function_index];
-            size_t other_file;
             if (function->skipped) continue;
-            analysis->translated_function_count++;
-            for (other_file = 0U; other_file <= file_index; other_file++) {
-                const PorpoiseSourceFile *candidate_file = &program->files[other_file];
-                size_t limit = other_file == file_index ? function_index : candidate_file->function_count;
-                size_t other_function;
-                for (other_function = 0U; other_function < limit; other_function++) {
-                    const PorpoiseFunction *candidate = &candidate_file->functions[other_function];
-                    if (!candidate->skipped && candidate->start_address == function->start_address) {
-                        porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR,
-                                                 file->relative_path, 0U, function->start_address,
-                                                 "function address collides with %s", candidate->name);
-                        valid = false;
-                    }
-                }
-            }
+            candidate.translated_function_count++;
         }
     }
-    if (analysis->translated_function_count == 0U) {
+    if (candidate.translated_function_count == 0U) {
         porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, NULL, 0U, 0U,
                                  "no functions remain to translate");
         valid = false;
@@ -436,8 +722,8 @@ int porpoise_analyze_program(
                                      "console __start cannot be used as the host entry; select a title function");
             return PORPOISE_EXIT_USAGE;
         }
-        analysis->entry = porpoise_program_find_function(program, requested_entry);
-        if (analysis->entry == NULL) {
+        candidate.entry = porpoise_program_find_function(program, requested_entry);
+        if (candidate.entry == NULL) {
             porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, requested_entry, 0U, 0U,
                                      "entry symbol is not a translated input function");
             return PORPOISE_EXIT_USAGE;
@@ -448,13 +734,24 @@ int porpoise_analyze_program(
             const PorpoiseSourceFile *file = &program->files[file_index];
             for (function_index = 0U; function_index < file->function_count; function_index++) {
                 const PorpoiseFunction *function = &file->functions[function_index];
-                if (!function->skipped && function->is_global && strcmp(function->name, "main") == 0) {
-                    analysis->entry = function;
+                if (!function->skipped &&
+                    function_has_global_input_name(function, "main")) {
+                    candidate.entry = function;
                     main_count++;
                 }
             }
         }
-        if (main_count != 1U) analysis->entry = NULL;
+        if (main_count != 1U) candidate.entry = NULL;
     }
+
+    binding_result = build_import_bindings(
+        program, abi, &candidate, diagnostics);
+    if (binding_result != PORPOISE_EXIT_OK) {
+        porpoise_analysis_free(&candidate);
+        return binding_result;
+    }
+
+    porpoise_analysis_free(analysis);
+    *analysis = candidate;
     return PORPOISE_EXIT_OK;
 }

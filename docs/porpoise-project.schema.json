@@ -1,0 +1,591 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://porpoise.invalid/schema/porpoise-project-v1.json",
+  "title": "Porpoise Recovery Project",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sdk_catalogs",
+    "abi_contracts",
+    "targets"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "sdk_catalogs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/path"
+      }
+    },
+    "abi_contracts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/path"
+      }
+    },
+    "targets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/target"
+      }
+    }
+  },
+  "$defs": {
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!~)(?!.*\\$)(?!.*%.*%)(?![A-Za-z]:[^/\\\\]).+$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "uint32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "symbol_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "codewarrior_map",
+            "dtk_symbols"
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "auxiliary_path": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "module": {
+          "type": "string"
+        },
+        "permissive": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "codewarrior_map"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "auxiliary_path": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "override": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "module",
+        "address",
+        "size",
+        "fingerprint",
+        "action",
+        "contract",
+        "acknowledge_conflict"
+      ],
+      "properties": {
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "module": {
+          "type": "string"
+        },
+        "address": {
+          "$ref": "#/$defs/uint32"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "action": {
+          "enum": [
+            "auto",
+            "lift",
+            "import",
+            "omit",
+            "treat_as_data"
+          ]
+        },
+        "contract": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acknowledge_conflict": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "import"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "contract": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "contract": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "annotation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "module",
+        "address",
+        "size",
+        "fingerprint",
+        "exact_bytes_sha256",
+        "interpretation",
+        "count",
+        "encoding"
+      ],
+      "properties": {
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "module": {
+          "type": "string"
+        },
+        "address": {
+          "$ref": "#/$defs/uint32"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "exact_bytes_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "interpretation": {
+          "enum": [
+            "raw_bytes",
+            "zero_fill",
+            "ascii",
+            "utf8",
+            "shift_jis",
+            "utf16",
+            "s8_array",
+            "u8_array",
+            "s16_array",
+            "u16_array",
+            "s32_array",
+            "u32_array",
+            "f32_array",
+            "f64_array",
+            "pointer32_array"
+          ]
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "encoding": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "interpretation": {
+                "enum": [
+                  "raw_bytes",
+                  "zero_fill",
+                  "s8_array",
+                  "u8_array"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "encoding": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "interpretation": {
+                "const": "ascii"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "encoding": {
+                "const": "ascii"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "interpretation": {
+                "const": "utf8"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "encoding": {
+                "const": "utf-8"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "interpretation": {
+                "const": "shift_jis"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "encoding": {
+                "const": "shift-jis"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "interpretation": {
+                "const": "utf16"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "encoding": {
+                "enum": [
+                  "utf-16be",
+                  "utf-16le"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "interpretation": {
+                "enum": [
+                  "s16_array",
+                  "u16_array",
+                  "s32_array",
+                  "u32_array",
+                  "f32_array",
+                  "f64_array",
+                  "pointer32_array"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "encoding": {
+                "enum": [
+                  "big-endian",
+                  "little-endian"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "size",
+        "mtime_ns"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "mtime_ns": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "match": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "module",
+        "address",
+        "size",
+        "fingerprint",
+        "canonical_identity",
+        "contract"
+      ],
+      "properties": {
+        "module": {
+          "type": "string"
+        },
+        "address": {
+          "$ref": "#/$defs/uint32"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "canonical_identity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contract": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_sha256",
+        "settings_sha256",
+        "dtk_version",
+        "dependencies",
+        "matches"
+      ],
+      "properties": {
+        "input_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "settings_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "dtk_version": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dependency"
+          }
+        },
+        "matches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/match"
+          }
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "enabled",
+        "source_kind",
+        "input",
+        "output",
+        "entry",
+        "strict",
+        "sdk_policy",
+        "symbol_sources",
+        "skip_list",
+        "overrides",
+        "annotations",
+        "cache"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "source_kind": {
+          "enum": [
+            "assembly",
+            "managed_elf",
+            "dtk_prepared_assembly"
+          ]
+        },
+        "input": {
+          "$ref": "#/$defs/path"
+        },
+        "output": {
+          "$ref": "#/$defs/path"
+        },
+        "entry": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "strict": {
+          "type": "boolean"
+        },
+        "sdk_policy": {
+          "enum": [
+            "keep",
+            "imported",
+            "omit"
+          ]
+        },
+        "symbol_sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/symbol_source"
+          }
+        },
+        "skip_list": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "overrides": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/override"
+          }
+        },
+        "annotations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/annotation"
+          }
+        },
+        "cache": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/cache"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

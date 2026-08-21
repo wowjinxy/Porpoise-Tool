@@ -1,0 +1,11 @@
+Link map of EntryPoint
+  1] GXInit (func,global) found in gx.a GXInit.c
+  2] UnknownSdk (func,global) found in gx.a UnknownSdk.c
+
+.text section layout
+  Starting        Virtual
+  address  Size   address
+  -----------------------
+  00000000 000020 80010000  4 GXInit gx.a GXInit.c
+  00000100 000020 80010100  4 UnknownSdk gx.a UnknownSdk.c
+  00000200 000008 80010200  4 title_main title.o

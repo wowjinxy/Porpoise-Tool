@@ -7,5 +7,7 @@
 *.json text eol=lf
 *.md text eol=lf
 *.yml text eol=lf
+*.patch text eol=lf whitespace=-trailing-space
+*.wrap text eol=lf
 meson.build text eol=lf
 meson_options.txt text eol=lf

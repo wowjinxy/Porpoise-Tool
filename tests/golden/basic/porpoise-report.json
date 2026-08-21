@@ -1,12 +1,20 @@
 {
-  "schema_version": 1,
+  "schema_version": 3,
+  "target": {"id": null, "module": null, "plan_digest": null, "sdk_policy": "keep"},
+  "data_model": {"source": "annotated_assembly", "chunks": 0},
   "files": [
     {"input": "no_entry.s", "generated": "src/lifted/no_entry.c"}
   ],
   "functions": [
-    {"symbol": "add_one", "c_symbol": "add_one", "file": "no_entry.s", "address": 2147487744, "size": 8, "status": "lifted"}
+    {"symbol": "add_one", "c_symbol": "add_one", "file": "no_entry.s", "address": 2147487744, "size": 8, "status": "lifted", "requested_action": "lift", "resolved_action": "lift", "origin": "default", "canonical_sdk_identity": null, "sdk_category": null, "confidence": "none", "binding": null, "fingerprint": "34b432f4f672632408b5c2f69285e0bf9bd737a92c873068d63c95afb5d83914", "evidence_flags": 0, "conflict": false, "overridden": false, "override_action": "auto", "blocking_reason": null, "provenance": {"map": null, "catalog": null}}
   ],
-  "data": [
+  "data_objects": [
+
+  ],
+  "anonymous_data": [
+
+  ],
+  "data_spans": [
 
   ],
   "instructions": [
@@ -19,5 +27,5 @@
   "diagnostics": [
     {"severity": "warning", "file": "no_entry.s", "line": 7, "address": 2147487748, "message": "blr instruction uses approximate host semantics"}
   ],
-  "summary": {"files": 1, "functions": 1, "data_words": 0, "lowered": 1, "host_equivalent_noop": 0, "approximate": 1, "unsupported": 0}
+  "summary": {"files": 1, "functions": 1, "data_words": 0, "data_objects": 0, "anonymous_contributions": 0, "anonymous_explicit_bytes": 0, "data_fixups": 0, "data_spans": 0, "initialized_data_bytes": 0, "zero_fill_data_bytes": 0, "data_chunks": 0, "lowered": 1, "host_equivalent_noop": 0, "approximate": 1, "unsupported": 0}
 }

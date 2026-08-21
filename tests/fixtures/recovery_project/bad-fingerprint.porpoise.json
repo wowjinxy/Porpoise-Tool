@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "sdk_catalogs": [],
+  "abi_contracts": [],
+  "targets": [
+    {
+      "id": "main",
+      "enabled": true,
+      "source_kind": "assembly",
+      "input": "asm",
+      "output": "out",
+      "entry": null,
+      "strict": false,
+      "sdk_policy": "keep",
+      "symbol_sources": [],
+      "skip_list": null,
+      "overrides": [
+        {
+          "target": "main",
+          "module": "",
+          "address": 4096,
+          "size": 16,
+          "fingerprint": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "action": "lift",
+          "contract": null,
+          "acknowledge_conflict": false
+        }
+      ],
+      "annotations": [],
+      "cache": null
+    }
+  ]
+}

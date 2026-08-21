@@ -144,7 +144,7 @@ This document collects working notes about registers and memory locations in the
 | 952 | MMCR0 | Monitor Mode Control Register 0 |
 | 953 | PMC1 | Performance Monitor Counter 1 |
 | 954 | PMC2 | Performance Monitor Counter 2 |
-| 955 | SIA | Sampled Instruction Address |
+| 955 | SIA | Sampled Instruction Address (supervisor read/write) |
 | 956 | MMCR1 | Monitor Mode Control Register 1 |
 | 957 | PMC3 | Performance Monitor Counter 3 |
 | 958 | PMC4 | Performance Monitor Counter 4 |
@@ -185,9 +185,14 @@ This document collects working notes about registers and memory locations in the
 Controls L2 cache modes and bus settings
 
 #### HID2 (SPR 920) - Gekko/Broadway Specific
-- Bit 29: LCE - Locked Cache Enable
-- Bit 30: PSE - Paired Single Enable
-- Bit 31: WPE - Write Pipe Enable
+
+This document uses PowerPC architectural bit numbering here (bit 0 is the
+most-significant bit of the 32-bit register). Porpoise Tool currently models:
+
+- Bit 0 (`0x80000000`): LSQE - paired-single quantized load/store enable
+- Bit 2 (`0x20000000`): PSE - paired-single execution enable
+
+Other HID2 facilities, including locked-cache behavior, are not modeled.
 
 #### HID4 (SPR 1011) - Broadway Only
 - Bit 31: H4A - Special Broadway feature

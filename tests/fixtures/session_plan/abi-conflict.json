@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "functions": [
+    {
+      "kind": "import",
+      "symbol": "import_me",
+      "wrapper": "different_host_import",
+      "header": "porpoise/import_test.h",
+      "return": {"type": "void"},
+      "arguments": []
+    }
+  ]
+}

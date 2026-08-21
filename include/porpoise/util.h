@@ -17,6 +17,7 @@ bool porpoise_path_without_extension(char *destination, size_t capacity, const c
 bool porpoise_path_is_absolute(const char *path);
 bool porpoise_path_exists(const char *path);
 bool porpoise_path_is_directory(const char *path);
+const char *porpoise_default_runtime_directory(void);
 bool porpoise_path_normalize_lexical(char *destination, size_t capacity, const char *path);
 bool porpoise_path_contains_path(const char *parent, const char *child, bool *contains);
 bool porpoise_path_trees_overlap(const char *left, const char *right, bool *overlap);

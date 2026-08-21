@@ -56,6 +56,19 @@ int porpoise_abi_load(
     PorpoiseAbiManifest *manifest,
     const char *path,
     PorpoiseDiagnostics *diagnostics);
+/*
+ * Add contracts transactionally. Byte-for-byte equivalent declarations
+ * coalesce; a repeated symbol with a different contract is rejected.
+ */
+int porpoise_abi_merge(
+    PorpoiseAbiManifest *destination,
+    const PorpoiseAbiManifest *source,
+    const char *source_identity,
+    PorpoiseDiagnostics *diagnostics);
+int porpoise_abi_load_additive(
+    PorpoiseAbiManifest *manifest,
+    const char *path,
+    PorpoiseDiagnostics *diagnostics);
 const PorpoiseAbiFunction *porpoise_abi_find_import(
     const PorpoiseAbiManifest *manifest,
     const char *symbol);

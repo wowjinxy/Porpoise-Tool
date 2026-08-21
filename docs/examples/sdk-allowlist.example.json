@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "symbol": "OSReport",
+      "canonical_identity": "OS.a/OSReport.o/OSReport",
+      "category": "nintendo_dolphin",
+      "contract": "OSReport"
+    },
+    {
+      "symbol": "DEMOInit",
+      "canonical_identity": "demo.a/DEMOInit.o/DEMOInit",
+      "category": "demo"
+    }
+  ]
+}

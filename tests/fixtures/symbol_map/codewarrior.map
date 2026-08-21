@@ -1,0 +1,20 @@
+Link map of EntryPoint
+  1] MainFunc (func,weak) found in sdk.a main.c
+   2] GlobalData (object,local) found in sdk.a data.c
+
+.text section layout
+  Starting        Virtual
+  address  Size   address
+  -----------------------
+  00000000 000020 80001000  1 .text sdk.a main.c
+  00000000 000018 80001000  4 MainFunc sdk.a main.c
+  00000008 000000 80001008 MainAlias (entry of MainFunc) sdk.a main.c
+  UNUSED   000010 ........ GoneFunc sdk.a gone.c
+
+.data section layout
+  Starting        Virtual
+  address  Size   address
+  -----------------------
+  00000000 000010 80002000  1 .data sdk.a data.c
+  00000000 000004 80002000  4 GlobalData sdk.a data.c
+

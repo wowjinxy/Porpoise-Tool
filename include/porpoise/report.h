@@ -11,13 +11,13 @@ typedef enum PorpoiseLoweringStatus {
 } PorpoiseLoweringStatus;
 
 typedef struct PorpoiseInstructionReport {
-    char *file;
+    const char *file;
     size_t line;
     uint32_t address;
-    char *mnemonic;
+    const char *mnemonic;
     PorpoiseLoweringStatus status;
     bool semantic_test;
-    char *detail;
+    const char *detail;
 } PorpoiseInstructionReport;
 
 typedef struct PorpoiseReport {
@@ -40,6 +40,12 @@ bool porpoise_report_add(
     PorpoiseLoweringStatus status,
     bool semantic_test,
     const char *detail);
+
+/*
+ * Report records borrow file, mnemonic, and detail strings. Callers must keep
+ * those immutable strings alive until porpoise_report_free(). The normal
+ * project pipeline satisfies this through the program IR and opcode registry.
+ */
 const char *porpoise_lowering_status_name(PorpoiseLoweringStatus status);
 
 #endif

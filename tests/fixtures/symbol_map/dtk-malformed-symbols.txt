@@ -1,0 +1,2 @@
+Broken = .text:not-an-address; // type:function size:0x10
+

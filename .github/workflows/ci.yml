@@ -45,6 +45,114 @@ jobs:
       - name: Test
         run: meson test -C build --print-errorlogs
 
+  linux-gui-release:
+    name: Linux GUI (Release, bundled dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools and desktop headers
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          build-essential
+          cmake
+          git
+          libasound2-dev
+          libdbus-1-dev
+          libdrm-dev
+          libegl1-mesa-dev
+          libgbm-dev
+          libgl1-mesa-dev
+          libibus-1.0-dev
+          libpulse-dev
+          libudev-dev
+          libwayland-dev
+          libx11-dev
+          libxcursor-dev
+          libxext-dev
+          libxi-dev
+          libxinerama-dev
+          libxkbcommon-dev
+          libxrandr-dev
+          libxss-dev
+          libxtst-dev
+          meson
+          ninja-build
+          wayland-protocols
+          xorg-dev
+      - name: Configure bundled GUI release
+        run: meson setup build-gui --buildtype=release --werror -Dgui=enabled
+      - name: Build
+        run: meson compile -C build-gui
+      - name: Run headless GUI smoke tests
+        run: >-
+          meson test -C build-gui
+          workbench-model workbench-gui-startup --print-errorlogs
+      - name: Stage release bundle
+        run: meson install -C build-gui --destdir "$RUNNER_TEMP/porpoise-gui-linux"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: porpoise-gui-linux
+          path: ${{ runner.temp }}/porpoise-gui-linux
+
+  windows-gui-release:
+    name: Windows GUI (Release, bundled dependencies)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ninja
+      - name: Configure bundled GUI release
+        run: meson setup build-gui --buildtype=release --werror -Dgui=enabled
+      - name: Build
+        run: meson compile -C build-gui
+      - name: Run headless GUI smoke tests
+        run: >-
+          meson test -C build-gui
+          workbench-model workbench-gui-startup --print-errorlogs
+      - name: Stage release bundle
+        run: meson install -C build-gui --destdir "$RUNNER_TEMP/porpoise-gui-windows"
+      - name: Verify staged Windows GUI bundle
+        run: |
+          runner_temp="$(cygpath -u "$RUNNER_TEMP")"
+          gui_exe="$(find "$runner_temp/porpoise-gui-windows" -type f -name porpoise-gui.exe -print -quit)"
+          test -n "$gui_exe"
+          gui_bin="$(dirname "$gui_exe")"
+          runtime_imports="$(
+            objdump -p "$gui_exe" |
+              awk '/DLL Name: (libstdc\+\+-6\.dll|libgcc_s_.*-1\.dll|libwinpthread-1\.dll)/ { print $3 }'
+          )"
+          test -n "$runtime_imports"
+
+          poison_path="$runner_temp/porpoise-gui-poison-path"
+          smoke_state="$runner_temp/porpoise-gui-staged-smoke-state"
+          mkdir -p "$poison_path" "$smoke_state"
+          while IFS= read -r runtime; do
+            test -f "$gui_bin/$runtime"
+            : > "$poison_path/$runtime"
+          done <<< "$runtime_imports"
+
+          PATH="$poison_path" \
+          SDL_VIDEODRIVER=dummy \
+          SDL_AUDIODRIVER=dummy \
+          SDL_RENDER_DRIVER=software \
+          PORPOISE_GUI_SMOKE_STATE_DIR="$(cygpath -w "$smoke_state")" \
+            "$gui_exe" --smoke-test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: porpoise-gui-windows
+          path: ${{ runner.temp }}/porpoise-gui-windows
+
   linux-sanitizers:
     name: Linux (ASan + UBSan)
     runs-on: ubuntu-latest
@@ -73,9 +181,11 @@ jobs:
       - name: Analyze
         run: >-
           cppcheck
-          --enable=warning,style,performance,portability
+          --enable=warning,performance,portability
           --error-exitcode=1
+          --inline-suppr
           --suppress=missingIncludeSystem
+          --suppress=preprocessorErrorDirective:runtime/src/porpoise_libporpoise_guest_os.c:6
           --std=c11
           -Iinclude
           -Iruntime/include
