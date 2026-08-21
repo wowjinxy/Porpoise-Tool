@@ -1,6 +1,12 @@
 # Porpoise Tool
 
-Porpoise Tool is an annotated PowerPC assembly-to-C frontend for main/DOL-style GameCube title code. It emits lifted C functions, a small PPC execution-state shim, a Meson static library, and, when an entry point is available, a `DolphinMain` adapter for use with `libPorpoise`.
+Porpoise Tool is an annotated PowerPC assembly-to-C frontend and recovery
+workbench for GameCube title code. Its CLI, in-process API, and optional desktop
+GUI share an immutable session/plan pipeline with optional symbol maps, exact
+SDK recognition, DTK import, and transactional multi-target generation. It
+emits lifted C functions, a small PPC execution-state shim, a Meson static
+library, and, when an entry point is available, a `DolphinMain` adapter for use
+with `libPorpoise`.
 
 This project does **not** claim complete PowerPC ISA support, 100% correctness, or production readiness. Every accepted instruction receives a measured status in `porpoise-report.json`; an instruction being lowered is not evidence that all of its hardware semantics have been verified.
 
@@ -13,6 +19,9 @@ Porpoise Tool owns assembly parsing, instruction lowering, PPC register state, t
 Current scope:
 
 - annotated `.s`/`.S` input representing main/DOL-style title code;
+- read-only prepared DTK assembly or managed import from a trusted local ELF;
+- strict multi-target `.porpoise.json` projects with optional/partial maps and
+  exact local SDK catalogs;
 - Windows through MSYS2/MinGW-w64 and Linux through GCC;
 - Meson for Porpoise Tool and generated projects;
 - generated static libraries and an optional title executable;
@@ -23,7 +32,8 @@ Out of scope:
 
 - reading a `.dol` binary directly;
 - embedding an ELF/DOL as a generated runtime payload;
-- REL or native-module generation;
+- native REL packaging/loading (DTK-prepared REL assembly can still be planned
+  and lifted as a library target);
 - a standalone SDK/CRT implementation or a second console-memory runtime;
 - automatic guessing of external SDK function signatures;
 - macOS, MSVC, or other untested host toolchains.
@@ -39,6 +49,16 @@ meson test -C build --print-errorlogs
 ```
 
 The executable is `build/porpoise` on Linux and `build/porpoise.exe` on Windows.
+
+The C++17 desktop workbench is optional and keeps GUI dependencies out of the
+C99 core and CLI:
+
+```sh
+meson setup build-gui --buildtype=release -Dgui=enabled --wrap-mode=forcefallback
+meson compile -C build-gui porpoise-gui
+```
+
+See [Desktop recovery workbench](docs/RECOVERY_GUI.md).
 
 To check a local, consumer-supplied `libPorpoise` checkout against the generated
 runtime's compile-time contracts, opt in at configure time:
@@ -85,7 +105,14 @@ and negative contract fixtures. It does not require or inspect a working
 
 ```text
 porpoise INPUT --output DIR [--config FILE] [--abi FILE]
-         [--skip-list FILE] [--entry SYMBOL] [--force] [--strict]
+         [--skip-list FILE] [--map FILE]
+         [--dtk-symbols FILE [--dtk-splits FILE]]
+         [--sdk-catalog FILE] [--sdk-policy keep|imported|omit]
+         [--module NAME] [--entry SYMBOL] [--force] [--strict]
+         [--quiet | --verbose]
+
+porpoise --project FILE [--target ID ...] [--analyze-only]
+         [--report FILE] [--dtk FILE] [--force]
          [--quiet | --verbose]
 ```
 
@@ -97,6 +124,13 @@ porpoise INPUT --output DIR [--config FILE] [--abi FILE]
 | `--config FILE` | Load only this explicit schema-version 1 config. Nothing is auto-loaded beside the executable or input. |
 | `--abi FILE` | Load the typed import/export manifest described in [ABI_MANIFEST.md](docs/ABI_MANIFEST.md). |
 | `--skip-list FILE` | Skip exact input function symbols listed one per line. `#` begins a comment. Unknown symbols are errors. A matching ABI import replaces the skipped guest address with its typed host bridge. |
+| `--map FILE` | Add optional CodeWarrior DOL/REL map evidence. Empty and partial maps are valid. |
+| `--dtk-symbols FILE` | Add optional section-aware DTK `symbols.txt` evidence. |
+| `--dtk-splits FILE` | Pair DTK `splits.txt` ownership with `--dtk-symbols`; it cannot be used alone. |
+| `--sdk-catalog FILE` | Add a strict exact-signature SDK catalog. |
+| `--sdk-policy POLICY` | `keep` (default), `imported`, or `omit`; fuzzy, ambiguous, and map-only evidence never changes output. |
+| `--dtk FILE` | Project mode only: select the DTK executable used by managed ELF targets instead of `PORPOISE_DTK` or `PATH`. |
+| `--module NAME` | Scope map evidence to a DOL/REL module identity. |
 | `--entry SYMBOL` | Select a translated function for the generated `DolphinMain`. |
 | `--force` | Atomically replace an existing nonempty destination after generation succeeds. This is CLI-only. |
 | `--strict` | Reject approximate instruction lowerings instead of recording a warning. |
@@ -107,6 +141,27 @@ porpoise INPUT --output DIR [--config FILE] [--abi FILE]
 
 Duplicate options, extra positional arguments, unknown options, and using both `--quiet` and `--verbose` are rejected. CLI paths are interpreted by the invoking environment; paths supplied by config are resolved relative to the config file.
 
+### Recovery project mode
+
+A strict schema-version 1 `.porpoise.json` file can describe shared SDK/ABI
+inputs and several named targets. With no selector, every enabled target is
+analyzed, staged, and published all-or-nothing. `--target` is repeatable and an
+explicit selector may run a disabled target. `--analyze-only` builds and
+validates plans without publishing; `--report` writes the aggregate schema-v3
+report. `--force` remains operational and is never saved.
+
+`--dtk FILE` is also operational and is never saved. It selects the executable
+for managed ELF imports, which makes local or patched DTK builds reproducible.
+Canonical DTK `link_order.txt` object entries such as `path/to/foo.o` resolve
+to `asm/path/to/foo.s`; prepared trees may list `.s`/`.S` paths directly. See
+the [workbench input stages](docs/RECOVERY_WORKBENCH.md#input-stages) for the
+scoped DTK 1.8.3 executable-import patch and patched-binary workflow.
+
+Project mode is mutually exclusive with positional `INPUT`, `--output`,
+`--config`, and all classic input-setting flags. See
+[Recovery project files and CLI](docs/RECOVERY_PROJECT.md) and the
+[redacted example](docs/examples/recovery-workbench.porpoise.json).
+
 ### Configuration
 
 Configuration is a strict, flat JSON object. `schema_version` is required and must be the number `1`; all other keys are optional:
@@ -116,6 +171,10 @@ Configuration is a strict, flat JSON object. `schema_version` is required and mu
   "schema_version": 1,
   "abi": "title-abi.json",
   "skip_list": "skip-functions.txt",
+  "map": "title.map",
+  "sdk_catalog": "local-sdk.json",
+  "sdk_policy": "keep",
+  "module": "main",
   "entry": "main",
   "strict": true,
   "verbosity": "normal"
@@ -127,6 +186,12 @@ Allowed keys are exactly:
 - `schema_version`: numeric `1`;
 - `abi`: nonempty path string, relative to the config file when not absolute;
 - `skip_list`: nonempty path string, resolved the same way;
+- `map`: optional CodeWarrior map path;
+- `dtk_symbols`: optional DTK `symbols.txt` path;
+- `dtk_splits`: optional paired DTK `splits.txt` path; requires `dtk_symbols`;
+- `sdk_catalog`: optional exact SDK catalog path;
+- `sdk_policy`: `"keep"`, `"imported"`, or `"omit"`;
+- `module`: nonempty module identity for map evidence;
 - `entry`: nonempty function-symbol string;
 - `strict`: JSON boolean;
 - `verbosity`: `"quiet"`, `"normal"`, or `"verbose"`.
@@ -350,7 +415,12 @@ Generation happens in a sibling staging directory. Failed parsing, lowering, or 
 
 ## Measured instruction report
 
-`porpoise-report.json` is deterministic for the same inputs and options. It records input-to-generated file mappings, functions, assembly-derived data objects/fixups/spans, every translated instruction, approximations, diagnostics, and summary counts.
+`porpoise-report.json` schema version 3 is deterministic for the same inputs
+and options. It records input-to-generated file mappings, functions,
+assembly-derived data objects/fixups/spans, every translated instruction,
+approximations, diagnostics, and summary counts. Recovery plans additionally
+record target and canonical SDK identity, requested/resolved action, binding,
+provenance, evidence, confidence, override state, and blocking diagnostics.
 
 | Status | Meaning |
 | --- | --- |
@@ -363,6 +433,12 @@ Each instruction also has a `semantic_test` boolean. `false` means the registry 
 
 ## Design documentation
 
+- [Recovery workbench architecture](docs/RECOVERY_WORKBENCH.md)
+- [Recovery project files and CLI](docs/RECOVERY_PROJECT.md)
+- [Symbol maps](docs/SYMBOL_MAPS.md)
+- [Exact SDK catalogs and policies](docs/SDK_CATALOGS.md)
+- [Desktop recovery workbench](docs/RECOVERY_GUI.md)
+- [Classic CLI migration](docs/MIGRATION.md)
 - [Input format](docs/INPUT_FORMAT.md)
 - [ABI manifest](docs/ABI_MANIFEST.md)
 - [Architecture and ownership boundaries](docs/ARCHITECTURE.md)

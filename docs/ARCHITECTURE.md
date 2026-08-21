@@ -1,6 +1,11 @@
 # Architecture
 
-Porpoise Tool is split into a build-time frontend and a generated runtime shim. The frontend translates annotated main/DOL-style title assembly; the shim lets that lifted code run inside a consumer-supplied `libPorpoise` host. The tool does not implement a second SDK, console memory system, or application host.
+Porpoise Tool is split into a build-time frontend and a generated runtime shim.
+The frontend translates annotated title assembly, including managed or
+prepared DTK inputs; the shim lets that lifted code run inside a
+consumer-supplied `libPorpoise` host. It can emit a library-only target for
+prepared module code, but it does not package/load a native REL. The tool does
+not implement a second SDK, console memory system, or application host.
 
 ## Ownership boundary
 
@@ -18,18 +23,48 @@ Porpoise Tool is split into a build-time frontend and a generated runtime shim. 
 
 ## Frontend pipeline
 
-One explicit context flows through the translation pipeline; there is no cross-input register tracker or configuration auto-discovery.
+The CLI, in-process API, and optional desktop workbench share one staged
+recovery pipeline. Classic CLI mode is a compatibility wrapper over these same
+objects.
 
-1. **Options** parse one input, the required output, and optional config/ABI/skip/entry settings. An explicit config is validated before CLI overrides are applied.
-2. **Program loading** recursively discovers `.s`/`.S` inputs, sorts their relative paths, parses `.fn` code plus linked contribution/object data into an in-memory IR, resolves data fixups with file-local scope, and rejects symbol/output-name or guest-range collisions.
-3. **Selection and ABI loading** mark exact skip-list symbols, validate the complete schema-version 1 ABI manifest, and bind explicitly declared imports to matching skipped guest addresses.
-4. **Lowering** looks up each mnemonic in one opcode registry, validates its operand form, emits state-based C, and records a status plus semantic-test flag.
-5. **Project generation** writes runtime support, lifted sources, registries, ABI bridges, Meson metadata, and the JSON report into a sibling staging directory.
-6. **Publication** moves the completed stage into place. When replacing output, the old directory is temporarily backed up and restored if the new stage cannot be published.
+1. **Load/import** validates annotated assembly directly, validates an existing
+   DTK-prepared tree, or imports a trusted local ELF into a fresh managed DTK
+   stage. Source files are read-only.
+2. **Session** recursively parses sorted `.s`/`.S` inputs, resolves linked data
+   and file/section-scoped local symbols, validates additive ABI manifests,
+   skip lists, optional map sources, and exact SDK catalogs, then exposes an
+   immutable `PorpoiseSession`.
+3. **Plan** builds relocation-aware signatures and combines input state, map
+   provenance, SDK policy, bindings, and stable manual overrides into an
+   immutable `PorpoiseTranslationPlan`. Every function has an explicit lift,
+   import, omit, or data action and a blocking reason when incoherent.
+4. **Validate** checks plan/session coherence, entry and export disposition,
+   import contracts, stable locators, data coverage/overlap, and read-only data
+   annotations before lowering begins.
+5. **Generate** lowers only planned functions and writes runtime support,
+   lifted sources, data, registries, ABI bridges, Meson metadata, and a
+   schema-v3 measured report into a sibling stage.
+6. **Publish** installs one stage or an entire multi-target batch. Existing
+   outputs are backed up under a rollback journal and restored as a unit if any
+   publication step fails.
 
-Parsing, unsupported lowering, and strict-mode approximation failures use exit code `3`; I/O and publication failures use `4`. A failed stage is removed and never merged into the requested destination.
+Sessions outlive their borrowing plans. A plan digest binds the selected target
+and decisions to the immutable inputs, so generation rejects a mismatched plan.
+GUI replanning can therefore reuse a loaded session without reparsing.
+Operation callbacks expose load, import, symbols, signatures, plan, validate,
+generate, and publish progress plus cooperative cancellation.
 
-The implementation modules follow those responsibilities: options/configuration, program/IR, ABI validation, opcode lowering, report collection, project publication, and shared filesystem/diagnostic utilities. The old monolithic and duplicate project-generation paths are not part of this architecture.
+Parsing, unsupported lowering, and strict-mode approximation failures use exit
+code `3`; I/O and publication failures use `4`. A failed or cancelled stage is
+removed and never merged into the requested destination. See
+[Recovery workbench architecture](RECOVERY_WORKBENCH.md) for project, map,
+catalog, and transactional details.
+
+The implementation modules follow those responsibilities: options and strict
+project/config parsing, managed DTK import, program/IR, symbol and SDK catalogs,
+immutable sessions/plans, ABI validation, opcode lowering, report/artifact
+generation, transactional publication, and shared filesystem/diagnostic
+utilities.
 
 ## Lifted execution model
 

@@ -1,6 +1,10 @@
 # Annotated assembly input
 
-Porpoise Tool reads a deliberately small annotated assembly dialect. It is not a general PowerPC assembler, preprocessor, disassembler, or DOL reader. The text must already contain function boundaries and an address/encoding comment for every instruction to lift.
+Porpoise Tool reads a deliberately small annotated assembly dialect. It is not a general PowerPC assembler, preprocessor, disassembler, or DOL reader. The text must already contain function boundaries and an address/encoding comment for every instruction to lift. Managed ELF targets use DTK to create this dialect in a fresh derived cache before this parser runs; they are not converted through DOL.
+
+Assembly is always read-only. Direct assembly and prepared DTK trees are never
+rewritten. Managed ELF import writes only to Porpoise-owned staging/cache paths,
+then generation writes to a separate staged output.
 
 ## Input selection
 
@@ -22,7 +26,7 @@ Nested paths are preserved beneath `src/lifted` and the private declaration tree
 .endfn add_one
 ```
 
-`.include`, `.text`, and `.global` are tolerated directives; Porpoise Tool does not execute or interpret them. The function's global/local status comes from the `.fn` line. In particular, `.global main` alone does not make a function eligible for automatic entry selection; use `.fn main, global`. The `.sym` address-alias directive described below is interpreted.
+`.include`, `.text`, and `.global` are tolerated directives; Porpoise Tool does not execute or interpret them. The function's global/local status comes from the `.fn` line. In particular, `.global main` alone does not make a function eligible for automatic entry selection; use `.fn main, global`. The instruction and data forms of `.sym` described below are interpreted.
 
 ## Function blocks
 
@@ -51,7 +55,10 @@ Every function must:
 - have a matching `.endfn`;
 - contain at least one annotated instruction;
 - not contain another `.fn` block;
-- have a unique symbol and nonoverlapping address range among translated functions, apart from the proven exact-duplicate records described below.
+- have a nonoverlapping address range among translated functions, apart from
+  the proven exact-duplicate records described below. Global and weak symbols
+  must be unique; local symbols may repeat in different translation units or
+  sections.
 
 The name following `.endfn` is optional. When present, it must match the open function exactly.
 
@@ -115,14 +122,14 @@ Labels inside a function must end in a colon:
 
 A label may begin with `.`, `_`, or an ASCII letter. Legacy dot-label lines without a colon are treated as directives rather than branch targets. A label is directly visible in its containing function. A uniquely named label may also be used as a cross-function branch target; an ambiguous label name is not resolved globally.
 
-An address alias uses the strict form:
+An instruction-address alias uses the strict form:
 
 ```asm
 .sym alternate_entry, global
 /* 80001100 00000100  42 00 FF FC */  bdnz .loop
 ```
 
-The scope must be exactly `global` or `local`, and quoted names are accepted. An alias immediately before a `.fn` binds to that function's first instruction. An alias inside a function binds to the next annotated instruction. Multiple aliases may bind to the same address, but alias names must remain unique and must not collide with function or label names after C-identifier sanitization. A dangling alias is an error.
+The scope must be exactly `global` or `local`, and quoted names are accepted. This form has no fresh zero-size DTK contribution comment immediately before it. An alias immediately before a `.fn` binds to that function's first instruction. An alias inside a function binds to the next annotated instruction. Multiple aliases may bind to the same address. Global alias names must remain unique and must not collide with global function or label names after C-identifier sanitization. Local aliases are scoped by translation unit and section and receive deterministic names containing their unit/section/address identity. A pending alias may not cross a section directive, and a dangling alias is an error.
 
 Direct and conditional branch targets may resolve to:
 
@@ -164,14 +171,19 @@ same local name.
 
 The interpreted byte emitters are:
 
-- `.byte`, `.2byte`, and `.4byte`, with comma-separated integer literals;
-- `.4byte SYMBOL` and `.4byte SYMBOL+ADDEND` absolute-address fixups;
+- `.byte`; `.2byte`/`.short`; `.4byte`/`.int`/`.word`/`.long`; and
+  `.8byte`/`.quad`, with comma-separated signed or unsigned integer literals
+  checked against the selected width;
+- any four-byte integer spelling with `SYMBOL` or `SYMBOL+ADDEND` for an
+  absolute-address fixup;
 - `.float` and `.double` encoded as big-endian IEEE-754 values;
-- `.string` and `.string16`, including the supported C-style, octal, and quote
-  escapes and their terminating zero;
+- `.string`, `.asciz`, and `.string16`, including the supported C-style,
+  octal, and quote escapes and their terminating zero;
+- `.ascii` for one or more strings without a terminating zero;
 - `.rel BASE, TARGET`, whose existing dialect contract stores the resolved
   absolute target address;
-- `.skip SIZE` for explicit zero-fill storage; and
+- `.skip`, `.space`, and `.zero` for explicit storage with the accepted
+  optional byte fill; and
 - `.balign ALIGNMENT[, FILL]` inside an object.
 
 Decomp-toolkit also emits explicit padding directly between objects. Such a
@@ -184,6 +196,41 @@ Symbolic data expressions are resolved after every input has been parsed. The
 resolver checks object-local labels, same-file objects/functions/aliases and
 labels, then unique global definitions. An unresolved, ambiguous, overflowing,
 or out-of-object fixup fails translation.
+
+### DTK data symbols and section bases
+
+DTK uses the same `.sym` spelling for a data location. Porpoise distinguishes
+that form by its fresh, zero-size contribution metadata:
+
+```asm
+# .data:0x20 | 0x80300020 | size: 0x0
+.sym object_alias, local
+```
+
+The comment supplies the alias section, section offset, and exact linked
+address; `.sym` itself owns and emits no bytes. The metadata size must be zero.
+Outside an object, its section must match the selected section. Inside an open
+`.obj`, the metadata must use that object's section, name an address at the
+current emission cursor within the object, and be followed by `.sym` before
+another semantic directive. These checks prevent an alias from silently
+changing object size or binding to a guessed offset. Data-symbol scopes may be
+`global`, `weak`, or `local`; local symbols resolve in their translation unit.
+
+A zero-size data `.sym` in an executable section such as `.init` or `.text`
+starts a DTK data region. Annotated four-byte records outside `.fn` blocks are
+then preserved verbatim as guest data, even when DTK printed a decoded
+mnemonic, until a section, object, or function transition ends that region.
+They are never lifted merely because the bytes decode as instructions.
+
+Some DTK data fixups refer to a local section-base spelling such as
+`...rodata.0` without emitting its `.sym`. Porpoise synthesizes that name only
+when the same translation unit establishes the named section's base. Every
+data-object candidate must agree on `linked address - section offset`; if the
+unit has no object candidate, an exact range-only contribution may establish
+the base instead. The synthesized alias is local to that unit. No cross-unit
+base is guessed: an unknown base remains unresolved and conflicting same-unit
+candidates are an error. A compatible DTK executable import address-qualifies
+cross-translation-unit local references before Porpoise parses them.
 
 Legacy address-annotated four-byte records remain accepted in data sections:
 

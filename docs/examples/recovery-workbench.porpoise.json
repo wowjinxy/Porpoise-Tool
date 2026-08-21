@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "sdk_catalogs": [
+    "catalogs/local-sdk.json"
+  ],
+  "abi_contracts": [
+    "abi/title.json"
+  ],
+  "targets": [
+    {
+      "id": "main-dol",
+      "enabled": true,
+      "source_kind": "assembly",
+      "input": "input/main/asm",
+      "output": "generated/main",
+      "entry": "main",
+      "strict": false,
+      "sdk_policy": "keep",
+      "symbol_sources": [
+        {
+          "kind": "codewarrior_map",
+          "path": "maps/main.map",
+          "auxiliary_path": null,
+          "module": "",
+          "permissive": false
+        }
+      ],
+      "skip_list": null,
+      "overrides": [],
+      "annotations": [],
+      "cache": null
+    },
+    {
+      "id": "overlay-rel",
+      "enabled": false,
+      "source_kind": "dtk_prepared_assembly",
+      "input": "input/overlay/dtk",
+      "output": "generated/overlay",
+      "entry": null,
+      "strict": false,
+      "sdk_policy": "keep",
+      "symbol_sources": [
+        {
+          "kind": "dtk_symbols",
+          "path": "maps/overlay-symbols.txt",
+          "auxiliary_path": "maps/overlay-splits.txt",
+          "module": "rel:overlay",
+          "permissive": true
+        }
+      ],
+      "skip_list": null,
+      "overrides": [],
+      "annotations": [],
+      "cache": null
+    }
+  ]
+}
