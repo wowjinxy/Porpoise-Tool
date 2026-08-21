@@ -946,12 +946,14 @@ int porpoise_recovery_target_cache_validate(
         int found = recovery_cache_find_cached_dependency(
             &target->cache, current->path, &cached_index);
         if (found < 0) {
-            recovery_cache_dependency_snapshots_free(
-                dependencies, dependency_count);
+            int error_result;
             validation->state = PORPOISE_RECOVERY_CACHE_INVALID;
-            return recovery_cache_error(
+            error_result = recovery_cache_error(
                 diagnostics, PORPOISE_EXIT_USAGE, current->path,
                 "recovery cache contains conflicting duplicate dependencies");
+            recovery_cache_dependency_snapshots_free(
+                dependencies, dependency_count);
+            return error_result;
         }
         if (found == 0) {
             validation->reason_flags |=

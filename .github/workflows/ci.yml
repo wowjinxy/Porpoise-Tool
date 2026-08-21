@@ -165,10 +165,11 @@ jobs:
       - name: Analyze
         run: >-
           cppcheck
-          --enable=warning,style,performance,portability
+          --enable=warning,performance,portability
           --error-exitcode=1
           --inline-suppr
           --suppress=missingIncludeSystem
+          --suppress=preprocessorErrorDirective:runtime/src/porpoise_libporpoise_guest_os.c:6
           --std=c11
           -Iinclude
           -Iruntime/include

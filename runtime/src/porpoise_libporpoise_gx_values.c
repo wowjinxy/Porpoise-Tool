@@ -102,7 +102,7 @@ static void porpoise_gx_write_f32_values(
     const float *values,
     size_t count)
 {
-    uint8_t raw[PORPOISE_GX_MATRIX_4X4_SIZE];
+    uint8_t raw[PORPOISE_GX_MATRIX_4X4_SIZE] = {0};
     size_t index;
 
     for (index = 0U; index < count; index++) {
@@ -175,7 +175,7 @@ void porpoise_libporpoise_gx_call_display_list_adapter(
 void porpoise_libporpoise_gx_set_projection_adapter(
     PorpoisePpcState *state)
 {
-    Mtx44 matrix;
+    Mtx44 matrix = {{0.0f}};
 
     if (state == NULL || porpoise_state_should_stop(state)) {
         return;
@@ -226,7 +226,7 @@ void porpoise_libporpoise_gx_get_projectionv_adapter(
 void porpoise_libporpoise_gx_load_pos_mtx_imm_adapter(
     PorpoisePpcState *state)
 {
-    Mtx matrix;
+    Mtx matrix = {{0.0f}};
 
     if (state == NULL || porpoise_state_should_stop(state)) {
         return;
@@ -246,7 +246,7 @@ void porpoise_libporpoise_gx_load_pos_mtx_imm_adapter(
 void porpoise_libporpoise_gx_load_nrm_mtx_imm_adapter(
     PorpoisePpcState *state)
 {
-    Mtx matrix;
+    Mtx matrix = {{0.0f}};
 
     if (state == NULL || porpoise_state_should_stop(state)) {
         return;
@@ -266,7 +266,7 @@ void porpoise_libporpoise_gx_load_nrm_mtx_imm_adapter(
 void porpoise_libporpoise_gx_load_tex_mtx_imm_adapter(
     PorpoisePpcState *state)
 {
-    Mtx matrix;
+    Mtx matrix = {{0.0f}};
     uint32_t type;
     size_t size;
 
@@ -336,7 +336,7 @@ void porpoise_libporpoise_gx_get_viewportv_adapter(
 void porpoise_libporpoise_gx_set_ind_tex_mtx_adapter(
     PorpoisePpcState *state)
 {
-    Mtx23 matrix;
+    Mtx23 matrix = {{0.0f}};
 
     if (state == NULL || porpoise_state_should_stop(state)) {
         return;

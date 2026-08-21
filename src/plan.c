@@ -658,7 +658,7 @@ static bool populate_sdk_evidence(
     bool has_map_evidence;
     bool canonical_name_seen;
     bool conflict = false;
-    PorpoiseSdkCategory map_category;
+    PorpoiseSdkCategory map_category = PORPOISE_SDK_CATEGORY_NINTENDO_DOLPHIN;
     bool has_map_category = false;
 
     if (!porpoise_signature_compute(

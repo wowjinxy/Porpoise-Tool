@@ -413,12 +413,12 @@ static bool parse_owner_tokens(
     if (owner_index >= token_count) return true;
     if (token_count - owner_index == 1U) {
         *object_out = porpoise_strdup(tokens[owner_index]);
+        return *object_out != NULL;
     } else {
         *library_out = porpoise_strdup(tokens[owner_index]);
         *object_out = porpoise_strdup(tokens[owner_index + 1U]);
     }
-    return (owner_index >= token_count || *object_out != NULL) &&
-           (token_count - owner_index < 2U || *library_out != NULL);
+    return *library_out != NULL && *object_out != NULL;
 }
 
 static bool cw_collect_metadata(

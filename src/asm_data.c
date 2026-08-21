@@ -545,15 +545,20 @@ static bool parse_width_integer(
     uint64_t maximum;
     if (width == 0U || width > sizeof(uint64_t)) return false;
     bits = width * CHAR_BIT;
-    maximum = width == sizeof(uint64_t)
-                  ? UINT64_MAX
-                  : (UINT64_C(1) << bits) - UINT64_C(1);
+    if (width == sizeof(uint64_t)) {
+        maximum = UINT64_MAX;
+    } else {
+        maximum = (UINT64_C(1) << bits) - UINT64_C(1);
+    }
     text = skip_space(text);
     if (*text == '-') {
         long long value;
-        int64_t minimum = width == sizeof(uint64_t)
-                              ? INT64_MIN
-                              : -(INT64_C(1) << (bits - 1U));
+        int64_t minimum;
+        if (width == sizeof(uint64_t)) {
+            minimum = INT64_MIN;
+        } else {
+            minimum = -(INT64_C(1) << (bits - 1U));
+        }
         errno = 0;
         value = strtoll(text, &end, 0);
         if (errno == ERANGE || end == text ||
@@ -1998,7 +2003,8 @@ static bool raw_symbol_entry_belongs_to_file(
     const PorpoiseProgramSymbolIndexEntry *entry,
     const PorpoiseSourceFile *file) {
     return entry->file == file ||
-           (entry->alias != NULL && entry->alias->source_path != NULL &&
+           (file != NULL && entry->alias != NULL &&
+            entry->alias->source_path != NULL &&
             strcmp(entry->alias->source_path, file->path) == 0);
 }
 
@@ -2352,7 +2358,9 @@ static bool build_concrete_ranges(
             range->source_line = word->source_line;
         }
     }
-    qsort(ranges, count, sizeof(*ranges), compare_ranges);
+    if (count > 1U) {
+        qsort(ranges, count, sizeof(*ranges), compare_ranges);
+    }
     for (file_index = 1U; file_index < count; file_index++) {
         const PorpoiseConcreteRange *prior = &ranges[file_index - 1U];
         const PorpoiseConcreteRange *current = &ranges[file_index];

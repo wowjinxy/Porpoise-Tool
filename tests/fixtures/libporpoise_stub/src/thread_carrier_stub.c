@@ -1,3 +1,7 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <porpoise/host_thread_carrier.h>
 #include <porpoise/thread_carrier_stub.h>
 
@@ -281,11 +285,13 @@ LibPorpoiseHostThreadCarrierRequestStopV1(
     return LIBPORPOISE_HOST_THREAD_CARRIER_OK;
 }
 
-static void stub_deadline_after(
+static int stub_deadline_after(
     struct timespec *deadline,
     uint32_t timeout_milliseconds)
 {
-    (void)timespec_get(deadline, TIME_UTC);
+    if (clock_gettime(CLOCK_REALTIME, deadline) != 0) {
+        return 0;
+    }
     deadline->tv_sec += (time_t)(timeout_milliseconds / 1000U);
     deadline->tv_nsec +=
         (long)(timeout_milliseconds % 1000U) * 1000000L;
@@ -293,6 +299,7 @@ static void stub_deadline_after(
         deadline->tv_sec++;
         deadline->tv_nsec -= 1000000000L;
     }
+    return 1;
 }
 
 LibPorpoiseHostThreadCarrierResultV1
@@ -321,7 +328,11 @@ LibPorpoiseHostThreadCarrierJoinV1(
         }
     } else {
         struct timespec deadline;
-        stub_deadline_after(&deadline, timeout_milliseconds);
+        if (!stub_deadline_after(&deadline, timeout_milliseconds)) {
+            (void)pthread_mutex_unlock(&carrier->mutex);
+            stub_restore_scheduler(caller_was_enabled);
+            return LIBPORPOISE_HOST_THREAD_CARRIER_HOST_FAILURE;
+        }
         while (!carrier->finished && wait_result == 0) {
             wait_result = pthread_cond_timedwait(
                 &carrier->condition, &carrier->mutex, &deadline);

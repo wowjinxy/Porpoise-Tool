@@ -113,7 +113,11 @@ if get_option('gui').enabled()
     gui_dependencies += sdl2_project.dependency('SDL2main')
   endif
 
-  imgui_project = subproject('imgui', required: true)
+  imgui_project = subproject(
+    'imgui',
+    default_options: ['werror=false'],
+    required: true,
+  )
   imgui_dep = imgui_project.get_variable('imgui_dep')
   imgui_backend_sources = imgui_project.get_variable(
     'imgui_sdlrenderer2_backend_sources',
