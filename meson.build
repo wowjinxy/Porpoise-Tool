@@ -81,6 +81,49 @@ porpoise = executable(
 # the C99 core and CLI.
 if get_option('gui').enabled()
   add_languages('cpp', native: false, required: true)
+  cpp = meson.get_compiler('cpp')
+
+  # A MinGW executable loads its GCC runtimes before main().  Keep the
+  # compiler-matched DLLs beside the GUI in both the build and install trees so
+  # an unrelated libstdc++ earlier in PATH cannot satisfy those imports.
+  if host_machine.system() == 'windows' and cpp.get_id() == 'gcc'
+    fs = import('fs')
+    cpp_command = cpp.cmd_array()
+    cpp_driver = find_program(cpp_command[cpp_command.length() - 1])
+    cpp_bin_dir = fs.parent(cpp_driver.full_path())
+    mingw_runtime_names = [
+      'libstdc++-6.dll',
+      'libwinpthread-1.dll',
+      'libgcc_s_seh-1.dll',
+      'libgcc_s_dw2-1.dll',
+      'libgcc_s_sjlj-1.dll',
+    ]
+    mingw_runtime_count = 0
+    mingw_libgcc_count = 0
+
+    foreach runtime_name : mingw_runtime_names
+      runtime_path = cpp_bin_dir / runtime_name
+      if fs.is_file(runtime_path)
+        configure_file(
+          input: runtime_path,
+          output: runtime_name,
+          copy: true,
+          install_dir: get_option('bindir'),
+        )
+        mingw_runtime_count += 1
+        if runtime_name.startswith('libgcc_s_')
+          mingw_libgcc_count += 1
+        endif
+      endif
+    endforeach
+
+    if mingw_runtime_count < 3 or mingw_libgcc_count != 1
+      error(
+        'Could not locate one complete MinGW runtime set beside ' +
+        cpp_driver.full_path(),
+      )
+    endif
+  endif
 
   cmake = import('cmake')
   sdl2_options = cmake.subproject_options()

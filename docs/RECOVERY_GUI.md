@@ -15,6 +15,12 @@ meson compile -C build-gui porpoise-gui
 
 Leave `-Dgui=disabled` (the default) for a headless/core-only build.
 
+On Windows with MinGW, configuration copies the matching GCC C++ runtime DLLs
+beside `build-gui/porpoise-gui.exe`, and installation includes the same files.
+This makes direct and packaged launches independent of unrelated MinGW DLLs in
+the global `PATH`. Do not replace those files with runtimes from another
+compiler or architecture.
+
 ## Recommended workflow
 
 1. Create or open a `.porpoise.json` project.

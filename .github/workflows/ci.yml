@@ -122,17 +122,32 @@ jobs:
           workbench-model workbench-gui-startup --print-errorlogs
       - name: Stage release bundle
         run: meson install -C build-gui --destdir "$RUNNER_TEMP/porpoise-gui-windows"
-      - name: Bundle MinGW C++ runtime
+      - name: Verify staged Windows GUI bundle
         run: |
-          gui_exe="$(find "$RUNNER_TEMP/porpoise-gui-windows" -type f -name porpoise-gui.exe -print -quit)"
+          runner_temp="$(cygpath -u "$RUNNER_TEMP")"
+          gui_exe="$(find "$runner_temp/porpoise-gui-windows" -type f -name porpoise-gui.exe -print -quit)"
           test -n "$gui_exe"
           gui_bin="$(dirname "$gui_exe")"
-          compiler_bin="$(dirname "$(command -v g++)")"
-          for runtime in libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll; do
-            runtime_path="$compiler_bin/$runtime"
-            test -f "$runtime_path"
-            cp "$runtime_path" "$gui_bin/"
-          done
+          runtime_imports="$(
+            objdump -p "$gui_exe" |
+              awk '/DLL Name: (libstdc\+\+-6\.dll|libgcc_s_.*-1\.dll|libwinpthread-1\.dll)/ { print $3 }'
+          )"
+          test -n "$runtime_imports"
+
+          poison_path="$runner_temp/porpoise-gui-poison-path"
+          smoke_state="$runner_temp/porpoise-gui-staged-smoke-state"
+          mkdir -p "$poison_path" "$smoke_state"
+          while IFS= read -r runtime; do
+            test -f "$gui_bin/$runtime"
+            : > "$poison_path/$runtime"
+          done <<< "$runtime_imports"
+
+          PATH="$poison_path" \
+          SDL_VIDEODRIVER=dummy \
+          SDL_AUDIODRIVER=dummy \
+          SDL_RENDER_DRIVER=software \
+          PORPOISE_GUI_SMOKE_STATE_DIR="$(cygpath -w "$smoke_state")" \
+            "$gui_exe" --smoke-test
       - uses: actions/upload-artifact@v4
         with:
           name: porpoise-gui-windows
