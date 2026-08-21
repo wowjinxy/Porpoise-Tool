@@ -85,6 +85,22 @@ bool InputOptionalPath(const char *label, std::string &value,
     return changed;
 }
 
+bool InputFolderPath(const char *label, std::string &value) {
+    bool changed = InputTextString(label, value);
+    ImGui::SameLine();
+    ImGui::PushID(label);
+    if (ImGui::Button("Folder...")) {
+        const auto selected = pfd::select_folder(
+            "Select folder", value).result();
+        if (!selected.empty()) {
+            value = selected;
+            changed = true;
+        }
+    }
+    ImGui::PopID();
+    return changed;
+}
+
 std::string Lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char character) {
@@ -115,6 +131,35 @@ const char *SeverityName(PorpoiseSeverity severity) {
     case PORPOISE_SEVERITY_ERROR: return "error";
     }
     return "unknown";
+}
+
+std::string DiagnosticHint(const PorpoiseDiagnostic *diagnostic) {
+    if (diagnostic == nullptr || diagnostic->message == nullptr) return {};
+    const std::string message = diagnostic->message;
+    if (message.find("outside of section .init") != std::string::npos ||
+        message.find("Range 0x00000000") != std::string::npos) {
+        return "The selected DTK build cannot disassemble this executable "
+               "ELF. Select the Porpoise-patched DTK executable, then "
+               "Analyze again.";
+    }
+    if (message.find("overlaps the Porpoise project file") !=
+            std::string::npos ||
+        (message.find("output") != std::string::npos &&
+         message.find("overlaps") != std::string::npos)) {
+        return "Choose an output folder that is separate from the project, "
+               "input, cache, maps, catalogs, and runtime directory.";
+    }
+    if (message.find("approximate host semantics") != std::string::npos) {
+        return "Strict mode rejected an approximate lowering. Review the "
+               "diagnostic, then turn off Strict in Advanced settings if "
+               "that approximation is acceptable for this recovery pass.";
+    }
+    if (message.find("does not exist") != std::string::npos ||
+        message.find("could not open") != std::string::npos) {
+        return "Check the selected source and tool paths, then Analyze again.";
+    }
+    return "Open Diagnostics for the complete context, correct the setting "
+           "shown there, then Analyze again.";
 }
 
 std::string RegisterText(const PorpoiseAbiValue &value) {
@@ -410,9 +455,45 @@ public:
         RequestFileAction(PendingFileAction::NewProject);
         if (pending_file_action_ != PendingFileAction::NewProject ||
             !DiscardPendingFileAction()) return false;
-        return pending_file_action_ == PendingFileAction::None &&
-               !model_.Dirty() && !abi_drafts_dirty_ && abi_drafts_.empty() &&
-               model_.Project().target_count == 0;
+        if (pending_file_action_ != PendingFileAction::None ||
+            model_.Dirty() || abi_drafts_dirty_ || !abi_drafts_.empty() ||
+            model_.Project().target_count != 0) return false;
+
+        /* A run persists both dirty project edits and machine-local tool
+         * selection before launching. Its real failure diagnostic is routed
+         * back to the simple Setup page instead of being hidden in a log. */
+        const auto failure_project =
+            std::filesystem::path(preference_directory_) /
+            "failure-smoke.porpoise.json";
+        if (!model_.NewProject() || !model_.AddTarget("failure") ||
+            !model_.SetTargetPath(
+                0, false,
+                (std::filesystem::path(preference_directory_) /
+                 "missing-input").string()) ||
+            !model_.SetTargetPath(
+                0, true,
+                (std::filesystem::path(preference_directory_) /
+                 "missing-output").string()) ||
+            !model_.SetTargetEntry(0, "before-save") ||
+            !model_.SaveAs(failure_project.string()) ||
+            !model_.SetTargetEntry(0, "saved-before-run")) return false;
+        active_target_ = 0;
+        SyncTargetDraft();
+        dtk_path_ = (std::filesystem::path(preference_directory_) /
+                     "smoke-dtk").string();
+        RequestRun(true);
+        if (model_.State() != WorkerState::Running || model_.Dirty() ||
+            ReadTextFile(failure_project.string()).find("saved-before-run") ==
+                std::string::npos ||
+            ReadTextFile(machine_state_path_).find("dtk=" + dtk_path_) ==
+                std::string::npos) return false;
+        model_.Wait();
+        HandleWorkerCompletion();
+        const auto *primary = model_.PrimaryDiagnostic();
+        return model_.State() == WorkerState::Failed && select_setup_tab_ &&
+               primary != nullptr &&
+               primary->severity == PORPOISE_SEVERITY_ERROR &&
+               primary->message != nullptr && primary->message[0] != '\0';
     }
 
     void OpenInitial(const std::string &path) {
@@ -447,7 +528,7 @@ public:
     }
 
     void Frame() {
-        model_.PollWorker();
+        if (model_.PollWorker()) HandleWorkerCompletion();
         if (open_recovery_popup_) {
             ImGui::OpenPopup("Recovery autosave");
             open_recovery_popup_ = false;
@@ -495,6 +576,16 @@ public:
     }
 
 private:
+    void HandleWorkerCompletion() {
+        if (model_.State() == WorkerState::Failed) {
+            select_setup_tab_ = true;
+            select_diagnostics_tab_ = false;
+        } else if (model_.State() == WorkerState::Succeeded &&
+                   last_run_analyze_only_) {
+            select_functions_tab_ = true;
+        }
+    }
+
     std::string AbiAutosavePath() const {
         const auto project_autosave = model_.AutosavePath();
         return project_autosave.empty() ? std::string()
@@ -554,6 +645,7 @@ private:
     void MarkAbiDraftsDirty() { abi_drafts_dirty_ = true; }
 
     void SyncTargetDraft() {
+        target_draft_error_.clear();
         if (model_.Project().target_count == 0) {
             active_target_ = 0;
             target_draft_ = {};
@@ -608,10 +700,11 @@ private:
         if (!ImGui::BeginPopupModal("Recovery autosave", nullptr,
                                     ImGuiWindowFlags_AlwaysAutoResize)) return;
         ImGui::TextWrapped(
-            "A project or ABI-draft recovery autosave is newer than this "
-            "project. Recovery data is kept outside the project file and "
-            "will not replace saved files until you explicitly save.");
-        if (ImGui::Button("Recover")) {
+            "Newer recovery changes were found for this project. These may "
+            "include the source and output selected during the last session. "
+            "Recover them unless you intentionally want the older saved "
+            "settings.");
+        if (ImGui::Button("Recover newer changes (recommended)")) {
             if (model_.HasNewerAutosave())
                 model_.RecoverAutosave(recovery_document_);
             if (HasNewerAbiAutosave()) RecoverAbiDrafts();
@@ -619,7 +712,8 @@ private:
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Ignore")) ImGui::CloseCurrentPopup();
+        if (ImGui::Button("Use older saved project"))
+            ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
 
@@ -747,11 +841,18 @@ private:
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Run")) {
-            const bool idle = model_.State() != WorkerState::Running &&
-                              model_.State() != WorkerState::Cancelling;
-            if (ImGui::MenuItem("Analyze", nullptr, false, idle))
+            const auto state = model_.State();
+            const bool idle = state != WorkerState::Running &&
+                              state != WorkerState::Cancelling;
+            const bool valid_setup = SetupIssue().empty();
+            const bool ready_to_generate = idle && valid_setup &&
+                state == WorkerState::Succeeded &&
+                model_.RunResult() != nullptr;
+            if (ImGui::MenuItem("Analyze", nullptr, false,
+                                idle && valid_setup))
                 RequestRun(true);
-            if (ImGui::MenuItem("Generate", nullptr, false, idle))
+            if (ImGui::MenuItem("Generate", nullptr, false,
+                                ready_to_generate))
                 RequestRun(false);
             if (ImGui::MenuItem("Cancel", nullptr, false, !idle))
                 model_.Cancel();
@@ -770,11 +871,18 @@ private:
                      ImGuiWindowFlags_NoDecoration |
                      ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoSavedSettings);
-        const bool busy = model_.State() == WorkerState::Running ||
-                          model_.State() == WorkerState::Cancelling;
-        ImGui::BeginDisabled(busy || model_.DocumentPath().empty());
+        const auto state = model_.State();
+        const bool busy = state == WorkerState::Running ||
+                          state == WorkerState::Cancelling;
+        const bool valid_setup = SetupIssue().empty();
+        const bool ready_to_generate = !busy && valid_setup &&
+            state == WorkerState::Succeeded &&
+            model_.RunResult() != nullptr;
+        ImGui::BeginDisabled(busy || !valid_setup);
         if (ImGui::Button("Analyze")) RequestRun(true);
+        ImGui::EndDisabled();
         ImGui::SameLine();
+        ImGui::BeginDisabled(!ready_to_generate);
         if (ImGui::Button("Generate")) RequestRun(false);
         ImGui::EndDisabled();
         ImGui::SameLine();
@@ -787,10 +895,25 @@ private:
             ? (busy ? -1.0f : 0.0f)
             : static_cast<float>(progress.completed) /
                   static_cast<float>(progress.total);
-        std::string overlay = std::string(WorkerStateName(model_.State())) +
-            " · " + porpoise_operation_phase_name(progress.phase);
-        if (!progress.detail.empty()) overlay += " · " + progress.detail;
+        const auto *primary = state == WorkerState::Failed
+            ? model_.PrimaryDiagnostic() : nullptr;
+        std::string overlay;
+        if (state == WorkerState::Failed && primary != nullptr) {
+            overlay = "Failed: " + Text(primary->message);
+        } else {
+            overlay = std::string(WorkerStateName(state)) +
+                " - " + porpoise_operation_phase_name(progress.phase);
+            if (!progress.detail.empty()) overlay += " - " + progress.detail;
+        }
+        if (state == WorkerState::Failed)
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+                                  ImVec4(.75f, .18f, .16f, 1.0f));
         ImGui::ProgressBar(fraction, ImVec2(-1, 0), overlay.c_str());
+        if (state == WorkerState::Failed) {
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered() && primary != nullptr)
+                ImGui::SetTooltip("%s", Text(primary->message).c_str());
+        }
         ImGui::End();
     }
 
@@ -803,6 +926,7 @@ private:
         if (selected.empty()) return;
         if (model_.LoadProject(selected.front())) {
             last_project_ = selected.front();
+            SaveMachineState();
             selected_rows_.clear();
             ResetAbiEditor();
             SyncTargetDraft();
@@ -815,6 +939,10 @@ private:
 
     bool SaveProject(bool force_dialog) {
         ApplyTargetDraft();
+        if (target_draft_dirty_) {
+            select_setup_tab_ = true;
+            return false;
+        }
         std::string path = model_.DocumentPath();
         if (force_dialog || path.empty()) {
             path = pfd::save_file(
@@ -842,13 +970,25 @@ private:
             if (!model_.SaveAs(path)) return false;
         } else if (!model_.Save()) return false;
         last_project_ = path;
+        SaveMachineState();
         SyncTargetDraft();
         return true;
     }
 
     void RequestRun(bool analyze_only) {
         ApplyTargetDraft();
-        if (model_.DocumentPath().empty() && !SaveProject(true)) return;
+        if (target_draft_dirty_) {
+            select_setup_tab_ = true;
+            return;
+        }
+        if (model_.DocumentPath().empty()) {
+            if (!SaveProject(true)) return;
+        } else if ((model_.Dirty() || abi_drafts_dirty_) &&
+                   !SaveProject(false)) {
+            return;
+        }
+        SaveMachineState();
+        last_run_analyze_only_ = analyze_only;
         RunRequest request;
         request.analyze_only = analyze_only;
         request.report_path = report_path_;
@@ -903,10 +1043,15 @@ private:
         }
         ImGui::EndDisabled();
         ImGui::Separator();
-        ImGui::Checkbox("Run active target only", &active_target_only_);
-        ImGui::TextWrapped(
-            "With this off, all enabled targets stage and publish as one "
-            "transaction.");
+        if (project.target_count > 1) {
+            ImGui::Checkbox("Run selected target only", &active_target_only_);
+            ImGui::TextWrapped(
+                "Turn this off to run every enabled target as one "
+                "transaction.");
+        } else {
+            active_target_only_ = true;
+            ImGui::TextDisabled("Running the selected target.");
+        }
         ImGui::Separator();
         ImGui::Text("Plan rows: %zu", BuildRows().size());
         ImGui::Text("Selected: %zu", selected_rows_.size());
@@ -916,34 +1061,222 @@ private:
         else ImGui::Text("Diagnostics: %zu", model_.Diagnostics().count);
     }
 
+    std::filesystem::path ResolveSetupPath(const std::string &value) const {
+        if (value.empty()) return {};
+        std::filesystem::path path(value);
+        if (path.is_absolute()) return path.lexically_normal();
+        if (!model_.DocumentPath().empty()) {
+            return (std::filesystem::path(model_.DocumentPath()).parent_path() /
+                    path).lexically_normal();
+        }
+        if (model_.Project().directory != nullptr) {
+            return (std::filesystem::path(model_.Project().directory) /
+                    path).lexically_normal();
+        }
+        std::error_code error;
+        return (std::filesystem::current_path(error) / path).lexically_normal();
+    }
+
+    std::string SetupIssue() const {
+        if (!target_draft_error_.empty()) return target_draft_error_;
+        if (active_target_ >= model_.Project().target_count)
+            return "Create a target to begin.";
+        if (target_draft_.input.empty()) return "Choose a source input.";
+        const auto input = ResolveSetupPath(target_draft_.input);
+        std::error_code error;
+        if (!std::filesystem::exists(input, error) || error)
+            return "The selected source input does not exist.";
+        const auto &target = model_.Project().targets[active_target_];
+        if (target.source_kind == PORPOISE_RECOVERY_SOURCE_MANAGED_ELF) {
+            if (dtk_path_.empty()) return "Choose a DTK executable.";
+            error.clear();
+            if (!std::filesystem::is_regular_file(dtk_path_, error) || error)
+                return "The selected DTK executable does not exist.";
+        }
+        if (target_draft_.output.empty() || target_draft_.output == ".")
+            return "Choose a dedicated output folder, not the project folder.";
+        if (!model_.DocumentPath().empty()) {
+            const auto project_directory =
+                std::filesystem::path(model_.DocumentPath()).parent_path()
+                    .lexically_normal();
+            if (ResolveSetupPath(target_draft_.output) == project_directory)
+                return "The output folder cannot be the project folder.";
+        }
+        return {};
+    }
+
+    void RenderRunStatusBanner() {
+        if (model_.State() != WorkerState::Failed) return;
+        const auto *primary = model_.PrimaryDiagnostic();
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                              ImVec4(.24f, .055f, .045f, 1.0f));
+        ImGui::BeginChild("run-failure", ImVec2(0, 145), true,
+                          ImGuiWindowFlags_NoScrollbar);
+        ImGui::TextColored(ImVec4(1.0f, .42f, .35f, 1.0f),
+                           "%s failed",
+                           last_run_analyze_only_ ? "Analysis" : "Generation");
+        ImGui::TextWrapped("%s", primary == nullptr
+            ? "The operation failed without a diagnostic."
+            : Text(primary->message).c_str());
+        const auto hint = DiagnosticHint(primary);
+        if (!hint.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, .78f, .42f, 1.0f),
+                               "Next: %s", hint.c_str());
+        }
+        if (ImGui::Button("Back to Setup")) select_setup_tab_ = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Show diagnostics"))
+            select_diagnostics_tab_ = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Retry")) RequestRun(last_run_analyze_only_);
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+    }
+
+    void RenderSetup() {
+        const bool busy = model_.State() == WorkerState::Running ||
+                          model_.State() == WorkerState::Cancelling;
+        ImGui::TextWrapped(
+            "Choose the source and output here, then Analyze. Porpoise saves "
+            "the project before every run and never rewrites the source.");
+        if (active_target_ >= model_.Project().target_count) {
+            if (ImGui::Button("Create recovery target")) {
+                if (model_.AddTarget("target")) {
+                    active_target_ = model_.Project().target_count - 1;
+                    SyncTargetDraft();
+                }
+            }
+            return;
+        }
+
+        auto &target = model_.Project().targets[active_target_];
+        ImGui::BeginDisabled(busy);
+        ImGui::SeparatorText("1. Choose the source");
+        int source_kind = static_cast<int>(target.source_kind);
+        const char *source_kinds[] = {
+            "Assembly file or folder", "Executable ELF (managed DTK)",
+            "Prepared DTK assembly"
+        };
+        if (ImGui::Combo("Source type", &source_kind, source_kinds, 3)) {
+            target.source_kind =
+                static_cast<PorpoiseRecoverySourceKind>(source_kind);
+            model_.MarkDirty();
+        }
+        target_draft_dirty_ |= InputOptionalPath(
+            target.source_kind == PORPOISE_RECOVERY_SOURCE_MANAGED_ELF
+                ? "Game ELF" : "Assembly input",
+            target_draft_.input,
+            target.source_kind != PORPOISE_RECOVERY_SOURCE_MANAGED_ELF,
+            target.source_kind == PORPOISE_RECOVERY_SOURCE_MANAGED_ELF
+                ? "*.elf" : "*.s;*.asm");
+
+        if (target.source_kind == PORPOISE_RECOVERY_SOURCE_MANAGED_ELF) {
+            ImGui::SeparatorText("2. Choose DTK");
+            if (InputOptionalPath("DTK executable", dtk_path_, false,
+#ifdef _WIN32
+                                  "*.exe"
+#else
+                                  "*"
+#endif
+            )) SaveMachineState();
+            ImGui::TextDisabled(
+                "This computer-specific tool path is remembered immediately.");
+        }
+
+        ImGui::SeparatorText(
+            target.source_kind == PORPOISE_RECOVERY_SOURCE_MANAGED_ELF
+                ? "3. Choose the output" : "2. Choose the output");
+        target_draft_dirty_ |=
+            InputFolderPath("Generated project folder", target_draft_.output);
+        ImGui::TextDisabled(
+            "Use a new folder separate from the source and project file.");
+
+        ImGui::SeparatorText("Recovery options");
+        if (ImGui::Checkbox("Strict lowerings", &target.strict))
+            model_.MarkDirty();
+        ImGui::SameLine();
+        ImGui::TextDisabled(
+            target.strict ? "approximate instructions block generation"
+                          : "approximate instructions are reported as warnings");
+        ImGui::Text("SDK handling: %s",
+                    porpoise_sdk_policy_name(target.sdk_policy));
+        ImGui::TextDisabled(
+            "The safe default is keep. Maps, catalogs, policies, and entry "
+            "selection are under Advanced.");
+        ImGui::EndDisabled();
+
+        const auto issue = SetupIssue();
+        if (!issue.empty()) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(1.0f, .68f, .25f, 1.0f),
+                               "Before Analyze: %s", issue.c_str());
+        }
+
+        ImGui::BeginDisabled(busy || !issue.empty());
+        if (ImGui::Button("Analyze", ImVec2(150, 36))) RequestRun(true);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        const bool ready_to_generate = !busy && issue.empty() &&
+            model_.State() == WorkerState::Succeeded &&
+            model_.RunResult() != nullptr;
+        ImGui::BeginDisabled(!ready_to_generate);
+        if (ImGui::Button("Generate", ImVec2(150, 36))) RequestRun(false);
+        ImGui::EndDisabled();
+
+        if (model_.State() == WorkerState::Succeeded &&
+            model_.RunResult() != nullptr) {
+            ImGui::TextColored(ImVec4(.35f, .9f, .5f, 1.0f),
+                               "Ready: %zu functions analyzed.",
+                               BuildRows().size());
+        }
+    }
+
     void RenderWorkspace() {
+        RenderRunStatusBanner();
         if (ImGui::BeginTabBar("workbench-tabs")) {
-            if (ImGui::BeginTabItem("Functions")) {
+            const ImGuiTabItemFlags setup_flags = select_setup_tab_
+                ? ImGuiTabItemFlags_SetSelected : 0;
+            if (ImGui::BeginTabItem("Setup", nullptr, setup_flags)) {
+                select_setup_tab_ = false;
+                RenderSetup();
+                ImGui::EndTabItem();
+            }
+            const ImGuiTabItemFlags function_flags = select_functions_tab_
+                ? ImGuiTabItemFlags_SetSelected : 0;
+            if (ImGui::BeginTabItem(
+                    "Functions", nullptr, function_flags)) {
+                select_functions_tab_ = false;
                 RenderFunctionTable();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Project & Target")) {
-                RenderTargetSettings();
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("DTK Import")) {
-                RenderDtkWizard();
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Data")) {
-                RenderDataEditor();
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("ABI Contracts")) {
-                RenderAbiEditor();
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Diagnostics & Logs")) {
+            const ImGuiTabItemFlags diagnostics_flags =
+                select_diagnostics_tab_ ? ImGuiTabItemFlags_SetSelected : 0;
+            if (ImGui::BeginTabItem(
+                    "Diagnostics", nullptr, diagnostics_flags)) {
+                select_diagnostics_tab_ = false;
                 RenderDiagnostics();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Report & Output")) {
-                RenderReport();
+            if (ImGui::BeginTabItem("Advanced")) {
+                if (ImGui::BeginTabBar("advanced-tabs")) {
+                    if (ImGui::BeginTabItem("Project & Maps")) {
+                        RenderTargetSettings();
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Data")) {
+                        RenderDataEditor();
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("ABI Contracts")) {
+                        RenderAbiEditor();
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Report")) {
+                        RenderReport();
+                        ImGui::EndTabItem();
+                    }
+                    ImGui::EndTabBar();
+                }
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -1278,7 +1611,14 @@ private:
             model_.SetTargetPath(active_target_, true, target_draft_.output) &&
             model_.SetTargetEntry(active_target_, target_draft_.entry) &&
             model_.SetTargetSkipList(active_target_, target_draft_.skip_list);
-        if (okay) target_draft_dirty_ = false;
+        if (okay) {
+            target_draft_dirty_ = false;
+            target_draft_error_.clear();
+        } else {
+            target_draft_error_ =
+                "Target settings could not be applied. Use a unique, nonempty "
+                "target ID and nonempty source/output paths.";
+        }
     }
 
     void RenderTargetSettings() {
@@ -1291,23 +1631,10 @@ private:
             return;
         }
         auto &target = model_.Project().targets[active_target_];
+        ImGui::TextDisabled(
+            "Source and output are configured once in the Setup tab.");
         target_draft_dirty_ |= InputTextString("Target ID", target_draft_.id);
         if (ImGui::Checkbox("Enabled", &target.enabled)) model_.MarkDirty();
-        int source_kind = static_cast<int>(target.source_kind);
-        const char *source_kinds[] = {"Annotated assembly", "Managed ELF",
-                                      "DTK-prepared assembly"};
-        if (ImGui::Combo("Source kind", &source_kind, source_kinds, 3)) {
-            target.source_kind =
-                static_cast<PorpoiseRecoverySourceKind>(source_kind);
-            model_.MarkDirty();
-        }
-        target_draft_dirty_ |= InputOptionalPath(
-            "Input", target_draft_.input,
-            target.source_kind != PORPOISE_RECOVERY_SOURCE_MANAGED_ELF,
-            target.source_kind == PORPOISE_RECOVERY_SOURCE_MANAGED_ELF
-                ? "*.elf" : "*.s;*.asm");
-        target_draft_dirty_ |= InputOptionalPath(
-            "Output folder", target_draft_.output, true);
         target_draft_dirty_ |= InputTextString("Entry symbol", target_draft_.entry);
         if (ImGui::Checkbox("Strict", &target.strict)) model_.MarkDirty();
         int sdk_policy = static_cast<int>(target.sdk_policy);
@@ -1519,69 +1846,6 @@ private:
                 pfd::opt::none).result();
             if (!selected.empty()) model_.AddSharedPath(abi, selected.front());
         }
-    }
-
-    void RenderDtkWizard() {
-        ImGui::TextWrapped(
-            "Managed ELF imports are immutable: Porpoise checks the DTK "
-            "version and elf info, imports to a fresh stage, validates the "
-            "assembly tree, then atomically publishes a hash-bound cache.");
-        InputOptionalPath("DTK executable", dtk_path_, false,
-#ifdef _WIN32
-                          "*.exe"
-#else
-                          "*"
-#endif
-        );
-        if (active_target_ >= model_.Project().target_count) return;
-        const bool busy = model_.State() == WorkerState::Running ||
-                          model_.State() == WorkerState::Cancelling;
-        ImGui::BeginDisabled(busy);
-        auto &target = model_.Project().targets[active_target_];
-        ImGui::SeparatorText("1. Choose source mode");
-        int kind = static_cast<int>(target.source_kind);
-        const char *source_kinds[] = {"Annotated assembly", "Managed ELF",
-                                      "DTK-prepared assembly"};
-        if (ImGui::Combo("Source", &kind, source_kinds, 3)) {
-            target.source_kind =
-                static_cast<PorpoiseRecoverySourceKind>(kind);
-            model_.MarkDirty();
-        }
-        ImGui::SeparatorText("2. Select input");
-        std::string input = Text(target.input.value);
-        if (InputOptionalPath("Source input", input,
-                              target.source_kind !=
-                                  PORPOISE_RECOVERY_SOURCE_MANAGED_ELF,
-                              target.source_kind ==
-                                      PORPOISE_RECOVERY_SOURCE_MANAGED_ELF
-                                  ? "*.elf" : "*.s;*.asm")) {
-            model_.SetTargetPath(active_target_, false, input);
-            SyncTargetDraft();
-        }
-        ImGui::SeparatorText("3. Validate/import and analyze");
-        ImGui::TextWrapped(
-            "Analyze performs the import without generating output. A dirty "
-            "DTK output directory is never reused.");
-        ImGui::BeginDisabled(model_.DocumentPath().empty());
-        if (ImGui::Button("Import / validate now")) RequestRun(true);
-        ImGui::EndDisabled();
-        if (const auto *result = model_.RunResult()) {
-            for (std::size_t index = 0; index < result->target_count; ++index) {
-                const auto &run = result->targets[index];
-                if (run.target != &target) continue;
-                ImGui::SeparatorText("Validated import");
-                ImGui::TextWrapped("Assembly: %s", run.assembly_path);
-                if (target.source_kind != PORPOISE_RECOVERY_SOURCE_ASSEMBLY) {
-                    ImGui::Text("DTK: %s", run.import_result.metadata.dtk_version);
-                    ImGui::Text("Cache: %s", run.import_result.cache_hit
-                                                   ? "reused" : "rebuilt");
-                    ImGui::Text("Functions: %zu · annotations: %zu",
-                        run.import_result.metadata.function_count,
-                        run.import_result.metadata.annotation_count);
-                }
-            }
-        }
-        ImGui::EndDisabled();
     }
 
     void RenderDataEditor() {
@@ -2067,14 +2331,11 @@ private:
         ImGui::SeparatorText("Target outputs");
         for (std::size_t index = 0; index < model_.Project().target_count;
              ++index) {
-            auto &target = model_.Project().targets[index];
-            std::string output = Text(target.output.value);
-            ImGui::PushID(static_cast<int>(index));
-            ImGui::TextUnformatted(Text(target.id).c_str());
-            if (InputOptionalPath("Output", output, true))
-                model_.SetTargetPath(index, true, output);
-            ImGui::PopID();
+            const auto &target = model_.Project().targets[index];
+            ImGui::TextWrapped("%s: %s", Text(target.id).c_str(),
+                               Text(target.output.value).c_str());
         }
+        ImGui::TextDisabled("Change the active target output in Setup.");
     }
 
     WorkbenchModel model_;
@@ -2090,10 +2351,15 @@ private:
     std::string filter_;
     std::string override_contract_;
     bool acknowledge_conflict_ = false;
-    bool active_target_only_ = false;
+    bool active_target_only_ = true;
+    bool select_setup_tab_ = true;
+    bool select_functions_tab_ = false;
+    bool select_diagnostics_tab_ = false;
+    bool last_run_analyze_only_ = true;
     std::size_t active_target_ = 0;
     TargetDraft target_draft_;
     bool target_draft_dirty_ = false;
+    std::string target_draft_error_;
     std::unordered_set<std::string> selected_rows_;
     bool data_use_object_ = false;
     std::size_t active_data_object_ = 0;

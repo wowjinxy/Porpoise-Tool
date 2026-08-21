@@ -165,6 +165,7 @@ public:
 
     const PorpoiseRecoveryRunResult *RunResult() const;
     const PorpoiseDiagnostics &Diagnostics() const { return diagnostics_; }
+    const PorpoiseDiagnostic *PrimaryDiagnostic() const;
 
     FunctionLocator MakeLocator(
         const PorpoiseRecoveryRunTarget &target,

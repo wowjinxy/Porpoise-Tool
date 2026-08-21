@@ -23,13 +23,18 @@ compiler or architecture.
 
 ## Recommended workflow
 
-1. Create or open a `.porpoise.json` project.
-2. Configure shared exact catalogs and ABI manifests.
-3. Add targets and choose annotated assembly, managed ELF import, or prepared
-   DTK assembly. Set output, entry, strictness, SDK policy, maps, and skip list.
-4. Run analysis. Parsing, import, signatures, and planning execute on a worker;
-   the UI remains responsive and displays phase progress and logs.
-5. Filter and sort the function table. Review source/canonical name,
+1. Open **Setup**, create or select a target, and choose annotated assembly,
+   managed ELF, or prepared DTK assembly.
+2. Select the input and output folder. Managed ELF targets also require a DTK
+   executable. The workbench remembers that DTK selection as machine-only
+   state for later launches; it is not written into the shared project file.
+3. Leave the SDK policy at `keep` and **Strict** off for the first recovery
+   pass. New GUI targets default to those settings. Existing projects retain
+   their saved strictness.
+4. Select **Analyze**. The workbench saves the project first (opening Save As
+   for an untitled project), then runs import, parsing, signatures, planning,
+   and validation on a worker.
+5. Filter and sort **Functions**. Review source/canonical name,
    translation unit, section, address, size, category, confidence, proposed
    action, binding, provenance, conflict state, and override state.
 6. Open evidence/disassembly details before applying `Auto`, `Lift`,
@@ -37,13 +42,16 @@ compiler or architecture.
    bulk changes. Replanning reuses the loaded immutable session.
 7. Resolve every blocking diagnostic, then generate. All selected targets are
    staged before the transactional publish begins.
-8. Save the project explicitly. Treat an autosave as crash recovery, not as a
-   committed project revision.
+8. Use the **Advanced** tabs only when needed for project details, maps and
+   catalogs, data annotations, ABI contracts, reports, or output options.
 
-Other views expose target/project settings, the DTK import flow, data
-annotations, diagnostics, progress, logs, schema-v3 reports, and output-folder
-controls. Overwrite confirmation maps to the same operational `force` flag as
-the CLI and is not persisted.
+An unsuccessful run displays the first error and a corrective hint inline.
+Use **Back to Setup** to correct input, DTK, output, or strictness, or **Show
+diagnostics** for the complete error list and progress log. The workbench never
+changes Strict mode or another recovery policy silently.
+
+Overwrite confirmation maps to the same operational `force` flag as the CLI
+and is not persisted.
 
 ## Data editor
 
@@ -85,13 +93,15 @@ it removes unpublished staging data and leaves existing outputs untouched. If
 publication has started, the batch rollback journal restores the prior output
 set before cancellation completes.
 
-Project saves are explicit. The workbench maintains separate recovery autosaves
-for the project and unsaved direct-ABI drafts and offers either one when newer
-than the document. Untitled project and ABI-draft autosaves are discovered at
-startup before the last saved project is reopened, so a crash before the first
-Save As remains recoverable. Saving atomically replaces the selected local ABI
-manifest (or a project-adjacent default), adds that manifest to `abi_contracts`,
-and then saves the project. Window layout, recent paths, filters, recovery
+Analyze and Generate save the current project before starting, so the document
+on disk describes the run being performed. The workbench also maintains
+separate crash-recovery autosaves for the project and unsaved direct-ABI drafts
+and offers either one when newer than the document. Untitled project and
+ABI-draft autosaves are discovered at startup before the last saved project is
+reopened, so a crash before the first Save As remains recoverable. Saving
+atomically replaces the selected local ABI manifest (or a project-adjacent
+default), adds that manifest to `abi_contracts`, and then saves the project.
+Window layout, the selected DTK executable, recent paths, filters, recovery
 drafts, and other machine-only UI state remain outside `.porpoise.json`, so
 sharing a project does not share developer-specific state.
 

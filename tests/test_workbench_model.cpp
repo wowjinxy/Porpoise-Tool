@@ -138,6 +138,96 @@ void TestModel(const std::filesystem::path &source,
         "  .byte 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f\n"
         ".endobj editable_blob\n");
 
+    {
+        WorkbenchModel diagnostics;
+        CHECK(diagnostics.PrimaryDiagnostic() == nullptr);
+        CHECK(!diagnostics.LoadProject(
+            (temporary / "missing-project.porpoise.json").string()));
+        const auto *primary = diagnostics.PrimaryDiagnostic();
+        CHECK(primary != nullptr);
+        if (primary != nullptr)
+            CHECK(primary->severity == PORPOISE_SEVERITY_ERROR);
+    }
+
+    /* New targets begin with safe, distinct project-relative locations and
+     * permissive analysis so the first run does not require expert setup. */
+    {
+        WorkbenchModel defaults;
+        CHECK(defaults.NewProject());
+        CHECK(defaults.AddTarget("sample"));
+        CHECK(defaults.AddTarget("sample"));
+        CHECK(defaults.Project().target_count == 2);
+        if (defaults.Project().target_count == 2) {
+            const auto &first = defaults.Project().targets[0];
+            const auto &second = defaults.Project().targets[1];
+            CHECK(std::string(first.id) == "sample");
+            CHECK(std::string(first.input.value) == "input");
+            CHECK(std::string(first.output.value) ==
+                  "porpoise-output/sample");
+            CHECK(!first.strict);
+            CHECK(std::string(second.id) == "sample-2");
+            CHECK(std::string(second.input.value) == "input");
+            CHECK(std::string(second.output.value) ==
+                  "porpoise-output/sample-2");
+            CHECK(!second.strict);
+        }
+    }
+
+    /* Saving a never-published project interprets its relative defaults beside
+     * the selected project, rather than beside the process working directory. */
+    {
+        const auto destination = temporary / "direct-save-as";
+        std::filesystem::create_directories(destination, error);
+        CHECK(!error);
+        WorkbenchModel untitled;
+        CHECK(untitled.NewProject());
+        CHECK(untitled.AddTarget("direct"));
+        const auto document = destination / "direct.porpoise.json";
+        CHECK(untitled.SaveAs(document.string()));
+        const auto &target = untitled.Project().targets[0];
+        CHECK(std::string(target.input.value) == "input");
+        CHECK(std::string(target.output.value) ==
+              "porpoise-output/direct");
+        CHECK(std::filesystem::path(target.input.resolved).lexically_normal() ==
+              (destination / "input").lexically_normal());
+        CHECK(std::filesystem::path(target.output.resolved).lexically_normal() ==
+              (destination / "porpoise-output" / "direct").lexically_normal());
+    }
+
+    /* An untitled recovery autosave is stored under machine state, but Save As
+     * still binds its relative paths to the user-selected project directory. */
+    {
+        const auto recovery_directory = temporary / "rebase-recovery";
+        const auto destination = temporary / "recovered-save-as";
+        std::filesystem::create_directories(recovery_directory, error);
+        CHECK(!error);
+        std::filesystem::create_directories(destination, error);
+        CHECK(!error);
+        WorkbenchModel draft;
+        CHECK(draft.SetUntitledRecoveryDirectory(recovery_directory.string()));
+        CHECK(draft.NewProject());
+        CHECK(draft.AddTarget("recovered"));
+        CHECK(draft.Autosave());
+
+        WorkbenchModel recovered;
+        CHECK(recovered.SetUntitledRecoveryDirectory(
+            recovery_directory.string()));
+        CHECK(recovered.NewProject());
+        CHECK(recovered.RecoverAutosave(""));
+        CHECK(recovered.DocumentPath().empty());
+        const auto document = destination / "recovered.porpoise.json";
+        CHECK(recovered.SaveAs(document.string()));
+        const auto &target = recovered.Project().targets[0];
+        CHECK(std::string(target.input.value) == "input");
+        CHECK(std::string(target.output.value) ==
+              "porpoise-output/recovered");
+        CHECK(std::filesystem::path(target.input.resolved).lexically_normal() ==
+              (destination / "input").lexically_normal());
+        CHECK(std::filesystem::path(target.output.resolved).lexically_normal() ==
+              (destination / "porpoise-output" /
+               "recovered").lexically_normal());
+    }
+
     /* Never-saved documents use a discoverable recovery identity. Loading the
      * recovery keeps the document untitled and does not bind the in-memory
      * project to the hidden autosave filename. */

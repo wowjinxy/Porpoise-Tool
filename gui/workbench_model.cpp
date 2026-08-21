@@ -647,6 +647,84 @@ bool PublishAdjacentFileAtomically(
 #endif
 }
 
+struct RelativePathRebinding {
+    PorpoiseRecoveryPath *path = nullptr;
+    char *original_resolved = nullptr;
+    char *rebound_resolved = nullptr;
+};
+
+bool PrepareRelativePathRebinding(
+    PorpoiseRecoveryPath &path,
+    const std::filesystem::path &destination_directory,
+    std::vector<RelativePathRebinding> *rebindings) {
+    if (path.value == nullptr || IsAbsolutePortable(path.value)) return true;
+    char *resolved = Duplicate(GenericPath(
+        destination_directory / std::filesystem::path(path.value)));
+    if (resolved == nullptr) return false;
+    rebindings->push_back({&path, path.resolved, resolved});
+    return true;
+}
+
+bool PrepareUntitledPathRebindings(
+    PorpoiseRecoveryProject &project,
+    const std::filesystem::path &destination_directory,
+    std::vector<RelativePathRebinding> *rebindings) {
+    for (std::size_t index = 0; index < project.sdk_catalog_count; ++index) {
+        if (!PrepareRelativePathRebinding(
+                project.sdk_catalogs[index], destination_directory,
+                rebindings)) return false;
+    }
+    for (std::size_t index = 0; index < project.abi_contract_count; ++index) {
+        if (!PrepareRelativePathRebinding(
+                project.abi_contracts[index], destination_directory,
+                rebindings)) return false;
+    }
+    for (std::size_t target_index = 0;
+         target_index < project.target_count; ++target_index) {
+        auto &target = project.targets[target_index];
+        if (!PrepareRelativePathRebinding(
+                target.input, destination_directory, rebindings) ||
+            !PrepareRelativePathRebinding(
+                target.output, destination_directory, rebindings)) {
+            return false;
+        }
+        if (target.has_skip_list && !PrepareRelativePathRebinding(
+                target.skip_list, destination_directory, rebindings)) {
+            return false;
+        }
+        for (std::size_t source_index = 0;
+             source_index < target.symbol_source_count; ++source_index) {
+            auto &source = target.symbol_sources[source_index];
+            if (!PrepareRelativePathRebinding(
+                    source.path, destination_directory, rebindings) ||
+                (source.has_auxiliary_path && !PrepareRelativePathRebinding(
+                    source.auxiliary_path, destination_directory,
+                    rebindings))) {
+                return false;
+            }
+        }
+        for (std::size_t dependency_index = 0;
+             dependency_index < target.cache.dependency_count;
+             ++dependency_index) {
+            if (!PrepareRelativePathRebinding(
+                    target.cache.dependencies[dependency_index].path,
+                    destination_directory, rebindings)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void ReleasePathRebindings(
+    std::vector<RelativePathRebinding> *rebindings, bool restore) {
+    for (auto &rebinding : *rebindings) {
+        if (restore) rebinding.path->resolved = rebinding.original_resolved;
+        std::free(rebinding.rebound_resolved);
+    }
+    rebindings->clear();
+}
+
 }  // namespace
 
 bool FunctionFilterMatches(
@@ -713,6 +791,16 @@ void WorkbenchModel::AddLocalDiagnostic(PorpoiseSeverity severity,
                              document_path_.empty()
                                  ? nullptr : document_path_.c_str(),
                              0, 0, "%s", message.c_str());
+}
+
+const PorpoiseDiagnostic *WorkbenchModel::PrimaryDiagnostic() const {
+    const PorpoiseDiagnostic *primary = nullptr;
+    for (std::size_t index = 0; index < diagnostics_.count; ++index) {
+        const auto *candidate = &diagnostics_.items[index];
+        if (primary == nullptr || candidate->severity > primary->severity)
+            primary = candidate;
+    }
+    return primary;
 }
 
 bool WorkbenchModel::NewProject() {
@@ -812,8 +900,27 @@ bool WorkbenchModel::SaveAs(const std::string &path) {
     if (path.empty() || State() == WorkerState::Running ||
         State() == WorkerState::Cancelling) return false;
     ResetDiagnostics();
-    if (porpoise_recovery_project_save(
-            &project_, path.c_str(), &diagnostics_) != PORPOISE_EXIT_OK) {
+    std::vector<RelativePathRebinding> rebindings;
+    if (document_path_.empty()) {
+        std::error_code error;
+        const auto destination = std::filesystem::absolute(path, error);
+        if (error || !PrepareUntitledPathRebindings(
+                project_, destination.parent_path(), &rebindings)) {
+            ReleasePathRebindings(&rebindings, false);
+            AddLocalDiagnostic(
+                PORPOISE_SEVERITY_ERROR,
+                error ? "could not resolve the Save As project directory: " +
+                            error.message()
+                      : "out of memory while rebinding relative project paths");
+            return false;
+        }
+        for (auto &rebinding : rebindings)
+            rebinding.path->resolved = rebinding.rebound_resolved;
+    }
+    const int save_result = porpoise_recovery_project_save(
+        &project_, path.c_str(), &diagnostics_);
+    ReleasePathRebindings(&rebindings, true);
+    if (save_result != PORPOISE_EXIT_OK) {
         return false;
     }
     /* Reload to bind all relative paths to the new project location. */
@@ -867,8 +974,24 @@ bool WorkbenchModel::Autosave() {
     if (path.empty()) return false;
     PorpoiseDiagnostics autosave_diagnostics;
     porpoise_diagnostics_init(&autosave_diagnostics);
+    std::vector<RelativePathRebinding> rebindings;
+    if (document_path_.empty()) {
+        const auto destination = std::filesystem::path(path);
+        if (!PrepareUntitledPathRebindings(
+                project_, destination.parent_path(), &rebindings)) {
+            ReleasePathRebindings(&rebindings, false);
+            porpoise_diagnostics_free(&autosave_diagnostics);
+            AddLocalDiagnostic(
+                PORPOISE_SEVERITY_ERROR,
+                "out of memory while rebinding relative autosave paths");
+            return false;
+        }
+        for (auto &rebinding : rebindings)
+            rebinding.path->resolved = rebinding.rebound_resolved;
+    }
     const int result = porpoise_recovery_project_save(
         &project_, path.c_str(), &autosave_diagnostics);
+    ReleasePathRebindings(&rebindings, true);
     if (result != PORPOISE_EXIT_OK) {
         for (std::size_t index = 0; index < autosave_diagnostics.count;
              ++index) {
@@ -954,10 +1077,10 @@ bool WorkbenchModel::AddTarget(const std::string &preferred_id) {
     target.id = Duplicate(id);
     target.enabled = true;
     target.source_kind = PORPOISE_RECOVERY_SOURCE_ASSEMBLY;
-    target.strict = true;
+    target.strict = false;
     target.sdk_policy = PORPOISE_SDK_POLICY_KEEP;
-    if (target.id == nullptr || !SetPath(target.input, ".") ||
-        !SetPath(target.output, "porpoise-output")) {
+    if (target.id == nullptr || !SetPath(target.input, "input") ||
+        !SetPath(target.output, "porpoise-output/" + id)) {
         FreeTarget(target);
         return false;
     }
