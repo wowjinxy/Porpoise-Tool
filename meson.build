@@ -88,9 +88,7 @@ if get_option('gui').enabled()
     'SDL2_DISABLE_INSTALL': true,
     'SDL_SHARED': false,
     'SDL_STATIC': true,
-    # SDL supplies its portable libc shims. Besides reducing host variation,
-    # this avoids hundreds of compiler probes in the bundled configuration.
-    'SDL_LIBC': false,
+    'SDL_LIBC': true,
     'SDL_TEST': false,
     'SDL_TESTS': false,
   })

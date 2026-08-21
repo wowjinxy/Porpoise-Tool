@@ -127,8 +127,9 @@ jobs:
           gui_exe="$(find "$RUNNER_TEMP/porpoise-gui-windows" -type f -name porpoise-gui.exe -print -quit)"
           test -n "$gui_exe"
           gui_bin="$(dirname "$gui_exe")"
+          compiler_bin="$(dirname "$(command -v g++)")"
           for runtime in libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll; do
-            runtime_path="$(g++ -print-file-name="$runtime")"
+            runtime_path="$compiler_bin/$runtime"
             test -f "$runtime_path"
             cp "$runtime_path" "$gui_bin/"
           done
