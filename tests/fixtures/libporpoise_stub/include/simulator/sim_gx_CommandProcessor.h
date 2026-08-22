@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION 1
+#define SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION 2
 
 typedef enum GXBool {
     GX_FALSE = 0,
@@ -20,6 +20,9 @@ void SIM_GX_CommandProcessor_SendS16(s16 data);
 void SIM_GX_CommandProcessor_SendU32(u32 data);
 void SIM_GX_CommandProcessor_SendF32(f32 data);
 GXBool SIM_GX_CommandProcessor_SendCanonicalBytes(
+    const u8 *data,
+    u32 size);
+GXBool SIM_GX_CommandProcessor_QueueCanonicalBytes(
     const u8 *data,
     u32 size);
 

@@ -78,6 +78,23 @@ int porpoise_libporpoise_gx_init_commit(
 int porpoise_libporpoise_gx_require_active(
     PorpoisePpcState *state);
 
+/* Queue canonical write-gather bytes in-order when libPorpoise exposes the
+ * version-2 ingress. Version 1 remains a synchronous compatibility fallback.
+ * This is used for complete commands such as GXBegin; ordinary WGPIPE stores
+ * are coalesced privately and flushed at imported-call ordering boundaries. */
+int porpoise_libporpoise_gx_queue_canonical_bytes(
+    const uint8_t *bytes,
+    size_t size);
+
+int porpoise_libporpoise_gx_flush_pending(PorpoisePpcState *state);
+
+/* Complete all previously submitted GX work without flushing libPorpoise's
+ * private SDK shadow state into the shared command processor. Lifted guests
+ * own the FIFO state, so native GXDrawDone would overwrite their VCD/VAT
+ * registers with unrelated native defaults. */
+int porpoise_libporpoise_gx_complete_draw(
+    PorpoisePpcState *state);
+
 /* Validate and decode one complete ordinary-RAM guest span for a native GX
  * call. Tokens, MMIO, holes, guest/host misalignment, and overflow fault
  * before the native API sees a pointer. Alignment must be a power of two. */

@@ -1,3 +1,4 @@
+#include "porpoise/build.h"
 #include "porpoise/options.h"
 #include "porpoise/plan.h"
 #include "porpoise/project.h"
@@ -8,6 +9,7 @@
 #include "porpoise/util.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void print_diagnostics(
@@ -49,6 +51,84 @@ static void print_project_progress(
     fputc('\n', stderr);
 }
 
+static void print_build_progress(
+    void *user_data,
+    PorpoiseBuildPhase phase,
+    size_t completed,
+    size_t total,
+    const char *detail) {
+    const PorpoiseOptions *options = (const PorpoiseOptions *)user_data;
+    if (options == NULL ||
+        options->verbosity != PORPOISE_VERBOSITY_VERBOSE) {
+        return;
+    }
+    fprintf(stderr, "porpoise: %s", porpoise_build_phase_name(phase));
+    if (total != 0U) {
+        fprintf(stderr, " %lu/%lu", (unsigned long)completed,
+                (unsigned long)total);
+    }
+    if (detail != NULL && detail[0] != '\0') {
+        fprintf(stderr, ": %s", detail);
+    }
+    fputc('\n', stderr);
+}
+
+static void print_build_log(
+    void *user_data,
+    PorpoiseBuildPhase phase,
+    bool standard_error,
+    const char *text,
+    size_t length) {
+    const PorpoiseOptions *options = (const PorpoiseOptions *)user_data;
+    FILE *stream;
+    (void)phase;
+    if (options == NULL || options->verbosity == PORPOISE_VERBOSITY_QUIET ||
+        text == NULL || length == 0U) {
+        return;
+    }
+    stream = standard_error ? stderr : stdout;
+    (void)fwrite(text, 1U, length, stream);
+    (void)fflush(stream);
+}
+
+static void configure_build_request(
+    PorpoiseBuildRequest *request,
+    const PorpoiseOptions *options,
+    const PorpoiseRecoveryRunTarget *target) {
+    porpoise_build_request_init(request);
+    request->project_file = options->project_path;
+    request->target_id = target->target->id;
+    request->generated_directory = target->target->output.resolved;
+    request->libporpoise_directory =
+        options->libporpoise_path[0] == '\0' ?
+            NULL : options->libporpoise_path;
+    request->recovery_target = target->target;
+    request->plan = target->plan;
+    if (options->meson_path[0] != '\0') {
+        request->meson_executable = options->meson_path;
+    }
+    if (options->cc_path[0] != '\0') {
+        request->c_compiler = options->cc_path;
+    }
+    if (options->cxx_path[0] != '\0') {
+        request->cpp_compiler = options->cxx_path;
+    }
+    request->build_type = options->build_type;
+    request->generated_plan_digest = porpoise_plan_digest(target->plan);
+    request->dvd_root = options->dvd_root_path[0] == '\0' ?
+        NULL : options->dvd_root_path;
+    request->trace_file = options->trace_path[0] == '\0' ?
+        NULL : options->trace_path;
+    request->frame_limit = options->frame_limit;
+    request->reject_approximations =
+        getenv(PORPOISE_REJECT_APPROXIMATIONS_ENV) != NULL &&
+        strcmp(getenv(PORPOISE_REJECT_APPROXIMATIONS_ENV), "1") == 0;
+    request->force_reconfigure = options->force;
+    request->callbacks.progress = print_build_progress;
+    request->callbacks.log = print_build_log;
+    request->callbacks.user_data = (void *)options;
+}
+
 static int run_project_mode(
     const PorpoiseOptions *options,
     PorpoiseDiagnostics *diagnostics) {
@@ -71,6 +151,22 @@ static int run_project_mode(
         &project, options->project_path, diagnostics);
     if (result != PORPOISE_EXIT_OK) goto finished;
 
+    if (options->run && options->target_id_count == 0U) {
+        size_t enabled_count = 0U;
+        for (index = 0U; index < project.target_count; index++) {
+            if (project.targets[index].enabled) enabled_count++;
+        }
+        if (enabled_count != 1U) {
+            porpoise_diagnostics_add(
+                diagnostics, PORPOISE_SEVERITY_ERROR,
+                options->project_path, 0U, 0U,
+                "--run requires exactly one enabled target; found %lu",
+                (unsigned long)enabled_count);
+            result = PORPOISE_EXIT_USAGE;
+            goto finished;
+        }
+    }
+
     for (index = 0U; index < options->target_id_count; index++) {
         target_ids[index] = options->target_ids[index];
     }
@@ -88,6 +184,35 @@ static int run_project_mode(
     run_options.operation = &operation;
     result = porpoise_recovery_project_run(
         &project, &run_options, &run_result, diagnostics);
+
+    if (result == PORPOISE_EXIT_OK && options->build) {
+        for (index = 0U; index < run_result.target_count; index++) {
+            const PorpoiseRecoveryRunTarget *target =
+                &run_result.targets[index];
+            PorpoiseBuildRequest build_request;
+            PorpoiseBuildResult build_result;
+            configure_build_request(&build_request, options, target);
+            porpoise_build_result_init(&build_result);
+            result = porpoise_project_build(
+                &build_request, &build_result, diagnostics);
+            if (result != PORPOISE_EXIT_OK) break;
+            if (options->verbosity != PORPOISE_VERBOSITY_QUIET) {
+                fprintf(stdout, "Built target %s in %s%s.\n",
+                        target->target->id, build_result.cache_directory,
+                        build_result.cache_reused ? " (cache reused)" : "");
+            }
+            if (options->run) {
+                result = porpoise_project_run(
+                    &build_request, &build_result, diagnostics);
+                if (result == PORPOISE_EXIT_OK &&
+                    options->verbosity != PORPOISE_VERBOSITY_QUIET) {
+                    fprintf(stdout, "Ran target %s successfully.\n",
+                            target->target->id);
+                }
+                break;
+            }
+        }
+    }
 
     if (result == PORPOISE_EXIT_OK &&
         options->verbosity != PORPOISE_VERBOSITY_QUIET) {

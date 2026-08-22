@@ -385,6 +385,11 @@ class InputTests(unittest.TestCase):
   00000040 000020 80001040  4 OSReportExtra gx.a os.c
   00000060 000020 80001060  4 VIConfigure demo.a demo.c
   00000080 000020 80001080  4 ARInit title.o
+  000000a0 000020 800010a0  4 OSInit os.a OS.c
+  000000c0 000020 800010c0  4 DVDInit dvd.a dvd.c
+  000000e0 000020 800010e0  4 VIInit vi.a vi.c
+  00000100 000020 80001100  4 DEMOPadInit demo.a DEMOPad.c
+  00000120 000020 80001120  4 VIWaitForRetrace vi.a vi.c
 .data section layout
 """
         with tempfile.TemporaryDirectory(prefix="porpoise-catalog-test-") as temporary:
@@ -398,16 +403,69 @@ class InputTests(unittest.TestCase):
                 ("GXInit", "runtime", None),
                 ("OSReportExtra", "nintendo_dolphin", None),
                 ("VIConfigure", "demo", None),
+                ("OSInit", "nintendo_dolphin", "OSInit"),
+                ("DVDInit", "nintendo_dolphin", "DVDInit"),
+                ("VIInit", "nintendo_dolphin", "VIInit"),
+                ("DEMOPadInit", "demo", "DEMOPadInit"),
+                ("VIWaitForRetrace", "nintendo_dolphin", "VIWaitForRetrace"),
             ],
+        )
+        self.assertIsNone(
+            catalog_tool._builtin_contract_for_identity(
+                "gx.a/OS.c/OSInit", "nintendo_dolphin"
+            )
+        )
+        self.assertIsNone(
+            catalog_tool._builtin_contract_for_identity(
+                "demo.a/Other.c/DEMOPadInit", "demo"
+            )
+        )
+        self.assertEqual(
+            catalog_tool._builtin_contract_for_identity(
+                "gx.a/GXGeometry.c/GXBegin", "nintendo_dolphin"
+            ),
+            "GXBegin",
+        )
+        self.assertIsNone(
+            catalog_tool._builtin_contract_for_identity(
+                "gx.a/Other.c/GXBegin", "nintendo_dolphin"
+            )
         )
 
     def test_builtin_contract_names_match_the_c_registry(self):
         source = (ROOT / "src" / "sdk_contract.c").read_text(encoding="utf-8")
         names = re.findall(
-            r'SDK_CONTRACT\(\s*"[^"]+"\s*,\s*"([^"]+)"', source
+            r'SDK_(?:EXACT_)?CONTRACT\(\s*"[^"]+"\s*,\s*"([^"]+)"',
+            source,
         )
         self.assertEqual(len(names), len(set(names)))
         self.assertEqual(frozenset(names), catalog_tool._BUILTIN_SDK_CONTRACTS)
+
+        exact_pairs = re.findall(
+            r'SDK_EXACT_CONTRACT\(\s*"[^"]+"\s*,\s*"([^"]+)"'
+            r'\s*,\s*"([^"]+)"',
+            source,
+        )
+        exact_contracts = {
+            identity: name for name, identity in exact_pairs
+        }
+        self.assertEqual(
+            exact_contracts,
+            catalog_tool._BUILTIN_EXACT_SDK_CONTRACTS,
+        )
+        for identity, name in exact_contracts.items():
+            with self.subTest(identity=identity):
+                self.assertEqual(
+                    catalog_tool._builtin_contract_for_identity(
+                        identity, "nintendo_dolphin"
+                    ),
+                    name,
+                )
+                self.assertIsNone(
+                    catalog_tool._builtin_contract_for_identity(
+                        f"other.a/Other.c/{name}", "nintendo_dolphin"
+                    )
+                )
 
     def test_custom_map_archive_is_an_exact_explicit_assignment(self):
         map_text = """.text section layout

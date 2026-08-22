@@ -2,6 +2,7 @@
 
 #include "porpoise/sdk_contract.h"
 #include "porpoise/util.h"
+#include "sdk_guest_layout_internal.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -18,6 +19,39 @@ static const char *const BLOCK_INPUT_DATA =
     "an assembly data region cannot be reclassified as code";
 static const char *const BLOCK_SKIPPED_LIFT =
     "a skip-list function cannot be lifted by an override";
+static const char *const BLOCK_INTERIOR_ENTRY =
+    "a function with relocation-backed interior entry points must remain lifted";
+
+typedef struct PorpoiseAuditedInteriorImport {
+    const char *canonical_name;
+    const char *canonical_identity;
+    const char *host_adapter;
+} PorpoiseAuditedInteriorImport;
+
+/*
+ * These two exact GX SDK bodies use private relocation-backed jump tables to
+ * select a basic block inside the function. The table entries are consumed
+ * only by the body being replaced; they are not public callable entry points.
+ * Their specialized adapters perform the complete operation against the
+ * native GX owner, so retaining an interior dispatcher would instead expose
+ * a partial console implementation with no valid native-state semantics.
+ *
+ * Keep this exception closed over all three audited identities. A catalog
+ * name, a similarly named function, or a direct/user ABI contract is not
+ * sufficient to bypass the normal interior-entry safety rule.
+ */
+static const PorpoiseAuditedInteriorImport audited_interior_imports[] = {
+    {
+        "GXSetVtxDesc",
+        "gx.a/GXAttr.c/GXSetVtxDesc",
+        "porpoise_libporpoise_gx_set_vtx_desc_adapter"
+    },
+    {
+        "GXSetVtxAttrFmt",
+        "gx.a/GXAttr.c/GXSetVtxAttrFmt",
+        "porpoise_libporpoise_gx_set_vtx_attr_fmt_adapter"
+    }
+};
 
 void porpoise_plan_options_init(PorpoisePlanOptions *options) {
     if (options == NULL) return;
@@ -541,8 +575,66 @@ static const char *contract_name_for_entry(
 static const PorpoiseSdkContract *builtin_contract_for_entry(
     const PorpoiseSdkCatalogEntry *entry,
     const char *override_name) {
-    return porpoise_sdk_contract_find_by_canonical_name(
-        contract_name_for_entry(entry, override_name));
+    const PorpoiseSdkContract *contract =
+        porpoise_sdk_contract_find_by_canonical_name(
+            contract_name_for_entry(entry, override_name));
+    if (contract == NULL && entry != NULL &&
+        (override_name == NULL || override_name[0] == '\0') &&
+        entry->contract_name == NULL) {
+        contract = porpoise_sdk_contract_find_by_canonical_identity(
+            entry->canonical_identity);
+    }
+    if (contract == NULL ||
+        !porpoise_sdk_contract_accepts_canonical_identity(
+            contract, entry != NULL ? entry->canonical_identity : NULL)) {
+        return NULL;
+    }
+    return contract;
+}
+
+static const PorpoiseSdkContract *audited_interior_import_contract(
+    const PorpoiseFunctionPlanView *view) {
+    size_t index;
+
+    if (view == NULL || view->function == NULL || view->sdk_entry == NULL ||
+        view->sdk_entry->canonical_identity == NULL ||
+        view->function->address_taken_entry_count == 0U) {
+        return NULL;
+    }
+    for (index = 0U;
+         index < sizeof(audited_interior_imports) /
+                     sizeof(audited_interior_imports[0]);
+         index++) {
+        const PorpoiseAuditedInteriorImport *audited =
+            &audited_interior_imports[index];
+        const PorpoiseSdkContract *contract;
+
+        if (strcmp(
+                view->sdk_entry->canonical_identity,
+                audited->canonical_identity) != 0) {
+            continue;
+        }
+        contract = porpoise_sdk_contract_find_by_canonical_name(
+            audited->canonical_name);
+        if (contract != NULL &&
+            porpoise_sdk_contract_accepts_canonical_identity(
+                contract, view->sdk_entry->canonical_identity) &&
+            strcmp(
+                porpoise_sdk_contract_host_callable(contract),
+                audited->host_adapter) == 0) {
+            return contract;
+        }
+    }
+    return NULL;
+}
+
+static bool audited_interior_import_binding_matches(
+    const PorpoiseFunctionPlanView *view) {
+    const PorpoiseSdkContract *contract =
+        audited_interior_import_contract(view);
+
+    return contract != NULL && view->binding != NULL &&
+           porpoise_sdk_contract_binding_matches(contract, view->binding);
 }
 
 static void populate_legacy_action(
@@ -765,6 +857,28 @@ static bool populate_sdk_evidence(
     if (conflict && options->sdk_policy != PORPOISE_SDK_POLICY_KEEP) {
         mark_view_blocked(plan, view, BLOCK_CONFLICT);
         return true;
+    }
+    /*
+     * Replacing this body would discard relocation-backed entry points into
+     * its interior (normally switch-table destinations).  An automatic SDK
+     * policy must resolve such a proposal conservatively to Lift.  Explicit
+     * skip-list and manual actions are handled later and remain validation
+     * errors so user-authored structurally incoherent plans are not hidden.
+     */
+    if (view->function->address_taken_entry_count != 0U &&
+        (view->requested_action == PORPOISE_PLAN_ACTION_IMPORT ||
+         view->requested_action == PORPOISE_PLAN_ACTION_OMIT)) {
+        const PorpoiseSdkContract *audited_contract =
+            audited_interior_import_contract(view);
+        bool audited_import =
+            view->requested_action == PORPOISE_PLAN_ACTION_IMPORT &&
+            direct_contract == NULL && contract != NULL &&
+            contract == audited_contract;
+
+        if (!audited_import) {
+            view->origin = PORPOISE_PLAN_ORIGIN_SDK_POLICY;
+            return true;
+        }
     }
     if (view->requested_action == PORPOISE_PLAN_ACTION_IMPORT) {
         const PorpoiseAbiFunction *binding = direct_contract;
@@ -1080,6 +1194,12 @@ int porpoise_plan_build(
                 apply_override(
                     plan, view, &options->overrides[override_index]);
             }
+            if (function->address_taken_entry_count != 0U &&
+                (view->action == PORPOISE_PLAN_ACTION_OMIT ||
+                 (view->action == PORPOISE_PLAN_ACTION_IMPORT &&
+                  !audited_interior_import_binding_matches(view)))) {
+                mark_view_blocked(plan, view, BLOCK_INTERIOR_ENTRY);
+            }
             if (function == plan->analysis.entry) plan->entry = view;
             view_index++;
             porpoise_operation_progress(
@@ -1284,10 +1404,14 @@ int porpoise_plan_validate(
                     break;
                 case PORPOISE_PLAN_ACTION_OMIT:
                     action_valid = !function->data_region &&
+                                   function->address_taken_entry_count == 0U &&
                                    view->binding == NULL;
                     break;
                 case PORPOISE_PLAN_ACTION_IMPORT:
                     action_valid = !function->data_region &&
+                                   (function->address_taken_entry_count == 0U ||
+                                    audited_interior_import_binding_matches(
+                                        view)) &&
                                    view->binding != NULL &&
                                    view->binding->kind == PORPOISE_ABI_IMPORT;
                     break;
@@ -1328,6 +1452,37 @@ int porpoise_plan_validate(
             "entry point %s must remain lifted",
             plan->entry->function->name);
         valid = false;
+    }
+    {
+        PorpoiseSdkGuestOsLayout os_layout;
+        const PorpoiseSourceFile *os_init_source = NULL;
+        const char *problem_symbol = NULL;
+        PorpoiseSdkGuestLayoutResolution layout_result =
+            porpoise_sdk_guest_os_layout_for_plan(
+                plan,
+                &os_layout,
+                &os_init_source,
+                &problem_symbol);
+        (void)os_layout;
+        if (layout_result != PORPOISE_SDK_GUEST_LAYOUT_NOT_REQUIRED &&
+            layout_result != PORPOISE_SDK_GUEST_LAYOUT_RESOLVED) {
+            const char *description =
+                layout_result == PORPOISE_SDK_GUEST_LAYOUT_MISSING
+                    ? "is missing"
+                    : layout_result == PORPOISE_SDK_GUEST_LAYOUT_AMBIGUOUS
+                          ? "is ambiguous"
+                          : "is invalid";
+            porpoise_diagnostics_add(
+                diagnostics,
+                PORPOISE_SEVERITY_ERROR,
+                os_init_source != NULL ? os_init_source->path : NULL,
+                0U,
+                0U,
+                "exact SDK OSInit import requires one aligned guest data symbol for %s (exact spelling or a DTK _XXXXXXXX suffix equal to its address), but it %s",
+                problem_symbol != NULL ? problem_symbol : "the OS state layout",
+                description);
+            valid = false;
+        }
     }
     for (view_index = 0U;
          view_index < session_abi->function_count;

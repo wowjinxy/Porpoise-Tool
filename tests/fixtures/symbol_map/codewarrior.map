@@ -18,3 +18,7 @@ Link map of EntryPoint
   00000000 000010 80002000  1 .data sdk.a data.c
   00000000 000004 80002000  4 GlobalData sdk.a data.c
 
+Linker generated symbols:
+              _stack_addr 80004000
+               _SDA_BASE_ 80005000
+              _SDA2_BASE_ 80006000

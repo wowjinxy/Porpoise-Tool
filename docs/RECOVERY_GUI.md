@@ -31,24 +31,43 @@ compiler or architecture.
 3. Leave the SDK policy at `keep` and **Strict** off for the first recovery
    pass. New GUI targets default to those settings. Existing projects retain
    their saved strictness.
-4. Select **Analyze**. The workbench saves the project first (opening Save As
-   for an untitled project), then runs import, parsing, signatures, planning,
-   and validation on a worker.
+4. Select the single highlighted **Analyze** action. The workbench saves the
+   project first (opening Save As for an untitled project), then runs import,
+   parsing, signatures, planning, and validation on a worker.
 5. Filter and sort **Functions**. Review source/canonical name,
    translation unit, section, address, size, category, confidence, proposed
    action, binding, provenance, conflict state, and override state.
 6. Open evidence/disassembly details before applying `Auto`, `Lift`,
    `Import(contract)`, `Omit`, or `Treat as Data`. Multi-selection supports
    bulk changes. Replanning reuses the loaded immutable session.
-7. Resolve every blocking diagnostic, then generate. All selected targets are
-   staged before the transactional publish begins.
-8. Use the **Advanced** tabs only when needed for project details, maps and
+7. Resolve every blocking diagnostic. The same primary action advances to
+   **Generate**; all selected targets are staged before transactional publish.
+8. Review the compact title-host summary, then select **Configure Runtime**.
+   Choose a local libPorpoise checkout, Meson 1.2+, a matching x64 C/C++
+   compiler pair, and (when requested by the profile) the extracted DVD root.
+   The wizard identifies whether that checkout exposes observable GPU-resident
+   host-XFB support and queued canonical FIFO v2. Canonical FIFO v1 remains
+   compatible, but the wizard warns that its synchronous ingress can be slow
+   for lifted code which performs many write-gather stores.
+   These absolute paths remain in machine state keyed by the canonical project
+   path and are never saved in the shared project.
+   Exact register, arena, startup-locator, fingerprint, and initial-memory
+   values remain available under **Advanced > Title Host**.
+9. The primary action advances to **Build** after configuration passes, then
+   to **Run** when the executable and its non-system DLLs are staged. A first
+   run writes a JSONL boot trace and stops after three presented frames by
+   default, keeping first-boot evidence bounded. The trace path and frame limit
+   are available in Runtime configuration. Disable tracing for ordinary play;
+   choosing an unlimited traced run is explicit and carries a disk-usage
+   warning.
+10. Use the **Advanced** tabs only when needed for project details, maps and
    catalogs, data annotations, ABI contracts, reports, or output options.
 
-An unsuccessful run displays the first error and a corrective hint inline.
-Use **Back to Setup** to correct input, DTK, output, or strictness, or **Show
-diagnostics** for the complete error list and progress log. The workbench never
-changes Strict mode or another recovery policy silently.
+An unsuccessful operation displays the first error and a corrective hint
+inline. Use **Back to Setup** to correct input, DTK, output, strictness, or the
+specific highlighted runtime field, or **Show diagnostics** for the complete
+error list and live process log. The workbench never changes Strict mode or
+another recovery policy silently.
 
 Overwrite confirmation maps to the same operational `force` flag as the CLI
 and is not persisted.
@@ -92,6 +111,22 @@ Load, import, plan, validate, and generate phases report progress through
 it removes unpublished staging data and leaves existing outputs untouched. If
 publication has started, the batch rollback journal restores the prior output
 set before cancellation completes.
+
+Build and Run use the shared shell-free process service and the same Cancel
+control. The Setup page shows only the active stage; complete Meson/compiler
+stdout and stderr remain in Diagnostics. Per-target caches live under
+`.porpoise-build` beside the project. Setup can measure or reveal that cache
+and removes it only after an explicit confirmation. Dependency-copy fallback
+is also opt-in because it can consume substantial disk space.
+
+On POSIX hosts the service launches with `posix_spawnp`: argument arrays,
+environment overrides, working-directory changes, pipe wiring, and a dedicated
+process group are prepared without running non-async-signal-safe code in a
+post-fork GUI child. Cancel first terminates that group, then kills it after a
+250 ms grace period. Live log callbacks still receive every byte. The core's
+convenience capture is a bounded tail ring: it retains the newest 1 MiB of
+stdout and 1 MiB of stderr and marks either stream when older bytes were
+dropped, so unattended output cannot grow capture memory without bound.
 
 Analyze and Generate save the current project before starting, so the document
 on disk describes the run being performed. The workbench also maintains

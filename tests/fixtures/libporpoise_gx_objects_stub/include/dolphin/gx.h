@@ -157,6 +157,7 @@ typedef struct GXTlutObj {
 
 GXFifoObj *GXInit(void *base, u32 size);
 GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback callback);
+void GXDrawDone(void);
 void GXSetCopyFilter(
     GXBool use_aa,
     const u8 sample_pattern[12][2],

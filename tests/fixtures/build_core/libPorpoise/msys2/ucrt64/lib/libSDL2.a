@@ -1,0 +1,1 @@
+This static SDL2 library must never enter the isolated overlay.

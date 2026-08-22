@@ -57,6 +57,25 @@ int main(void)
     PorpoiseStubVIReset();
 
     prepare_call(&state, &host);
+    state.gpr[3] = 2U;
+    porpoise_libporpoise_vi_set_black_adapter(&state);
+    check_fault(&state, PORPOISE_FAULT_INVALID_ARGUMENT, 2U);
+    CHECK(PorpoiseStubVISetBlackCallCount() == 0U);
+
+    prepare_call(&state, &host);
+    state.gpr[3] = 1U;
+    porpoise_libporpoise_vi_set_black_adapter(&state);
+    CHECK(!porpoise_state_has_fault(&state));
+    CHECK(state.gpr[3] == 1U);
+    CHECK(PorpoiseStubVISetBlackCallCount() == 1U);
+    CHECK(PorpoiseStubVIBlack() == 1U);
+
+    prepare_call(&state, &host);
+    porpoise_libporpoise_vi_flush_adapter(&state);
+    CHECK(!porpoise_state_has_fault(&state));
+    CHECK(PorpoiseStubVIFlushCallCount() == 1U);
+
+    prepare_call(&state, &host);
     state.gpr[3] = 0U;
     porpoise_libporpoise_vi_set_next_frame_buffer_adapter(&state);
     check_fault(&state, PORPOISE_FAULT_INVALID_POINTER, 0U);
@@ -100,13 +119,29 @@ int main(void)
     CHECK(PorpoiseStubVISetNextFrameBufferCallCount() == 1U);
     CHECK(PorpoiseStubVINextFrameBufferGuestAddress() ==
           TEST_MEMORY_END - UINT32_C(32));
+    CHECK(state.trace_frame_count == 0U);
+
+    porpoise_libporpoise_vi_wait_for_retrace_adapter(&state);
+    CHECK(!porpoise_state_has_fault(&state));
+    CHECK(PorpoiseStubVIWaitForRetraceCallCount() == 1U);
+    CHECK(PorpoiseStubVIPresentationCount() == UINT64_C(1));
+    CHECK(state.trace_frame_count == 1U);
 
     prepare_call(&state, &host);
+    state.trace_frame_limit = 1U;
     state.gpr[3] = TEST_XFB;
     porpoise_libporpoise_vi_set_next_frame_buffer_adapter(&state);
     CHECK(!porpoise_state_has_fault(&state));
+    CHECK(state.status == PORPOISE_EXECUTION_RUNNING);
+    CHECK(state.trace_frame_count == 0U);
     CHECK(PorpoiseStubVISetNextFrameBufferCallCount() == 2U);
     CHECK(PorpoiseStubVINextFrameBufferGuestAddress() == TEST_XFB);
+    porpoise_libporpoise_vi_wait_for_retrace_adapter(&state);
+    CHECK(!porpoise_state_has_fault(&state));
+    CHECK(state.status == PORPOISE_EXECUTION_RETURNED);
+    CHECK(state.trace_frame_count == 1U);
+    CHECK(PorpoiseStubVIWaitForRetraceCallCount() == 2U);
+    CHECK(PorpoiseStubVIPresentationCount() == UINT64_C(2));
 
     PorpoiseStubVISetNextFrameBufferResult(0);
     prepare_call(&state, &host);
@@ -119,6 +154,7 @@ int main(void)
     CHECK(PorpoiseStubVISetNextFrameBufferCallCount() == 3U);
     CHECK(PorpoiseStubVINextFrameBufferGuestAddress() ==
           TEST_XFB + UINT32_C(32));
+    CHECK(state.trace_frame_count == 0U);
 
     state.gpr[3] = TEST_XFB + UINT32_C(64);
     porpoise_libporpoise_vi_set_next_frame_buffer_adapter(&state);

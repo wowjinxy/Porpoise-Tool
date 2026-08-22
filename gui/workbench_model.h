@@ -11,11 +11,19 @@
 #include <vector>
 
 extern "C" {
+#include "porpoise/build.h"
 #include "porpoise/recovery_annotation.h"
 #include "porpoise/recovery_runner.h"
+#include "porpoise/recovery_title_host.h"
+#include "porpoise/util.h"
 }
 
 namespace porpoise::gui {
+
+/* Safely remove only the derived cache component for a logical target id. */
+bool RemoveTargetBuildCache(const std::string &project_file,
+                            const std::string &target_id,
+                            std::string *error_out);
 
 enum class WorkerState {
     Idle,
@@ -24,6 +32,15 @@ enum class WorkerState {
     Succeeded,
     Failed,
     Cancelled
+};
+
+enum class WorkerOperation {
+    None,
+    Recovery,
+    Replan,
+    RuntimePreflight,
+    Build,
+    Run
 };
 
 struct ProgressSnapshot {
@@ -40,6 +57,40 @@ struct RunRequest {
     std::string report_path;
     std::string runtime_directory;
     std::string dtk_path;
+};
+
+struct BuildProgressSnapshot {
+    PorpoiseBuildPhase phase = PORPOISE_BUILD_PHASE_PREFLIGHT;
+    std::size_t completed = 0;
+    std::size_t total = 0;
+    std::string detail;
+};
+
+/*
+ * Owns every string referenced by the C build request for the lifetime of the
+ * background worker. Machine-specific paths deliberately live here instead
+ * of in the portable recovery project.
+ */
+struct BuildRunRequest {
+    std::string target_id;
+    std::string generated_directory;
+    std::string libporpoise_directory;
+    std::string title_host_directory;
+    std::string meson_executable;
+    std::string c_compiler;
+    std::string cpp_compiler;
+    std::string objdump_executable;
+    std::string build_type = "debugoptimized";
+    std::string generated_plan_digest;
+    std::string run_working_directory;
+    std::string dvd_root;
+    std::string trace_file;
+    std::size_t frame_limit = 0;
+    std::vector<std::string> runtime_search_directories;
+    std::vector<std::string> run_arguments;
+    bool allow_copy_fallback = false;
+    bool force_reconfigure = false;
+    bool run = false;
 };
 
 /* A copied locator remains valid after the immutable run result is released. */
@@ -151,13 +202,34 @@ public:
                                const std::string &module);
 
     bool Start(const RunRequest &request);
+    bool StartRuntimePreflight(const BuildRunRequest &request);
+    bool StartBuild(const BuildRunRequest &request);
     void Cancel();
     bool PollWorker();
     void Wait();
     WorkerState State() const { return worker_state_.load(); }
+    WorkerOperation Operation() const { return worker_operation_; }
     int LastExitCode() const { return last_exit_code_.load(); }
     ProgressSnapshot Progress() const;
+    BuildProgressSnapshot BuildProgress() const;
     std::vector<std::string> Logs() const;
+    const PorpoiseBuildResult *BuildResult() const;
+    void ClearBuildResult();
+    const PorpoiseBuildPreflight *RuntimePreflightResult() const;
+    bool RuntimePreflightRequestMatches(
+        const BuildRunRequest &request) const;
+    void ClearRuntimePreflight();
+
+    /* Inference is a review draft only; it never changes the project. */
+    bool InferTitleHostProfile(const std::string &target_id);
+    const PorpoiseRecoveryTitleHostProfile *InferredTitleHostProfile(
+        const std::string &target_id) const;
+    const std::string &TitleHostInferenceIssue() const {
+        return title_host_inference_issue_;
+    }
+    bool AcceptInferredTitleHostProfile(const std::string &target_id,
+                                        bool initialize_dvd);
+    void DiscardInferredTitleHostProfile();
 
     /* Mirrors the target-selection rules used by a project run. */
     bool SelectedOutputsExist(
@@ -212,13 +284,27 @@ private:
                               std::size_t completed, std::size_t total,
                               const char *detail);
     static bool CancelThunk(void *user_data);
+    static void BuildProgressThunk(void *user_data, PorpoiseBuildPhase phase,
+                                   std::size_t completed, std::size_t total,
+                                   const char *detail);
+    static void BuildLogThunk(void *user_data, PorpoiseBuildPhase phase,
+                              bool standard_error, const char *text,
+                              std::size_t length);
+    static bool BuildCancelThunk(void *user_data);
     void OnProgress(PorpoiseOperationPhase phase, std::size_t completed,
                     std::size_t total, const char *detail);
+    void OnBuildProgress(PorpoiseBuildPhase phase, std::size_t completed,
+                         std::size_t total, const char *detail);
+    void OnBuildLog(PorpoiseBuildPhase phase, bool standard_error,
+                    const char *text, std::size_t length);
     void WorkerMain(RunRequest request);
+    void RuntimePreflightWorkerMain(BuildRunRequest request);
+    void BuildWorkerMain(BuildRunRequest request);
     bool StartReplan(const std::vector<std::string> &target_ids);
     void ReplanWorkerMain(std::vector<std::string> target_ids);
     void AdoptWorkerProject();
     void ClearRunResult();
+    void ClearInferredTitleHostProfile();
     void ResetDiagnostics();
     void AddLocalDiagnostic(PorpoiseSeverity severity,
                             const std::string &message);
@@ -246,14 +332,27 @@ private:
     std::atomic<bool> cancel_requested_{false};
     std::atomic<bool> worker_finished_{false};
     std::atomic<int> last_exit_code_{PORPOISE_EXIT_OK};
+    WorkerOperation worker_operation_ = WorkerOperation::None;
 
     mutable std::mutex progress_mutex_;
     ProgressSnapshot progress_{};
+    BuildProgressSnapshot build_progress_{};
     mutable std::mutex log_mutex_;
     std::vector<std::string> logs_;
+    PorpoiseBuildResult build_result_{};
+    bool build_result_ready_ = false;
+    PorpoiseBuildPreflight runtime_preflight_{};
+    BuildRunRequest runtime_preflight_request_{};
+    bool runtime_preflight_attempted_ = false;
+    bool runtime_preflight_ready_ = false;
+    PorpoiseRecoveryTitleHostProfile inferred_title_host_{};
+    std::string inferred_title_host_target_;
+    std::string title_host_inference_issue_;
+    bool inferred_title_host_ready_ = false;
 };
 
 const char *WorkerStateName(WorkerState state);
+const char *WorkerOperationName(WorkerOperation operation);
 
 }  // namespace porpoise::gui
 

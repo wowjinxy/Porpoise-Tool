@@ -9,6 +9,8 @@ extern "C" {
 #endif
 
 #define PORPOISE_FAULT_MESSAGE_CAPACITY 160U
+#define PORPOISE_TRACE_STACK_CAPACITY 64U
+#define PORPOISE_LIFTED_CALL_STACK_CAPACITY 1024U
 
 /*
  * FPSCR masks use PowerPC bit numbering, where architectural bit 0 is the
@@ -63,6 +65,9 @@ extern "C" {
 #define PORPOISE_MSR_EE UINT32_C(0x00008000)
 #define PORPOISE_MSR_PR UINT32_C(0x00004000)
 #define PORPOISE_MSR_FP UINT32_C(0x00002000)
+#define PORPOISE_MSR_FE0 UINT32_C(0x00000800)
+#define PORPOISE_MSR_FE1 UINT32_C(0x00000100)
+#define PORPOISE_MSR_RI UINT32_C(0x00000002)
 #define PORPOISE_TRAP_SIGNED_LESS 0x10U
 #define PORPOISE_TRAP_SIGNED_GREATER 0x08U
 #define PORPOISE_TRAP_EQUAL 0x04U
@@ -131,6 +136,13 @@ typedef enum PorpoiseFpPrecision {
     PORPOISE_FP_PRECISION_SINGLE
 } PorpoiseFpPrecision;
 
+typedef enum PorpoiseFpBinaryOperation {
+    PORPOISE_FP_BINARY_ADD = 0,
+    PORPOISE_FP_BINARY_SUBTRACT,
+    PORPOISE_FP_BINARY_MULTIPLY,
+    PORPOISE_FP_BINARY_DIVIDE
+} PorpoiseFpBinaryOperation;
+
 typedef PorpoiseHostResult (*PorpoiseHostReadBytesFn)(
     void *context,
     uint32_t guest_address,
@@ -142,6 +154,12 @@ typedef PorpoiseHostResult (*PorpoiseHostWriteBytesFn)(
     uint32_t guest_address,
     const void *source,
     size_t size);
+
+/* Optional ordered byte ingress for the canonical GX write-gather pipe.
+ * Hosts which do not provide it retain the ordinary write_bytes behavior. */
+typedef PorpoiseHostResult (*PorpoiseHostWriteGxFifoU8Fn)(
+    void *context,
+    uint8_t value);
 
 typedef PorpoiseHostResult (*PorpoiseHostDecodePointerFn)(
     void *context,
@@ -191,6 +209,7 @@ struct PorpoiseHostAdapter {
     PorpoiseHostSystemCallFn system_call;
     PorpoiseHostCallGuestFn call_guest;
     PorpoiseHostPollEventsFn poll_events;
+    PorpoiseHostWriteGxFifoU8Fn write_gx_fifo_u8;
 };
 
 struct PorpoisePpcState {
@@ -251,6 +270,10 @@ struct PorpoisePpcState {
     /* Maintained by generated address dispatch. Deferred host completions use
      * this depth to run only after the submitting lifted frame has returned. */
     uint32_t lifted_call_depth;
+    /* Expected guest LR for each active translated C frame. This provenance
+     * lets a lowered LR branch distinguish an ordinary return from a genuine
+     * indirect tail branch without guessing from an address or symbol name. */
+    uint32_t lifted_return_stack[PORPOISE_LIFTED_CALL_STACK_CAPACITY];
     /* Suppresses recursive host-event drains while a guest callback runs. */
     uint32_t host_event_delivery_depth;
 
@@ -258,6 +281,27 @@ struct PorpoisePpcState {
     PorpoiseFault fault;
     uint32_t fault_address;
     char fault_message[PORPOISE_FAULT_MESSAGE_CAPACITY];
+
+    /*
+     * Runtime evidence is opt-in. The generated entry configures these fields
+     * from PORPOISE_TRACE, PORPOISE_FRAME_LIMIT, and the optional
+     * PORPOISE_REJECT_APPROXIMATIONS test gate; ordinary embeddings leave them
+     * zero. trace_file is an opaque FILE pointer so this public C99 header does
+     * not expose stdio implementation details.
+     */
+    void *trace_file;
+    uint32_t trace_call_stack[PORPOISE_TRACE_STACK_CAPACITY];
+    const char *trace_function_stack[PORPOISE_TRACE_STACK_CAPACITY];
+    uint32_t trace_call_depth;
+    uint32_t trace_call_overflow;
+    uint32_t trace_frame_count;
+    uint32_t trace_frame_limit;
+    uint64_t trace_sequence;
+    int trace_fault_emitted;
+    uint64_t approximation_count;
+    uint32_t first_approximation_address;
+    char first_approximation_mnemonic[32];
+    int reject_approximations;
 
     PorpoiseHostAdapter *host;
 };
@@ -278,9 +322,43 @@ void porpoise_state_set_fault(
     const char *message);
 int porpoise_state_has_fault(const PorpoisePpcState *state);
 int porpoise_state_should_stop(const PorpoisePpcState *state);
+int porpoise_guest_lr_returns_to_caller(const PorpoisePpcState *state);
 const char *porpoise_state_fault_message(const PorpoisePpcState *state);
 const char *porpoise_fault_string(PorpoiseFault fault);
 const char *porpoise_host_result_string(PorpoiseHostResult result);
+
+/*
+ * Configure optional JSONL tracing and deterministic frame limiting from the
+ * process environment. Returns zero only when an explicitly requested trace
+ * path or frame limit is invalid. Close is idempotent.
+ */
+int porpoise_trace_configure_from_environment(PorpoisePpcState *state);
+void porpoise_trace_close(PorpoisePpcState *state);
+void porpoise_trace_call_enter(
+    PorpoisePpcState *state,
+    uint32_t guest_address,
+    const char *dispatch_kind,
+    const char *function_name);
+void porpoise_trace_call_exit(
+    PorpoisePpcState *state,
+    uint32_t guest_address,
+    const char *dispatch_kind,
+    const char *function_name);
+void porpoise_trace_approximate(
+    PorpoisePpcState *state,
+    uint32_t instruction_address,
+    const char *mnemonic);
+void porpoise_trace_frame(
+    PorpoisePpcState *state,
+    uint32_t guest_frame_buffer);
+/* Record a presented frame whose complete canonical XFB span was observed.
+ * content_varied is true when the span is not one repeated YUV 4:2:2 pixel
+ * pair (for example, the intentional all-black VI startup frame). */
+void porpoise_trace_frame_observed(
+    PorpoisePpcState *state,
+    uint32_t guest_frame_buffer,
+    uint64_t content_hash,
+    int content_varied);
 
 /*
  * CR indices follow PowerPC notation: field 0 occupies bits 0..3 of the
@@ -379,6 +457,20 @@ int porpoise_frsp(
     unsigned int destination_register,
     unsigned int source_register,
     int record);
+/*
+ * Exact Gekko reciprocal-square-root estimate. The finite result is produced
+ * by the hardware-tested 32-segment estimate table and integer bit transform;
+ * no host sqrt operation participates. Special values, enabled-exception
+ * suppression, FPRF, and record-form CR1 updates follow the Gekko definition.
+ * FPSCR[FR/FI] are architecturally undefined for this instruction; this helper
+ * preserves them for ordinary estimates and clears them for special values,
+ * matching established Gekko hardware-test behavior.
+ */
+int porpoise_frsqrte(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int source_register,
+    int record);
 int porpoise_fctiwz(
     PorpoisePpcState *state,
     unsigned int destination_register,
@@ -418,6 +510,82 @@ int porpoise_fp_fma(
     unsigned int addend_register,
     PorpoiseFpFmaOperation operation,
     PorpoiseFpPrecision precision,
+    int record);
+
+/*
+ * Exact-domain helpers for instructions whose general lowering also accepts
+ * mixed scalar-double FPR contents. Scalar single and non-scalar paired
+ * operations retain conservative host-proof domains. Paired scalar multiply
+ * and MADD, however, use the raw integer-only PPC arithmetic core for every
+ * valid widened binary32 operand, including all RN modes, NI, special values,
+ * exception status, and enabled OE/UE adjusted results. A zero return means
+ * either that an architectural availability fault was recorded or that a
+ * mixed/non-binary32 lane remains outside the defined paired-single domain;
+ * lowering must never run its fallback when state has faulted.
+ */
+int porpoise_fp_binary_single_try_exact(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int left_register,
+    unsigned int right_register,
+    PorpoiseFpBinaryOperation operation,
+    int record);
+int porpoise_fp_fma_execution_is_exact(
+    const PorpoisePpcState *state,
+    unsigned int multiplicand_register,
+    unsigned int multiplier_register,
+    unsigned int addend_register,
+    PorpoiseFpFmaOperation operation,
+    PorpoiseFpPrecision precision);
+int porpoise_ps_binary_try_exact(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int left_register,
+    unsigned int right_register,
+    PorpoiseFpBinaryOperation operation,
+    int record);
+int porpoise_ps_fma_try_exact(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int multiplicand_register,
+    unsigned int multiplier_register,
+    unsigned int addend_register,
+    PorpoiseFpFmaOperation operation,
+    int scalar_lane,
+    int record);
+int porpoise_ps_scalar_multiply_try_exact(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int multiplicand_register,
+    unsigned int scalar_register,
+    unsigned int scalar_lane,
+    int record);
+
+/* Complete instruction boundaries for the defined raw-binary32 paired-
+ * single domain. Mixed binary64/paired contents are a guest programming error
+ * and fault explicitly instead of silently using host arithmetic. */
+int porpoise_ps_muls_scalar(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int multiplicand_register,
+    unsigned int scalar_register,
+    unsigned int scalar_lane,
+    int record);
+int porpoise_ps_madds_scalar(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int multiplicand_register,
+    unsigned int scalar_register,
+    unsigned int addend_register,
+    unsigned int scalar_lane,
+    int record);
+int porpoise_ps_sum_try_exact(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int left_register,
+    unsigned int passthrough_register,
+    unsigned int right_register,
+    unsigned int sum_lane,
     int record);
 
 /*
@@ -511,6 +679,24 @@ int porpoise_psq_store(
     unsigned int requires_lsqe);
 
 /*
+ * Return nonzero only when this particular PSQ execution is in the fully
+ * modeled raw-binary32 domain. Type-zero loads preserve every binary32 bit
+ * pattern. Type-zero stores are exact when each transferred lane is the
+ * architectural widening of a binary32 value. Integer quantization and
+ * non-representable FPR inputs remain conservatively approximate.
+ *
+ * This predicate is side-effect free and controls runtime evidence only;
+ * porpoise_psq_load/store still own validation, mode checks, memory access,
+ * and fault behavior.
+ */
+int porpoise_psq_transfer_is_exact(
+    const PorpoisePpcState *state,
+    unsigned int register_index,
+    unsigned int w,
+    unsigned int gqr_index,
+    int store);
+
+/*
  * Focused system-instruction helpers keep privilege checks and host events in
  * one place. All helpers stop immediately when state already carries a fault.
  * Time-base writes preserve the other half and adjust a guest-visible bias;
@@ -523,6 +709,15 @@ int porpoise_require_supervisor(
 int porpoise_write_msr(
     PorpoisePpcState *state,
     uint32_t instruction_address,
+    uint32_t value);
+/*
+ * A transition is fully modeled when supervisor validation can succeed and
+ * only EE (guest event delivery), PR (privilege checks), FP (floating-point
+ * availability), or RI (architectural recoverability state) changes. Writes
+ * that alter any other architectural MSR bit retain approximation evidence.
+ */
+int porpoise_msr_transition_is_exact(
+    const PorpoisePpcState *state,
     uint32_t value);
 /* Deliver queued host completions without bypassing guest interrupt masking. */
 int porpoise_poll_host_events(
@@ -598,6 +793,12 @@ int porpoise_zero_bytes(
 void porpoise_store_u8(
     PorpoisePpcState *state,
     uint32_t guest_address,
+    uint8_t value);
+/* Fast form used only after generated code proves the effective address is
+ * exactly 0xCC008000. It falls back to the ordinary checked store when the
+ * host does not advertise specialized FIFO ingress. */
+void porpoise_store_gx_fifo_u8(
+    PorpoisePpcState *state,
     uint8_t value);
 void porpoise_store_u16(
     PorpoisePpcState *state,

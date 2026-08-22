@@ -85,7 +85,7 @@ static bool write_text(const char *path, const char *text) {
 static void check_loaded_project(const PorpoiseRecoveryProject *project) {
     const PorpoiseRecoveryTarget *main_target;
     const PorpoiseRecoveryTarget *overlay;
-    CHECK(project->schema_version == 1U);
+    CHECK(project->schema_version == PORPOISE_RECOVERY_PROJECT_SCHEMA_VERSION);
     CHECK(project->path != NULL);
     CHECK(project->directory != NULL);
     CHECK(project->sdk_catalog_count == 2U);
@@ -128,6 +128,7 @@ static void check_loaded_project(const PorpoiseRecoveryProject *project) {
         /* Loading is deliberately independent of cache freshness/existence. */
         CHECK(main_target->input.resolved != NULL);
         CHECK(main_target->cache.input_sha256 != NULL);
+        CHECK(!main_target->has_title_host);
     }
     if (overlay != NULL) {
         CHECK(!overlay->enabled);
@@ -136,6 +137,7 @@ static void check_loaded_project(const PorpoiseRecoveryProject *project) {
         CHECK(overlay->sdk_policy == PORPOISE_SDK_POLICY_KEEP);
         CHECK(strcmp(overlay->input.resolved,
                      "C:/recovery-inputs/overlay.elf") == 0);
+        CHECK(!overlay->has_title_host);
     }
 }
 
@@ -168,7 +170,9 @@ static void test_strict_failures_are_transactional(const char *root) {
         "expansion.porpoise.json",
         "duplicate-target-field.porpoise.json",
         "wrong-nested-type.porpoise.json",
-        "bad-fingerprint.porpoise.json"
+        "bad-fingerprint.porpoise.json",
+        "invalid-target-id.porpoise.json",
+        "invalid-v2-missing-title-host.porpoise.json"
     };
     char valid_path[PORPOISE_PATH_CAPACITY];
     PorpoiseRecoveryProject project;
@@ -231,13 +235,18 @@ static void test_save_rebase_reopen_and_determinism(const char *root) {
     CHECK(second_text != NULL);
     if (first_text != NULL && second_text != NULL) {
         CHECK(strcmp(first_text, second_text) == 0);
+        /* The canonical spelling is relative when the test build and this
+         * synthetic C: input happen to share a volume, and absolute when
+         * they do not. Reopening below verifies the resolved identity. */
         CHECK(strstr(first_text,
-                     "C:/recovery-inputs/overlay.elf") != NULL);
+                     "recovery-inputs/overlay.elf") != NULL);
         CHECK(strstr(first_text, "Z:/NintendoSDK/demo.a") != NULL);
         CHECK(strstr(first_text,
                      "/opt/porpoise/catalogs/local.json") != NULL);
         CHECK(strstr(first_text,
                      "//server/share/contracts.json") != NULL);
+        CHECK(strstr(first_text, "\"schema_version\": 2") != NULL);
+        CHECK(strstr(first_text, "\"title_host\": null") != NULL);
         CHECK(strstr(first_text, "${") == NULL);
     }
     CHECK(porpoise_recovery_project_load(
@@ -260,6 +269,94 @@ static void test_save_rebase_reopen_and_determinism(const char *root) {
     free(second_text);
     (void)remove(first_path);
     (void)remove(second_path);
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_recovery_project_free(&reopened);
+    porpoise_recovery_project_free(&project);
+}
+
+static void test_v2_title_host_roundtrip(const char *root) {
+    char input_path[PORPOISE_PATH_CAPACITY];
+    char output_path[PORPOISE_PATH_CAPACITY];
+    PorpoiseRecoveryProject project;
+    PorpoiseRecoveryProject reopened;
+    PorpoiseDiagnostics diagnostics;
+    const PorpoiseRecoveryTarget *target;
+    char *text;
+    CHECK(fixture_path(
+        input_path, sizeof(input_path), root, "valid-v2.porpoise.json"));
+    CHECK(snprintf(
+              output_path, sizeof(output_path),
+              "recovery-project-v2-roundtrip-%lu.json",
+              (unsigned long)TEST_GETPID()) > 0);
+    (void)remove(output_path);
+    porpoise_recovery_project_init(&project);
+    porpoise_recovery_project_init(&reopened);
+    porpoise_diagnostics_init(&diagnostics);
+    CHECK(porpoise_recovery_project_load(
+              &project, input_path, &diagnostics) == PORPOISE_EXIT_OK);
+    target = porpoise_recovery_project_find_target(&project, "main");
+    CHECK(target != NULL && target->has_title_host);
+    if (target != NULL && target->has_title_host) {
+        CHECK(target->title_host.entry_address == UINT32_C(0x80001000));
+        CHECK(target->title_host.gpr[1] == UINT32_C(0x80004000));
+        CHECK(target->title_host.gpr[2] == UINT32_C(0x80005000));
+        CHECK(target->title_host.gpr[13] == UINT32_C(0x80006000));
+        CHECK(target->title_host.startup_function_count == 1U);
+        CHECK(target->title_host.initial_word_count == 1U);
+        CHECK(target->title_host.initialize_dvd);
+    }
+    CHECK(porpoise_recovery_project_save(
+              &project, output_path, &diagnostics) == PORPOISE_EXIT_OK);
+    text = read_text(output_path);
+    CHECK(text != NULL && strstr(text, "\"title_host\": {") != NULL);
+    CHECK(text != NULL && strstr(text, "\"entry_address\": 2147487744") != NULL);
+    free(text);
+    CHECK(porpoise_recovery_project_load(
+              &reopened, output_path, &diagnostics) == PORPOISE_EXIT_OK);
+    target = porpoise_recovery_project_find_target(&reopened, "main");
+    CHECK(target != NULL && target->has_title_host);
+    CHECK(target != NULL &&
+          target->title_host.initial_words[0].value == UINT32_MAX);
+    (void)remove(output_path);
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_recovery_project_free(&reopened);
+    porpoise_recovery_project_free(&project);
+}
+
+static void test_v1_legacy_target_id_roundtrip(const char *root) {
+    char input_path[PORPOISE_PATH_CAPACITY];
+    char output_path[PORPOISE_PATH_CAPACITY];
+    PorpoiseRecoveryProject project;
+    PorpoiseRecoveryProject reopened;
+    PorpoiseDiagnostics diagnostics;
+    char *text;
+    CHECK(fixture_path(
+        input_path, sizeof(input_path), root,
+        "valid-v1-legacy-id.porpoise.json"));
+    CHECK(snprintf(
+              output_path, sizeof(output_path),
+              "recovery-project-v1-legacy-id-%lu.json",
+              (unsigned long)TEST_GETPID()) > 0);
+    (void)remove(output_path);
+    porpoise_recovery_project_init(&project);
+    porpoise_recovery_project_init(&reopened);
+    porpoise_diagnostics_init(&diagnostics);
+    CHECK(porpoise_recovery_project_load(
+              &project, input_path, &diagnostics) == PORPOISE_EXIT_OK);
+    CHECK(porpoise_recovery_project_find_target(
+              &project, "legacy.overlay/one") != NULL);
+    CHECK(porpoise_recovery_project_save(
+              &project, output_path, &diagnostics) == PORPOISE_EXIT_OK);
+    text = read_text(output_path);
+    CHECK(text != NULL && strstr(text, "\"schema_version\": 2") != NULL);
+    CHECK(text != NULL &&
+          strstr(text, "\"id\": \"legacy.overlay/one\"") != NULL);
+    free(text);
+    CHECK(porpoise_recovery_project_load(
+              &reopened, output_path, &diagnostics) == PORPOISE_EXIT_OK);
+    CHECK(porpoise_recovery_project_find_target(
+              &reopened, "legacy.overlay/one") != NULL);
+    (void)remove(output_path);
     porpoise_diagnostics_free(&diagnostics);
     porpoise_recovery_project_free(&reopened);
     porpoise_recovery_project_free(&project);
@@ -390,6 +487,26 @@ static void test_enum_names(void) {
     }
     CHECK(!porpoise_recovery_annotation_interpretation_from_name(
         "cstring", NULL));
+    CHECK(porpoise_recovery_target_id_is_valid("main-dol_2"));
+    CHECK(porpoise_recovery_target_id_is_valid("main.overlay"));
+    CHECK(porpoise_recovery_target_id_is_valid("legacy/overlay"));
+    CHECK(porpoise_recovery_target_id_is_valid(".."));
+    CHECK(!porpoise_recovery_target_id_is_valid(NULL));
+    CHECK(!porpoise_recovery_target_id_is_valid(""));
+    {
+        char first[PORPOISE_RECOVERY_TARGET_CACHE_KEY_SIZE];
+        char second[PORPOISE_RECOVERY_TARGET_CACHE_KEY_SIZE];
+        CHECK(porpoise_recovery_target_cache_key("main-dol_2", first));
+        CHECK(strcmp(first, "main-dol_2") == 0);
+        CHECK(porpoise_recovery_target_cache_key("CON", first));
+        CHECK(strncmp(first, "target-", 7U) == 0);
+        CHECK(porpoise_recovery_target_cache_key("main/overlay", first));
+        CHECK(porpoise_recovery_target_cache_key("main\\overlay", second));
+        CHECK(strncmp(first, "target-", 7U) == 0);
+        CHECK(strlen(first) == 71U);
+        CHECK(strcmp(first, second) != 0);
+        CHECK(!porpoise_recovery_target_cache_key("", first));
+    }
 }
 
 int main(int argc, char **argv) {
@@ -400,6 +517,8 @@ int main(int argc, char **argv) {
     test_load_and_stale_independence(argv[1]);
     test_strict_failures_are_transactional(argv[1]);
     test_save_rebase_reopen_and_determinism(argv[1]);
+    test_v2_title_host_roundtrip(argv[1]);
+    test_v1_legacy_target_id_roundtrip(argv[1]);
     test_atomic_save_preserves_prior_destination(argv[1]);
     test_enum_names();
     if (failures != 0U) {

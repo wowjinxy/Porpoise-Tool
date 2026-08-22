@@ -37,6 +37,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+int porpoise_libporpoise_has_host_thread_carrier_v1(void)
+{
+#if defined(PORPOISE_HAVE_LIBPORPOISE_HOST_THREAD_CARRIER_V1)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 enum {
     PORPOISE_GUEST_THREAD_QUEUE_SIZE = 8,
     PORPOISE_GUEST_THREAD_QUEUE_ALIGNMENT = 4,
@@ -80,6 +89,7 @@ enum {
 };
 
 #define PORPOISE_GUEST_CURRENT_CONTEXT_ADDRESS UINT32_C(0x800000D4)
+#define PORPOISE_GUEST_CURRENT_FPU_CONTEXT_ADDRESS UINT32_C(0x800000D8)
 #define PORPOISE_GUEST_CURRENT_THREAD_ADDRESS UINT32_C(0x800000E4)
 #define PORPOISE_GUEST_THREAD_STACK_MAGIC UINT32_C(0xDEADBABE)
 
@@ -301,6 +311,14 @@ static int porpoise_guest_spans_overlap(
            (uint64_t)right_address < left_end;
 }
 
+static void porpoise_write_be_u32(uint8_t *bytes, uint32_t value)
+{
+    bytes[0] = (uint8_t)(value >> 24U);
+    bytes[1] = (uint8_t)(value >> 16U);
+    bytes[2] = (uint8_t)(value >> 8U);
+    bytes[3] = (uint8_t)value;
+}
+
 #if defined(PORPOISE_HAVE_LIBPORPOISE_HOST_THREAD_CARRIER_V1)
 static uint64_t porpoise_read_be_u64(const uint8_t *bytes)
 {
@@ -312,14 +330,6 @@ static void porpoise_write_be_u16(uint8_t *bytes, uint16_t value)
 {
     bytes[0] = (uint8_t)(value >> 8U);
     bytes[1] = (uint8_t)value;
-}
-
-static void porpoise_write_be_u32(uint8_t *bytes, uint32_t value)
-{
-    bytes[0] = (uint8_t)(value >> 24U);
-    bytes[1] = (uint8_t)(value >> 16U);
-    bytes[2] = (uint8_t)(value >> 8U);
-    bytes[3] = (uint8_t)value;
 }
 
 static void porpoise_write_be_u64(uint8_t *bytes, uint64_t value)
@@ -575,7 +585,6 @@ static PorpoiseHostResult porpoise_guest_read_raw(
         state->host->context, guest_address, destination, size);
 }
 
-#if defined(PORPOISE_HAVE_LIBPORPOISE_HOST_THREAD_CARRIER_V1)
 static PorpoiseHostResult porpoise_guest_write_raw(
     PorpoisePpcState *state,
     uint32_t guest_address,
@@ -591,7 +600,6 @@ static PorpoiseHostResult porpoise_guest_write_raw(
     return state->host->write_bytes(
         state->host->context, guest_address, source, size);
 }
-#endif
 
 static PorpoiseHostResult porpoise_read_guest_word_result(
     PorpoisePpcState *state,
@@ -611,6 +619,96 @@ static PorpoiseHostResult porpoise_read_guest_word_result(
         *value_out = porpoise_read_be_u32(bytes);
     }
     return result;
+}
+
+static PorpoiseHostResult porpoise_write_guest_word_result(
+    PorpoisePpcState *state,
+    uint32_t guest_address,
+    uint32_t value)
+{
+    uint8_t bytes[4];
+
+    porpoise_write_be_u32(bytes, value);
+    return porpoise_guest_write_raw(
+        state, guest_address, bytes, sizeof(bytes));
+}
+
+static PorpoiseHostResult porpoise_acquire_initial_main_thread_fpu(
+    PorpoisePpcState *state,
+    PorpoiseLibporpoiseThreadRegistry *registry,
+    uint32_t current_context)
+{
+    PorpoiseHostResult result;
+    uint32_t previous_owner;
+    uint32_t previous_srr1;
+    uint32_t saved_srr1_address;
+    uint32_t acquired_srr1;
+    int srr1_changed;
+
+    if (state == NULL || registry == NULL || current_context == 0U ||
+        current_context >
+            UINT32_MAX - PORPOISE_GUEST_CONTEXT_SRR1_OFFSET) {
+        return PORPOISE_HOST_INVALID_ARGUMENT;
+    }
+    saved_srr1_address =
+        current_context + PORPOISE_GUEST_CONTEXT_SRR1_OFFSET;
+    result = porpoise_read_guest_word_result(
+        state,
+        PORPOISE_GUEST_CURRENT_FPU_CONTEXT_ADDRESS,
+        &previous_owner);
+    if (result != PORPOISE_HOST_OK) {
+        return result;
+    }
+    result = porpoise_read_guest_word_result(
+        state, saved_srr1_address, &previous_srr1);
+    if (result != PORPOISE_HOST_OK) {
+        return result;
+    }
+    if (previous_owner != 0U && previous_owner != current_context) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_STATE,
+            previous_owner,
+            "guest main-thread FPU acquisition found a conflicting owner");
+        return PORPOISE_HOST_INVALID_ARGUMENT;
+    }
+
+    acquired_srr1 = previous_srr1 | PORPOISE_MSR_FP;
+    srr1_changed = acquired_srr1 != previous_srr1;
+    if (srr1_changed) {
+        result = porpoise_write_guest_word_result(
+            state, saved_srr1_address, acquired_srr1);
+        if (result != PORPOISE_HOST_OK) {
+            return result;
+        }
+    }
+    if (previous_owner == 0U) {
+        result = porpoise_write_guest_word_result(
+            state,
+            PORPOISE_GUEST_CURRENT_FPU_CONTEXT_ADDRESS,
+            current_context);
+        if (result != PORPOISE_HOST_OK) {
+            if (srr1_changed &&
+                porpoise_write_guest_word_result(
+                    state,
+                    saved_srr1_address,
+                    previous_srr1) != PORPOISE_HOST_OK) {
+                registry->poisoned = 1;
+                porpoise_state_set_fault(
+                    state,
+                    PORPOISE_FAULT_INVALID_STATE,
+                    saved_srr1_address,
+                    "guest main-thread FPU acquisition failed and rollback was incomplete");
+                return PORPOISE_HOST_IO_ERROR;
+            }
+            return result;
+        }
+    }
+
+    /* This is the SDK handler's first-owner path: no saved floating-point
+     * payload is loaded, so all live FPR/FPSCR values remain authoritative. */
+    state->msr |= PORPOISE_MSR_FP;
+    return PORPOISE_HOST_OK;
 }
 
 PorpoiseHostResult porpoise_libporpoise_bind_guest_main_thread(
@@ -655,6 +753,11 @@ PorpoiseHostResult porpoise_libporpoise_bind_guest_main_thread(
         porpoise_guest_spans_overlap(
             current_thread,
             PORPOISE_GUEST_THREAD_SIZE,
+            PORPOISE_GUEST_CURRENT_FPU_CONTEXT_ADDRESS,
+            sizeof(uint32_t)) ||
+        porpoise_guest_spans_overlap(
+            current_thread,
+            PORPOISE_GUEST_THREAD_SIZE,
             PORPOISE_GUEST_CURRENT_THREAD_ADDRESS,
             sizeof(uint32_t))) {
         return PORPOISE_HOST_INVALID_ARGUMENT;
@@ -682,6 +785,12 @@ PorpoiseHostResult porpoise_libporpoise_bind_guest_main_thread(
         (porpoise_current_guest_thread != 0U &&
          porpoise_current_guest_thread != current_thread)) {
         return PORPOISE_HOST_INVALID_ARGUMENT;
+    }
+
+    result = porpoise_acquire_initial_main_thread_fpu(
+        state, registry, current_context);
+    if (result != PORPOISE_HOST_OK) {
+        return result;
     }
 
     registry->main_guest_thread = current_thread;
@@ -2039,7 +2148,8 @@ void porpoise_libporpoise_os_resume_thread_adapter(
 #else
     porpoise_guest_thread_scheduler_fault(
         state,
-        "OSResumeThread requires a guest thread scheduler mirror");
+        "OSResumeThread requires libPorpoise host-thread carrier API v1; "
+        "this runtime supports single-thread guest execution only");
 #endif
 }
 
@@ -2051,7 +2161,8 @@ void porpoise_libporpoise_os_suspend_thread_adapter(
 #else
     porpoise_guest_thread_scheduler_fault(
         state,
-        "OSSuspendThread requires a guest thread scheduler mirror");
+        "OSSuspendThread requires libPorpoise host-thread carrier API v1; "
+        "this runtime supports single-thread guest execution only");
 #endif
 }
 
@@ -2072,6 +2183,7 @@ void porpoise_libporpoise_os_exit_thread_adapter(
         state,
         PORPOISE_FAULT_UNSUPPORTED_OPERATION,
         state->pc,
-        "OSExitThread requires a guest thread scheduler mirror");
+        "OSExitThread requires libPorpoise host-thread carrier API v1; "
+        "this runtime supports single-thread guest execution only");
 #endif
 }

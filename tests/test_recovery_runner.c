@@ -962,6 +962,8 @@ static void test_runner(const char *source_root, const char *build_root) {
     char temporary[PORPOISE_PATH_CAPACITY];
     char runtime[PORPOISE_PATH_CAPACITY];
     char report_path[PORPOISE_PATH_CAPACITY];
+    char strict_input[PORPOISE_PATH_CAPACITY];
+    char *normal_overlay_input;
     PorpoiseRecoveryProject project;
     PorpoiseRecoveryRunOptions options;
     PorpoiseRecoveryRunResult result;
@@ -985,6 +987,22 @@ static void test_runner(const char *source_root, const char *build_root) {
     CHECK(porpoise_path_join(
         report_path, sizeof(report_path), temporary,
         "aggregate-report.json"));
+    CHECK(porpoise_path_join(
+        strict_input, sizeof(strict_input), temporary,
+        "strict-approximate.s"));
+    CHECK(write_text_file(
+        strict_input,
+        ".text\n"
+        ".fn lift_me, global\n"
+        "/* 80001000 00000000 60000000 */ frsp f2, f1\n"
+        "/* 80001004 00000004 4E800020 */ blr\n"
+        ".endfn lift_me\n"
+        ".fn import_me, global\n"
+        "/* 80003000 00000008 4E800020 */ blr\n"
+        ".endfn import_me\n"
+        ".fn omit_me, global\n"
+        "/* 80004000 0000000C 4E800020 */ blr\n"
+        ".endfn omit_me\n"));
 
     porpoise_recovery_run_options_init(&options);
     options.analyze_only = true;
@@ -1047,6 +1065,9 @@ static void test_runner(const char *source_root, const char *build_root) {
             index == 0U ? "old-main" : "old-overlay"));
     }
 
+    normal_overlay_input = copy_text(project.targets[1].input.resolved);
+    CHECK(normal_overlay_input != NULL);
+    CHECK(replace_path(&project.targets[1].input, strict_input));
     project.targets[1].strict = true;
     porpoise_recovery_run_options_init(&options);
     options.force = true;
@@ -1066,6 +1087,8 @@ static void test_runner(const char *source_root, const char *build_root) {
     CHECK(!directory_has_stage_artifact(temporary));
     porpoise_recovery_run_result_free(&result);
     project.targets[1].strict = false;
+    CHECK(replace_path(&project.targets[1].input, normal_overlay_input));
+    free(normal_overlay_input);
     porpoise_diagnostics_free(&diagnostics);
     porpoise_diagnostics_init(&diagnostics);
 

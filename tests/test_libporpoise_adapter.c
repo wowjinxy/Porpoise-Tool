@@ -40,6 +40,13 @@
 #define TEST_GUEST_DISPATCH_RETURNED UINT32_C(0x8000800C)
 #define TEST_GUEST_DISPATCH_CONTENTION_FIRST UINT32_C(0x80008010)
 #define TEST_GUEST_DISPATCH_CONTENTION_SECOND UINT32_C(0x80008014)
+#define TEST_GUEST_OS_ARENA_LO UINT32_C(0x80002100)
+#define TEST_GUEST_OS_ARENA_HI UINT32_C(0x80002104)
+#define TEST_GUEST_OS_INITIALIZED UINT32_C(0x80002108)
+#define TEST_GUEST_OS_BOOT_INFO UINT32_C(0x8000210C)
+#define TEST_GUEST_OS_BI2_DEBUG_FLAG UINT32_C(0x80002110)
+#define TEST_GUEST_DVD_LONG_FILE_NAME_FLAG UINT32_C(0x80002114)
+#define TEST_GUEST_PAD_STATUS UINT32_C(0x80016000)
 
 static const uint8_t test_canonical_system_call_vector[28] = {
     0x7DU, 0x30U, 0xFAU, 0xA6U,
@@ -589,6 +596,79 @@ static void test_system_call_adapter(
     system_call_base_read_bytes = NULL;
 }
 
+static void test_pad_read_adapter(PorpoisePpcState *state)
+{
+    static const uint8_t expected[48] = {
+        0x12U, 0x34U, 0x80U, 0x7FU, 0xFEU, 0x02U,
+        0x56U, 0x78U, 0x9AU, 0xBCU, 0xFDU, 0xCCU,
+        0xABU, 0xCDU, 0xFFU, 0x01U, 0xC0U, 0x40U,
+        0x10U, 0x20U, 0x30U, 0x40U, 0x00U, 0xCCU,
+        0x10U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0xFFU, 0xCCU,
+        0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0xFEU, 0xCCU
+    };
+    uint8_t preserved[sizeof(expected)];
+    uint8_t actual[sizeof(expected)];
+    size_t index;
+
+    PorpoiseStubPADReadReset();
+    fill_guest_bytes(
+        state, TEST_GUEST_PAD_STATUS, UINT8_C(0xCC), sizeof(expected));
+    state->gpr[3] = TEST_GUEST_PAD_STATUS;
+    porpoise_libporpoise_pad_read_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubPADReadCount() == 1U);
+    CHECK(state->gpr[3] == UINT32_C(0xA0000000));
+    CHECK(state->host->read_bytes(
+              state->host->context,
+              TEST_GUEST_PAD_STATUS,
+              actual,
+              sizeof(actual)) == PORPOISE_HOST_OK);
+    CHECK(memcmp(actual, expected, sizeof(expected)) == 0);
+    for (index = 0U; index < 4U; index++) {
+        CHECK(actual[index * 12U + 11U] == UINT8_C(0xCC));
+    }
+
+    memcpy(preserved, actual, sizeof(preserved));
+    state->gpr[3] = TEST_GUEST_PAD_STATUS + UINT32_C(1);
+    porpoise_libporpoise_pad_read_adapter(state);
+    CHECK(state->fault == PORPOISE_FAULT_INVALID_ARGUMENT);
+    CHECK(state->gpr[3] == TEST_GUEST_PAD_STATUS + UINT32_C(1));
+    CHECK(PorpoiseStubPADReadCount() == 1U);
+    CHECK(state->host->read_bytes(
+              state->host->context,
+              TEST_GUEST_PAD_STATUS,
+              actual,
+              sizeof(actual)) == PORPOISE_HOST_OK);
+    CHECK(memcmp(actual, preserved, sizeof(actual)) == 0);
+    porpoise_state_clear_fault(state);
+
+    state->gpr[3] = 0U;
+    porpoise_libporpoise_pad_read_adapter(state);
+    CHECK(state->fault == PORPOISE_FAULT_INVALID_POINTER);
+    CHECK(PorpoiseStubPADReadCount() == 1U);
+    porpoise_state_clear_fault(state);
+
+    state->gpr[3] = UINT32_C(0x817FFFE0);
+    porpoise_libporpoise_pad_read_adapter(state);
+    CHECK(state->fault == PORPOISE_FAULT_UNMAPPED_ADDRESS);
+    CHECK(PorpoiseStubPADReadCount() == 1U);
+    porpoise_state_clear_fault(state);
+
+    state->gpr[3] = TEST_GX_FIFO_ADDRESS;
+    porpoise_libporpoise_pad_read_adapter(state);
+    CHECK(state->fault == PORPOISE_FAULT_UNSUPPORTED_MMIO);
+    CHECK(PorpoiseStubPADReadCount() == 1U);
+    porpoise_state_clear_fault(state);
+
+    state->gpr[3] = UINT32_C(0xFFFFFFE0);
+    porpoise_libporpoise_pad_read_adapter(state);
+    CHECK(state->fault == PORPOISE_FAULT_ADDRESS_OVERFLOW);
+    CHECK(PorpoiseStubPADReadCount() == 1U);
+    porpoise_state_clear_fault(state);
+}
+
 int main(void)
 {
     PorpoiseHostAdapter host;
@@ -625,6 +705,7 @@ int main(void)
     CHECK(host.context != NULL);
     CHECK(host.read_bytes != NULL);
     CHECK(host.write_bytes != NULL);
+    CHECK(host.write_gx_fifo_u8 != NULL);
     CHECK(host.decode_pointer != NULL);
     CHECK(host.encode_pointer != NULL);
     CHECK(host.read_time_base != NULL);
@@ -655,6 +736,118 @@ int main(void)
     CHECK(state.gpr[1] == UINT32_C(0x817FF000));
     CHECK(state.gpr[2] == UINT32_C(0x80001000));
     CHECK(state.gpr[13] == UINT32_C(0x80002000));
+    CHECK(!porpoise_libporpoise_has_host_thread_carrier_v1());
+
+    {
+        uint32_t preserved_r3 = UINT32_C(0xA1B2C3D4);
+        uint32_t preserved_gprs[32];
+        const uint32_t guest_layout_addresses[] = {
+            TEST_GUEST_OS_ARENA_LO,
+            TEST_GUEST_OS_ARENA_HI,
+            TEST_GUEST_OS_INITIALIZED,
+            TEST_GUEST_OS_BOOT_INFO,
+            TEST_GUEST_OS_BI2_DEBUG_FLAG,
+            TEST_GUEST_DVD_LONG_FILE_NAME_FLAG
+        };
+        PorpoiseLibporpoiseGuestSdkLayoutV1 guest_layout = {
+            TEST_GUEST_OS_ARENA_LO,
+            TEST_GUEST_OS_ARENA_HI,
+            TEST_GUEST_OS_INITIALIZED,
+            TEST_GUEST_OS_BOOT_INFO,
+            TEST_GUEST_OS_BI2_DEBUG_FLAG,
+            TEST_GUEST_DVD_LONG_FILE_NAME_FLAG
+        };
+        PorpoiseLibporpoiseGuestSdkLayoutV1 changed_layout;
+        unsigned int os_init_before = PorpoiseStubOSInitCount();
+        size_t layout_index;
+
+        /* A manually authored ABI import has no exact SDK owner/layout and
+         * retains the old validate-only behavior. */
+        state.gpr[3] = preserved_r3;
+        porpoise_libporpoise_os_init_adapter(&state);
+        CHECK(!porpoise_state_has_fault(&state));
+        CHECK(state.gpr[3] == preserved_r3);
+        CHECK(PorpoiseStubOSInitCount() == os_init_before);
+
+        changed_layout = guest_layout;
+        changed_layout.os_initialized_address++;
+        CHECK(porpoise_libporpoise_bind_guest_sdk_layout_v1(
+                  NULL, &guest_layout) == PORPOISE_HOST_INVALID_ARGUMENT);
+        CHECK(porpoise_libporpoise_bind_guest_sdk_layout_v1(
+                  &host, NULL) == PORPOISE_HOST_INVALID_ARGUMENT);
+        CHECK(porpoise_libporpoise_bind_guest_sdk_layout_v1(
+                  &host, &changed_layout) ==
+              PORPOISE_HOST_INVALID_ARGUMENT);
+        CHECK(porpoise_libporpoise_bind_guest_sdk_layout_v1(
+                  &host, &guest_layout) == PORPOISE_HOST_OK);
+        CHECK(porpoise_libporpoise_bind_guest_sdk_layout_v1(
+                  &host, &guest_layout) == PORPOISE_HOST_OK);
+        changed_layout = guest_layout;
+        changed_layout.os_initialized_address = UINT32_C(0x80002118);
+        CHECK(porpoise_libporpoise_bind_guest_sdk_layout_v1(
+                  &host, &changed_layout) ==
+              PORPOISE_HOST_INVALID_ARGUMENT);
+        for (layout_index = 0U;
+             layout_index < sizeof(guest_layout_addresses) /
+                                    sizeof(guest_layout_addresses[0]);
+             layout_index++) {
+            porpoise_store_u32(
+                &state,
+                guest_layout_addresses[layout_index],
+                UINT32_C(0xCCCCCCCC));
+        }
+        CHECK(!porpoise_state_has_fault(&state));
+        memcpy(preserved_gprs, state.gpr, sizeof(preserved_gprs));
+        porpoise_libporpoise_os_init_adapter(&state);
+        CHECK(!porpoise_state_has_fault(&state));
+        CHECK(memcmp(
+                  state.gpr,
+                  preserved_gprs,
+                  sizeof(preserved_gprs)) == 0);
+        CHECK(porpoise_load_u32(&state, TEST_GUEST_OS_ARENA_LO) ==
+              UINT32_C(0x80003000));
+        CHECK(porpoise_load_u32(&state, TEST_GUEST_OS_ARENA_HI) ==
+              UINT32_C(0x80004000));
+        CHECK(porpoise_load_u32(&state, TEST_GUEST_OS_INITIALIZED) == 1U);
+        CHECK(porpoise_load_u32(&state, TEST_GUEST_OS_BOOT_INFO) ==
+              UINT32_C(0x80000000));
+        CHECK(porpoise_load_u32(&state, TEST_GUEST_OS_BI2_DEBUG_FLAG) == 0U);
+        CHECK(porpoise_load_u32(
+                  &state, TEST_GUEST_DVD_LONG_FILE_NAME_FLAG) == 1U);
+        CHECK(PorpoiseStubOSInitCount() == os_init_before);
+
+        /* Repeated exact OSInit calls are guest-idempotent just like the SDK
+         * AreWeInitialized guard. */
+        porpoise_libporpoise_os_init_adapter(&state);
+        CHECK(!porpoise_state_has_fault(&state));
+        CHECK(memcmp(
+                  state.gpr,
+                  preserved_gprs,
+                  sizeof(preserved_gprs)) == 0);
+
+        porpoise_libporpoise_dvd_init_adapter(&state);
+        CHECK(state.fault == PORPOISE_FAULT_UNSUPPORTED_OPERATION);
+        CHECK(strcmp(
+                  porpoise_state_fault_message(&state),
+                  "DVDInit import requires title-host native DVD initialization") ==
+              0);
+        CHECK(PorpoiseStubDVDInitCount() == 0U);
+        porpoise_state_clear_fault(&state);
+
+        porpoise_libporpoise_vi_init_adapter(&state);
+        porpoise_libporpoise_vi_init_adapter(&state);
+        CHECK(!porpoise_state_has_fault(&state));
+        CHECK(PorpoiseStubVIInitCount() == 1U);
+        CHECK(state.gpr[3] == preserved_r3);
+
+        porpoise_libporpoise_demo_pad_init_adapter(&state);
+        porpoise_libporpoise_demo_pad_init_adapter(&state);
+        CHECK(!porpoise_state_has_fault(&state));
+        CHECK(PorpoiseStubDEMOPadInitCount() == 1U);
+        CHECK(PorpoiseStubPADInitCount() == 1U);
+        CHECK(state.gpr[3] == preserved_r3);
+    }
+    test_pad_read_adapter(&state);
     token = porpoise_encode_pointer(&state, native_pointer);
     CHECK(!porpoise_state_has_fault(&state));
     CHECK(token == PorpoiseStubTokenAddress());
@@ -692,22 +885,24 @@ int main(void)
 
     PorpoiseStubGXFifoReset();
     porpoise_store_u8(&state, TEST_GX_FIFO_ADDRESS, UINT8_C(0x61));
+    porpoise_store_gx_fifo_u8(&state, UINT8_C(0x42));
     porpoise_store_u16(&state, TEST_GX_FIFO_ADDRESS, UINT16_C(0xABCD));
     porpoise_store_u32(
         &state, TEST_GX_FIFO_ADDRESS, UINT32_C(0x12345678));
     porpoise_store_f32(&state, TEST_GX_FIFO_ADDRESS, 1.0f);
     porpoise_store_f64(&state, TEST_GX_FIFO_ADDRESS, 1.0);
     CHECK(!porpoise_state_has_fault(&state));
-    CHECK(PorpoiseStubGXFifoCallCount() == 5U);
-    CHECK(PorpoiseStubGXFifoCallSize(0U) == 1U);
-    CHECK(PorpoiseStubGXFifoCallSize(1U) == 2U);
-    CHECK(PorpoiseStubGXFifoCallSize(2U) == 4U);
-    CHECK(PorpoiseStubGXFifoCallSize(3U) == 4U);
-    CHECK(PorpoiseStubGXFifoCallSize(4U) == 8U);
-    CHECK(PorpoiseStubGXFifoByteCount() == 19U);
+    CHECK(PorpoiseStubGXFifoCallCount() == 0U);
+    CHECK(porpoise_libporpoise_gx_flush_pending(&state));
+    CHECK(PorpoiseStubGXFifoCallCount() == 1U);
+    CHECK(PorpoiseStubGXFifoQueuedCallCount() == 1U);
+    CHECK(PorpoiseStubGXFifoSynchronousCallCount() == 0U);
+    CHECK(PorpoiseStubGXFifoCallSize(0U) == 20U);
+    CHECK(PorpoiseStubGXFifoByteCount() == 20U);
     {
-        static const uint8_t expected_fifo_bytes[19] = {
+        static const uint8_t expected_fifo_bytes[20] = {
             0x61U,
+            0x42U,
             0xABU, 0xCDU,
             0x12U, 0x34U, 0x56U, 0x78U,
             0x3FU, 0x80U, 0x00U, 0x00U,
@@ -728,23 +923,27 @@ int main(void)
               invalid_fifo_bytes,
               sizeof(invalid_fifo_bytes)) ==
           PORPOISE_HOST_UNSUPPORTED_MMIO);
-    CHECK(PorpoiseStubGXFifoCallCount() == 5U);
+    CHECK(PorpoiseStubGXFifoCallCount() == 1U);
     porpoise_store_u8(
         &state, TEST_GX_FIFO_ADDRESS + UINT32_C(1), UINT8_C(0xFF));
     CHECK(state.fault == PORPOISE_FAULT_UNSUPPORTED_MMIO);
-    CHECK(PorpoiseStubGXFifoCallCount() == 5U);
+    CHECK(PorpoiseStubGXFifoCallCount() == 1U);
     porpoise_state_clear_fault(&state);
     (void)porpoise_load_u8(&state, TEST_GX_FIFO_ADDRESS);
     CHECK(state.fault == PORPOISE_FAULT_UNSUPPORTED_MMIO);
-    CHECK(PorpoiseStubGXFifoCallCount() == 5U);
+    CHECK(PorpoiseStubGXFifoCallCount() == 1U);
     porpoise_state_clear_fault(&state);
     PorpoiseStubGXFifoSetAccept(0);
     porpoise_store_u8(&state, TEST_GX_FIFO_ADDRESS, UINT8_C(0x00));
+    CHECK(!porpoise_state_has_fault(&state));
+    CHECK(!porpoise_libporpoise_gx_flush_pending(&state));
     CHECK(state.fault == PORPOISE_FAULT_HOST_IO);
-    CHECK(PorpoiseStubGXFifoCallCount() == 5U);
+    CHECK(PorpoiseStubGXFifoCallCount() == 1U);
     CHECK(PorpoiseStubGXNumericWriteCount() == 0U);
     porpoise_state_clear_fault(&state);
     PorpoiseStubGXFifoSetAccept(1);
+    CHECK(porpoise_libporpoise_gx_flush_pending(&state));
+    CHECK(PorpoiseStubGXFifoCallCount() == 2U);
 
     CHECK(sizeof(GXRenderModeObj) == 0x3CU);
     fill_guest_bytes(
@@ -875,6 +1074,16 @@ int main(void)
     CHECK(PorpoiseStubDVDInitCount() == 1U);
     CHECK(strcmp(PorpoiseStubDVDRoot(), "adapter-files") == 0);
     porpoise_state_init(&state, &host);
+    porpoise_libporpoise_os_init_adapter(&state);
+    porpoise_libporpoise_dvd_init_adapter(&state);
+    porpoise_libporpoise_vi_init_adapter(&state);
+    porpoise_libporpoise_demo_pad_init_adapter(&state);
+    CHECK(!porpoise_state_has_fault(&state));
+    CHECK(PorpoiseStubOSInitCount() == 1U);
+    CHECK(PorpoiseStubDVDInitCount() == 1U);
+    CHECK(PorpoiseStubVIInitCount() == 1U);
+    CHECK(PorpoiseStubDEMOPadInitCount() == 1U);
+    CHECK(PorpoiseStubPADInitCount() == 1U);
     next_generation_token = porpoise_encode_pointer(&state, native_pointer);
     CHECK(!porpoise_state_has_fault(&state));
     CHECK(next_generation_token == PorpoiseStubTokenAddress());

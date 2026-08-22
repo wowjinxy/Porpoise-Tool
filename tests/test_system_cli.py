@@ -42,7 +42,6 @@ def add_stub(project):
 
 
 RAW_DETAIL = "raw architectural state transfer"
-RETURN_DETAIL = "C call-stack return does not dispatch an arbitrary guest LR target"
 EXPECTED_INSTRUCTIONS = {
     0x80008000: ("mfxer", "lowered", True, RAW_DETAIL),
     0x80008004: ("mtxer", "lowered", True, RAW_DETAIL),
@@ -121,7 +120,7 @@ EXPECTED_INSTRUCTIONS = {
         True,
         "performance-monitor timing and side effects are not modeled",
     ),
-    0x80008058: ("blr", "approximate", False, RETURN_DETAIL),
+    0x80008058: ("blr", "lowered", False, ""),
     0x80008100: (
         "twui",
         "approximate",
@@ -134,7 +133,7 @@ EXPECTED_INSTRUCTIONS = {
         True,
         "the system call is delegated to the embedding host adapter",
     ),
-    0x80008108: ("blr", "approximate", False, RETURN_DETAIL),
+    0x80008108: ("blr", "lowered", False, ""),
     0x80008200: (
         "rfi",
         "approximate",
@@ -171,7 +170,7 @@ EXPECTED_INSTRUCTIONS = {
         True,
         "state is preserved but hardware control side effects are not modeled",
     ),
-    0x80008294: ("blr", "approximate", False, RETURN_DETAIL),
+    0x80008294: ("blr", "lowered", False, ""),
 }
 
 
@@ -206,9 +205,9 @@ with tempfile.TemporaryDirectory(
         "initialized_data_bytes": 0,
         "zero_fill_data_bytes": 0,
         "data_chunks": 0,
-        "lowered": 12,
+        "lowered": 15,
         "host_equivalent_noop": 2,
-        "approximate": 19,
+        "approximate": 16,
         "unsupported": 0,
     }
     approximation_addresses = {

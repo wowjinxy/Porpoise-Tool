@@ -9,6 +9,7 @@
 #include <portable-file-dialogs.h>
 
 extern "C" {
+#include "porpoise/sha256.h"
 #include "porpoise/util.h"
 }
 
@@ -23,6 +24,9 @@ extern "C" {
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
+#include <iterator>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -124,6 +128,157 @@ std::string ReadTextFile(const std::string &path) {
     return output.str();
 }
 
+std::string ResolveExecutable(const std::string &value) {
+    if (value.empty()) return {};
+    std::error_code error;
+    const std::filesystem::path requested(value);
+    if (requested.has_parent_path() || requested.is_absolute()) {
+#if defined(_WIN32)
+        const auto extension = Lower(requested.extension().string());
+        if (extension == ".cmd" || extension == ".bat") return {};
+#endif
+        const auto absolute = std::filesystem::absolute(requested, error);
+        if (!error && std::filesystem::is_regular_file(absolute, error) &&
+            !error) return absolute.lexically_normal().string();
+        return {};
+    }
+    const char *path_value = std::getenv("PATH");
+    if (path_value == nullptr) return {};
+#if defined(_WIN32)
+    constexpr char separator = ';';
+    const std::array<const char *, 2> suffixes = {"", ".exe"};
+#else
+    constexpr char separator = ':';
+    const std::array<const char *, 1> suffixes = {""};
+#endif
+    std::istringstream path_stream(path_value);
+    std::string directory;
+    while (std::getline(path_stream, directory, separator)) {
+        if (directory.empty()) continue;
+        for (const char *suffix : suffixes) {
+            const auto candidate = std::filesystem::path(directory) /
+                (value + suffix);
+            error.clear();
+            if (std::filesystem::is_regular_file(candidate, error) && !error)
+                return std::filesystem::absolute(candidate).lexically_normal()
+                    .string();
+        }
+    }
+    return {};
+}
+
+bool IsLibPorpoiseCheckout(const std::filesystem::path &directory) {
+    std::error_code error;
+    return std::filesystem::is_directory(directory, error) && !error &&
+           std::filesystem::is_regular_file(directory / "meson.build", error) &&
+           !error;
+}
+
+struct LibPorpoiseCapabilities {
+    bool checkout = false;
+    bool canonical_fifo = false;
+    bool queued_canonical_fifo = false;
+    bool host_xfb_observation = false;
+    bool gpu_resident_xfb = false;
+    unsigned int canonical_fifo_version = 0;
+};
+
+unsigned int DefinedUnsignedVersion(const std::string &source,
+                                    const std::string &name) {
+    const auto definition = source.find("#define " + name);
+    if (definition == std::string::npos) return 0;
+    auto cursor = definition + std::string("#define ").size() + name.size();
+    while (cursor < source.size() &&
+           std::isspace(static_cast<unsigned char>(source[cursor])) != 0)
+        ++cursor;
+    unsigned int value = 0;
+    bool found_digit = false;
+    while (cursor < source.size() &&
+           std::isdigit(static_cast<unsigned char>(source[cursor])) != 0) {
+        found_digit = true;
+        const unsigned int digit =
+            static_cast<unsigned int>(source[cursor] - '0');
+        if (value > (std::numeric_limits<unsigned int>::max() - digit) / 10U)
+            return 0;
+        value = value * 10U + digit;
+        ++cursor;
+    }
+    return found_digit ? value : 0;
+}
+
+LibPorpoiseCapabilities InspectLibPorpoiseCapabilities(
+    const std::filesystem::path &directory) {
+    LibPorpoiseCapabilities capabilities;
+    capabilities.checkout = IsLibPorpoiseCheckout(directory);
+    if (!capabilities.checkout) return capabilities;
+
+    const auto command_processor = ReadTextFile(
+        (directory / "include" / "simulator" /
+         "sim_gx_CommandProcessor.h").string());
+    capabilities.canonical_fifo_version = DefinedUnsignedVersion(
+        command_processor,
+        "SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION");
+    capabilities.queued_canonical_fifo =
+        capabilities.canonical_fifo_version >= 2U &&
+        command_processor.find(
+            "SIM_GX_CommandProcessor_QueueCanonicalBytes") !=
+            std::string::npos;
+    capabilities.canonical_fifo =
+        capabilities.queued_canonical_fifo ||
+        (capabilities.canonical_fifo_version >= 1U &&
+         command_processor.find(
+             "SIM_GX_CommandProcessor_SendCanonicalBytes") !=
+             std::string::npos);
+
+    const auto host_xfb = ReadTextFile(
+        (directory / "include" / "simulator" / "sim_gx_Xfb.hpp")
+            .string());
+    capabilities.host_xfb_observation =
+        host_xfb.find("HostXfbExecutionStats") != std::string::npos &&
+        host_xfb.find("GetHostXfbExecutionStats") != std::string::npos &&
+        host_xfb.find("lastPresentedGuestAddress") != std::string::npos &&
+        host_xfb.find("presentations") != std::string::npos;
+    capabilities.gpu_resident_xfb =
+        capabilities.host_xfb_observation &&
+        host_xfb.find("gpuResidentDisplayCopies") != std::string::npos &&
+        host_xfb.find("gpuResidentPresentations") != std::string::npos;
+    return capabilities;
+}
+
+std::uintmax_t DirectoryAllocatedSize(const std::filesystem::path &root) {
+    std::error_code error;
+    if (!std::filesystem::is_directory(root, error) || error) return 0;
+    std::uintmax_t total = 0;
+    std::filesystem::recursive_directory_iterator iterator(
+        root, std::filesystem::directory_options::skip_permission_denied,
+        error);
+    const std::filesystem::recursive_directory_iterator end;
+    while (!error && iterator != end) {
+        if (iterator->is_regular_file(error) && !error) {
+            const auto size = iterator->file_size(error);
+            if (!error && total <= std::numeric_limits<std::uintmax_t>::max() -
+                                      size) total += size;
+        }
+        error.clear();
+        iterator.increment(error);
+    }
+    return total;
+}
+
+std::string HumanSize(std::uintmax_t bytes) {
+    static const char *units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double value = static_cast<double>(bytes);
+    std::size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < std::size(units)) {
+        value /= 1024.0;
+        ++unit;
+    }
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(unit == 0 ? 0 : 1)
+           << value << ' ' << units[unit];
+    return output.str();
+}
+
 const char *SeverityName(PorpoiseSeverity severity) {
     switch (severity) {
     case PORPOISE_SEVERITY_INFO: return "info";
@@ -154,9 +309,25 @@ std::string DiagnosticHint(const PorpoiseDiagnostic *diagnostic) {
                "diagnostic, then turn off Strict in Advanced settings if "
                "that approximation is acceptable for this recovery pass.";
     }
+    if (message.find("compiler") != std::string::npos ||
+        message.find("Meson") != std::string::npos ||
+        message.find("meson") != std::string::npos) {
+        return "Open Runtime configuration and select one matching x64 C/C++ "
+               "toolchain plus Meson 1.2 or newer.";
+    }
+    if (message.find("DLL") != std::string::npos ||
+        message.find("runtime import") != std::string::npos) {
+        return "Open Runtime configuration and correct the reported runtime "
+               "or compiler path before running again.";
+    }
+    if (message.find("title_host") != std::string::npos ||
+        message.find("title-host") != std::string::npos) {
+        return "Review the target title-host profile; stale locators and "
+               "startup functions that are not Lift block Build and Run.";
+    }
     if (message.find("does not exist") != std::string::npos ||
         message.find("could not open") != std::string::npos) {
-        return "Check the selected source and tool paths, then Analyze again.";
+        return "Check the selected source and tool paths, then retry.";
     }
     return "Open Diagnostics for the complete context, correct the setting "
            "shown there, then Analyze again.";
@@ -322,6 +493,25 @@ enum class PendingFileAction {
     Close
 };
 
+enum class GuidedAction {
+    Analyze,
+    Generate,
+    ConfigureRuntime,
+    Build,
+    Run
+};
+
+const char *GuidedActionName(GuidedAction action) {
+    switch (action) {
+    case GuidedAction::Analyze: return "Analyze";
+    case GuidedAction::Generate: return "Generate";
+    case GuidedAction::ConfigureRuntime: return "Configure Runtime";
+    case GuidedAction::Build: return "Build";
+    case GuidedAction::Run: return "Run";
+    }
+    return "Continue";
+}
+
 struct RowRecord {
     std::size_t run_target_index = 0;
     std::size_t function_index = 0;
@@ -357,6 +547,7 @@ public:
         if (!error)
             model_.SetUntitledRecoveryDirectory(preference_directory_);
         LoadMachineState();
+        DiscoverRuntimeSettings();
     }
 
     ~WorkbenchApp() { SaveMachineState(); }
@@ -374,6 +565,26 @@ public:
         std::error_code error;
         std::filesystem::create_directories(preference_directory_, error);
         if (error) return false;
+        ResetProjectMachineState();
+        if (!trace_enabled_ || frame_limit_ != 3U) return false;
+        trace_enabled_ = false;
+        if (EffectiveRunFrameLimit() != 0U) return false;
+        trace_enabled_ = true;
+
+        /* Legacy schema-v1 IDs may contain path punctuation. Cache and trace
+         * controls must use the same derived key as the C Build/Run core. */
+        if (!model_.NewProject() || !model_.AddTarget("..")) return false;
+        const auto legacy_id_project =
+            std::filesystem::path(preference_directory_) /
+            "legacy-id-smoke.porpoise.json";
+        if (!model_.SaveAs(legacy_id_project.string())) return false;
+        active_target_ = 0;
+        char legacy_cache_key[PORPOISE_RECOVERY_TARGET_CACHE_KEY_SIZE] = {};
+        if (!porpoise_recovery_target_cache_key("..", legacy_cache_key) ||
+            ActiveBuildCacheRoot().filename().string() != legacy_cache_key ||
+            ActiveBuildCacheRoot().parent_path().filename().string() !=
+                ".porpoise-build") return false;
+        if (!model_.NewProject()) return false;
 
         /* Exercise the actual startup routing for ABI-only work created before
          * an untitled project has ever been saved. */
@@ -481,16 +692,80 @@ public:
         SyncTargetDraft();
         dtk_path_ = (std::filesystem::path(preference_directory_) /
                      "smoke-dtk").string();
+        const auto smoke_libporpoise =
+            std::filesystem::path(preference_directory_) /
+            "smoke-libporpoise";
+        error.clear();
+        std::filesystem::create_directories(
+            smoke_libporpoise / "include" / "simulator", error);
+        if (error) return false;
+        {
+            std::ofstream meson(smoke_libporpoise / "meson.build");
+            std::ofstream command_processor(
+                smoke_libporpoise / "include" / "simulator" /
+                "sim_gx_CommandProcessor.h");
+            std::ofstream host_xfb(
+                smoke_libporpoise / "include" / "simulator" /
+                "sim_gx_Xfb.hpp");
+            if (!meson || !command_processor || !host_xfb) return false;
+            meson << "project('smoke-libporpoise', 'c', 'cpp')\n";
+            command_processor
+                << "#define SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION 2\n"
+                << "int SIM_GX_CommandProcessor_QueueCanonicalBytes;\n";
+            host_xfb
+                << "struct HostXfbExecutionStats { unsigned long long "
+                   "presentations; unsigned long long "
+                   "gpuResidentDisplayCopies; unsigned long long "
+                   "gpuResidentPresentations; unsigned "
+                   "lastPresentedGuestAddress; };\n"
+                << "HostXfbExecutionStats GetHostXfbExecutionStats();\n";
+        }
+        libporpoise_directory_ = smoke_libporpoise.string();
+        RefreshLibPorpoiseCapabilities();
+        if (!libporpoise_capabilities_.canonical_fifo ||
+            !libporpoise_capabilities_.queued_canonical_fifo ||
+            !libporpoise_capabilities_.host_xfb_observation ||
+            !libporpoise_capabilities_.gpu_resident_xfb) return false;
+        meson_path_ = (std::filesystem::path(preference_directory_) /
+                       "smoke-meson").string();
+        c_compiler_path_ = (std::filesystem::path(preference_directory_) /
+                            "smoke-cc").string();
+        cpp_compiler_path_ = (std::filesystem::path(preference_directory_) /
+                              "smoke-cxx").string();
+        dvd_root_ = (std::filesystem::path(preference_directory_) /
+                     "smoke-dvd").string();
+        trace_path_ = (std::filesystem::path(preference_directory_) /
+                       "smoke-trace.jsonl").string();
+        frame_limit_ = 300;
+        if (NextAction() != GuidedAction::Analyze) return false;
         RequestRun(true);
+        const auto project_machine_state =
+            ProjectMachineStatePath(failure_project.string());
         if (model_.State() != WorkerState::Running || model_.Dirty() ||
             ReadTextFile(failure_project.string()).find("saved-before-run") ==
                 std::string::npos ||
-            ReadTextFile(machine_state_path_).find("dtk=" + dtk_path_) ==
+            ReadTextFile(project_machine_state).find("dtk=" + dtk_path_) ==
+                std::string::npos ||
+            ReadTextFile(project_machine_state).find(
+                "libporpoise=" + libporpoise_directory_) ==
+                std::string::npos ||
+            ReadTextFile(project_machine_state).find("frame_limit=300") ==
+                std::string::npos ||
+            ReadTextFile(machine_state_path_).find("libporpoise=") !=
                 std::string::npos) return false;
         model_.Wait();
         HandleWorkerCompletion();
         const auto *primary = model_.PrimaryDiagnostic();
-        return model_.State() == WorkerState::Failed && select_setup_tab_ &&
+        const std::string expected_libporpoise = libporpoise_directory_;
+        ResetProjectMachineState();
+        LoadProjectMachineState(failure_project.string());
+        DiscoverRuntimeSettings();
+        return libporpoise_directory_ == expected_libporpoise &&
+               libporpoise_capabilities_.queued_canonical_fifo &&
+               ReadTextFile(failure_project.string()).find(
+                   expected_libporpoise) == std::string::npos &&
+               frame_limit_ == 300 &&
+               model_.State() == WorkerState::Failed && select_setup_tab_ &&
                primary != nullptr &&
                primary->severity == PORPOISE_SEVERITY_ERROR &&
                primary->message != nullptr && primary->message[0] != '\0';
@@ -506,6 +781,8 @@ public:
             last_project_.clear();
             ResetAbiEditor();
             SyncTargetDraft();
+            ResetProjectMachineState();
+            DiscoverRuntimeSettings();
             recovery_document_.clear();
             open_recovery_popup_ = true;
             return;
@@ -516,6 +793,8 @@ public:
             last_project_ = selected;
             ResetAbiEditor();
             SyncTargetDraft();
+            LoadProjectMachineState(selected);
+            DiscoverRuntimeSettings();
             if (model_.HasNewerAutosave() || HasNewerAbiAutosave()) {
                 recovery_document_ = selected;
                 open_recovery_popup_ = true;
@@ -524,6 +803,8 @@ public:
             model_.NewProject();
             ResetAbiEditor();
             SyncTargetDraft();
+            ResetProjectMachineState();
+            DiscoverRuntimeSettings();
         }
     }
 
@@ -536,6 +817,9 @@ public:
         RenderRecoveryPopup();
         RenderUnsavedPopup();
         RenderOverwritePopup();
+        RenderCopyFallbackPopup();
+        RenderCacheCleanupPopup();
+        RenderProfileResetPopup();
         RenderMenu();
         RenderToolbar();
 
@@ -577,12 +861,41 @@ public:
 
 private:
     void HandleWorkerCompletion() {
+        last_operation_ = model_.Operation();
+        bool inferred_review_ready = false;
+        if (model_.State() == WorkerState::Succeeded &&
+            last_operation_ == WorkerOperation::Recovery &&
+            active_target_ < model_.Project().target_count &&
+            !model_.Project().targets[active_target_].has_title_host) {
+            inferred_initialize_dvd_ = false;
+            inferred_review_ready = model_.InferTitleHostProfile(
+                Text(model_.Project().targets[active_target_].id));
+        }
+        if (model_.State() == WorkerState::Succeeded &&
+            (last_operation_ == WorkerOperation::Build ||
+             last_operation_ == WorkerOperation::Run) &&
+            active_target_ < model_.Project().target_count) {
+            built_target_id_ = Text(
+                model_.Project().targets[active_target_].id);
+            cache_size_known_ = false;
+        }
         if (model_.State() == WorkerState::Failed) {
             select_setup_tab_ = true;
+            select_functions_tab_ = false;
             select_diagnostics_tab_ = false;
         } else if (model_.State() == WorkerState::Succeeded &&
+                   last_operation_ == WorkerOperation::Recovery &&
                    last_run_analyze_only_) {
-            select_functions_tab_ = true;
+            if (inferred_review_ready) {
+                select_setup_tab_ = true;
+                select_functions_tab_ = false;
+            } else {
+                select_setup_tab_ = false;
+                select_functions_tab_ = true;
+            }
+        } else if (model_.State() == WorkerState::Succeeded) {
+            select_setup_tab_ = true;
+            select_functions_tab_ = false;
         }
     }
 
@@ -663,6 +976,131 @@ private:
         target_draft_dirty_ = false;
     }
 
+    void RefreshLibPorpoiseCapabilities() {
+        libporpoise_capability_path_ = libporpoise_directory_;
+        libporpoise_capabilities_ = InspectLibPorpoiseCapabilities(
+            std::filesystem::path(libporpoise_directory_));
+    }
+
+    void DiscoverRuntimeSettings() {
+        auto first_executable = [](std::initializer_list<const char *> names) {
+            for (const char *name : names) {
+                const auto resolved = ResolveExecutable(name);
+                if (!resolved.empty()) return resolved;
+            }
+            return std::string();
+        };
+        if (ResolveExecutable(meson_path_).empty())
+            meson_path_ = first_executable({"meson"});
+        if (ResolveExecutable(c_compiler_path_).empty()) {
+            c_compiler_path_.clear();
+            const char *configured = std::getenv("CC");
+            if (configured != nullptr)
+                c_compiler_path_ = ResolveExecutable(configured);
+            if (c_compiler_path_.empty())
+                c_compiler_path_ = first_executable({"clang", "gcc", "cc"});
+        }
+        if (ResolveExecutable(cpp_compiler_path_).empty()) {
+            cpp_compiler_path_.clear();
+            const char *configured = std::getenv("CXX");
+            if (configured != nullptr)
+                cpp_compiler_path_ = ResolveExecutable(configured);
+            if (cpp_compiler_path_.empty() && !c_compiler_path_.empty()) {
+                auto candidate = std::filesystem::path(c_compiler_path_);
+                std::string stem = candidate.stem().string();
+                if (stem.size() >= 3 &&
+                    stem.substr(stem.size() - 3) == "gcc") {
+                    stem.replace(stem.size() - 3, 3, "g++");
+                } else if (stem.size() >= 5 &&
+                           stem.substr(stem.size() - 5) == "clang") {
+                    stem += "++";
+                } else stem.clear();
+                if (!stem.empty()) {
+                    candidate = candidate.parent_path() /
+                        (stem + candidate.extension().string());
+                    cpp_compiler_path_ = ResolveExecutable(candidate.string());
+                }
+            }
+            if (cpp_compiler_path_.empty())
+                cpp_compiler_path_ = first_executable(
+                    {"clang++", "g++", "c++"});
+        }
+        if (!IsLibPorpoiseCheckout(libporpoise_directory_)) {
+            libporpoise_directory_.clear();
+            std::vector<std::filesystem::path> candidates;
+            std::error_code error;
+            const auto current = std::filesystem::current_path(error);
+            if (!error) {
+                candidates.push_back(current / "libPorpoise");
+                candidates.push_back(current.parent_path() / "libPorpoise");
+            }
+            if (!model_.DocumentPath().empty()) {
+                const auto project_directory =
+                    std::filesystem::path(model_.DocumentPath()).parent_path();
+                candidates.push_back(project_directory / "libPorpoise");
+                candidates.push_back(
+                    project_directory.parent_path() / "libPorpoise");
+            }
+            for (const auto &candidate : candidates) {
+                if (IsLibPorpoiseCheckout(candidate)) {
+                    libporpoise_directory_ =
+                        std::filesystem::absolute(candidate).lexically_normal()
+                            .string();
+                    break;
+                }
+            }
+        }
+        if (build_type_.empty()) build_type_ = "debugoptimized";
+        RefreshLibPorpoiseCapabilities();
+    }
+
+    std::string ProjectMachineStatePath(const std::string &document) const {
+        if (document.empty()) return {};
+        std::error_code error;
+        auto normalized = std::filesystem::absolute(document, error);
+        if (error) normalized = document;
+        error.clear();
+        const auto canonical = std::filesystem::weakly_canonical(
+            normalized, error);
+        if (!error) normalized = canonical;
+        std::string identity = normalized.lexically_normal().generic_string();
+#if defined(_WIN32)
+        std::transform(identity.begin(), identity.end(), identity.begin(),
+                       [](unsigned char character) {
+                           return static_cast<char>(std::tolower(character));
+                       });
+#endif
+        std::uint8_t digest[PORPOISE_SHA256_DIGEST_SIZE];
+        char digest_hex[PORPOISE_SHA256_HEX_SIZE];
+        porpoise_sha256(identity.data(), identity.size(), digest);
+        porpoise_sha256_hex(digest, digest_hex);
+        return (std::filesystem::path(preference_directory_) /
+                ("project-state-" + std::string(digest_hex) + ".ini"))
+            .string();
+    }
+
+    void ResetProjectMachineState() {
+        dtk_path_.clear();
+        runtime_directory_ = porpoise_default_runtime_directory();
+        report_path_.clear();
+        libporpoise_directory_.clear();
+        libporpoise_capability_path_.clear();
+        libporpoise_capabilities_ = {};
+        meson_path_.clear();
+        c_compiler_path_.clear();
+        cpp_compiler_path_.clear();
+        dvd_root_.clear();
+        run_working_directory_.clear();
+        build_type_ = "debugoptimized";
+        trace_path_.clear();
+        trace_enabled_ = true;
+        allow_copy_fallback_ = false;
+        frame_limit_ = 3;
+        built_target_id_.clear();
+        cache_size_known_ = false;
+        cache_cleanup_error_.clear();
+    }
+
     void LoadMachineState() {
         std::ifstream input(machine_state_path_);
         std::string line;
@@ -672,28 +1110,80 @@ private:
             const auto key = line.substr(0, separator);
             const auto value = line.substr(separator + 1);
             if (key == "last_project") last_project_ = value;
-            else if (key == "dtk") dtk_path_ = value;
+            else if (key == "filter") filter_ = value;
+        }
+    }
+
+    void LoadProjectMachineState(const std::string &document) {
+        ResetProjectMachineState();
+        const auto state_path = ProjectMachineStatePath(document);
+        if (state_path.empty()) return;
+        std::ifstream input(state_path);
+        std::string line;
+        while (std::getline(input, line)) {
+            const auto separator = line.find('=');
+            if (separator == std::string::npos) continue;
+            const auto key = line.substr(0, separator);
+            const auto value = line.substr(separator + 1);
+            if (key == "dtk") dtk_path_ = value;
             else if (key == "runtime") runtime_directory_ = value;
             else if (key == "report") report_path_ = value;
-            else if (key == "filter") filter_ = value;
+            else if (key == "libporpoise") libporpoise_directory_ = value;
+            else if (key == "meson") meson_path_ = value;
+            else if (key == "cc") c_compiler_path_ = value;
+            else if (key == "cxx") cpp_compiler_path_ = value;
+            else if (key == "dvd_root") dvd_root_ = value;
+            else if (key == "working_directory")
+                run_working_directory_ = value;
+            else if (key == "build_type") build_type_ = value;
+            else if (key == "trace") trace_path_ = value;
+            else if (key == "trace_enabled") trace_enabled_ = value != "0";
+            else if (key == "allow_copy_fallback")
+                allow_copy_fallback_ = value == "1";
+            else if (key == "frame_limit") {
+                try {
+                    frame_limit_ = std::stoull(value);
+                } catch (...) {
+                    frame_limit_ = 0;
+                }
+            }
         }
     }
 
     void SaveMachineState() const {
         std::error_code error;
         std::filesystem::create_directories(preference_directory_, error);
-        std::ofstream output(machine_state_path_,
-                             std::ios::binary | std::ios::trunc);
         auto safe = [](std::string value) {
             std::replace(value.begin(), value.end(), '\n', ' ');
             std::replace(value.begin(), value.end(), '\r', ' ');
             return value;
         };
-        output << "last_project=" << safe(last_project_) << '\n'
-               << "dtk=" << safe(dtk_path_) << '\n'
+        {
+            std::ofstream output(machine_state_path_,
+                                 std::ios::binary | std::ios::trunc);
+            output << "last_project=" << safe(last_project_) << '\n'
+                   << "filter=" << safe(filter_) << '\n';
+        }
+        const auto project_state =
+            ProjectMachineStatePath(model_.DocumentPath());
+        if (project_state.empty()) return;
+        std::ofstream output(project_state,
+                             std::ios::binary | std::ios::trunc);
+        output << "dtk=" << safe(dtk_path_) << '\n'
                << "runtime=" << safe(runtime_directory_) << '\n'
                << "report=" << safe(report_path_) << '\n'
-               << "filter=" << safe(filter_) << '\n';
+               << "libporpoise=" << safe(libporpoise_directory_) << '\n'
+               << "meson=" << safe(meson_path_) << '\n'
+               << "cc=" << safe(c_compiler_path_) << '\n'
+               << "cxx=" << safe(cpp_compiler_path_) << '\n'
+               << "dvd_root=" << safe(dvd_root_) << '\n'
+               << "working_directory=" << safe(run_working_directory_) << '\n'
+               << "build_type=" << safe(build_type_) << '\n'
+               << "trace=" << safe(trace_path_) << '\n'
+               << "trace_enabled=" << (trace_enabled_ ? "1" : "0") << '\n'
+               << "allow_copy_fallback="
+               << (allow_copy_fallback_ ? "1" : "0") << '\n'
+               << "frame_limit=" << frame_limit_ << '\n';
     }
 
     void RenderRecoveryPopup() {
@@ -735,6 +1225,8 @@ private:
                 last_project_.clear();
                 ResetAbiEditor();
                 SyncTargetDraft();
+                ResetProjectMachineState();
+                DiscoverRuntimeSettings();
             }
             break;
         case PendingFileAction::OpenProject:
@@ -844,16 +1336,13 @@ private:
             const auto state = model_.State();
             const bool idle = state != WorkerState::Running &&
                               state != WorkerState::Cancelling;
-            const bool valid_setup = SetupIssue().empty();
-            const bool ready_to_generate = idle && valid_setup &&
-                state == WorkerState::Succeeded &&
-                model_.RunResult() != nullptr;
-            if (ImGui::MenuItem("Analyze", nullptr, false,
-                                idle && valid_setup))
-                RequestRun(true);
-            if (ImGui::MenuItem("Generate", nullptr, false,
-                                ready_to_generate))
-                RequestRun(false);
+            const auto action = NextAction();
+            const bool primary_enabled = idle &&
+                (action == GuidedAction::ConfigureRuntime ||
+                 SetupIssue().empty());
+            if (ImGui::MenuItem(GuidedActionName(action), nullptr, false,
+                                primary_enabled))
+                RequestPrimaryAction();
             if (ImGui::MenuItem("Cancel", nullptr, false, !idle))
                 model_.Cancel();
             ImGui::EndMenu();
@@ -874,36 +1363,47 @@ private:
         const auto state = model_.State();
         const bool busy = state == WorkerState::Running ||
                           state == WorkerState::Cancelling;
-        const bool valid_setup = SetupIssue().empty();
-        const bool ready_to_generate = !busy && valid_setup &&
-            state == WorkerState::Succeeded &&
-            model_.RunResult() != nullptr;
-        ImGui::BeginDisabled(busy || !valid_setup);
-        if (ImGui::Button("Analyze")) RequestRun(true);
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!ready_to_generate);
-        if (ImGui::Button("Generate")) RequestRun(false);
+        const auto action = NextAction();
+        const bool primary_enabled = !busy &&
+            (action == GuidedAction::ConfigureRuntime ||
+             SetupIssue().empty());
+        ImGui::BeginDisabled(!primary_enabled);
+        if (ImGui::Button(GuidedActionName(action))) RequestPrimaryAction();
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(!busy);
         if (ImGui::Button("Cancel")) model_.Cancel();
         ImGui::EndDisabled();
         ImGui::SameLine();
+        const bool build_operation =
+            model_.Operation() == WorkerOperation::RuntimePreflight ||
+            model_.Operation() == WorkerOperation::Build ||
+            model_.Operation() == WorkerOperation::Run;
         const auto progress = model_.Progress();
-        float fraction = progress.total == 0
+        const auto build_progress = model_.BuildProgress();
+        const std::size_t completed = build_operation
+            ? build_progress.completed : progress.completed;
+        const std::size_t total = build_operation
+            ? build_progress.total : progress.total;
+        float fraction = total == 0
             ? (busy ? -1.0f : 0.0f)
-            : static_cast<float>(progress.completed) /
-                  static_cast<float>(progress.total);
+            : static_cast<float>(completed) / static_cast<float>(total);
         const auto *primary = state == WorkerState::Failed
             ? model_.PrimaryDiagnostic() : nullptr;
         std::string overlay;
         if (state == WorkerState::Failed && primary != nullptr) {
             overlay = "Failed: " + Text(primary->message);
         } else {
-            overlay = std::string(WorkerStateName(state)) +
-                " - " + porpoise_operation_phase_name(progress.phase);
-            if (!progress.detail.empty()) overlay += " - " + progress.detail;
+            overlay = std::string(WorkerStateName(state)) + " - ";
+            if (build_operation) {
+                overlay += porpoise_build_phase_name(build_progress.phase);
+                if (!build_progress.detail.empty())
+                    overlay += " - " + build_progress.detail;
+            } else {
+                overlay += porpoise_operation_phase_name(progress.phase);
+                if (!progress.detail.empty())
+                    overlay += " - " + progress.detail;
+            }
         }
         if (state == WorkerState::Failed)
             ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
@@ -930,6 +1430,8 @@ private:
             selected_rows_.clear();
             ResetAbiEditor();
             SyncTargetDraft();
+            LoadProjectMachineState(selected.front());
+            DiscoverRuntimeSettings();
             if (model_.HasNewerAutosave() || HasNewerAbiAutosave()) {
                 recovery_document_ = selected.front();
                 open_recovery_popup_ = true;
@@ -989,6 +1491,8 @@ private:
         }
         SaveMachineState();
         last_run_analyze_only_ = analyze_only;
+        last_operation_ = WorkerOperation::Recovery;
+        built_target_id_.clear();
         RunRequest request;
         request.analyze_only = analyze_only;
         request.report_path = report_path_;
@@ -1003,6 +1507,107 @@ private:
             pending_run_ = request;
             open_overwrite_popup_ = true;
         } else model_.Start(request);
+    }
+
+    void RequestBuild(bool run) {
+        ApplyTargetDraft();
+        if (target_draft_dirty_ || active_target_ >=
+                model_.Project().target_count) {
+            select_setup_tab_ = true;
+            return;
+        }
+        if (model_.DocumentPath().empty()) {
+            if (!SaveProject(true)) return;
+        } else if ((model_.Dirty() || abi_drafts_dirty_) &&
+                   !SaveProject(false)) {
+            return;
+        }
+        const auto configuration_issue = RuntimeConfigurationIssue();
+        if (!configuration_issue.empty()) {
+            runtime_config_expanded_ = true;
+            select_setup_tab_ = true;
+            return;
+        }
+        const auto *run_target = ActiveRunTarget();
+        if (run_target == nullptr || run_target->plan == nullptr) return;
+
+        SaveMachineState();
+        BuildRunRequest request;
+        if (!BuildRequestForActiveTarget(run, &request)) return;
+        last_operation_ = run ? WorkerOperation::Run : WorkerOperation::Build;
+        if (!model_.StartBuild(request)) {
+            select_setup_tab_ = true;
+            select_diagnostics_tab_ = false;
+        }
+    }
+
+    bool BuildRequestForActiveTarget(
+        bool run, BuildRunRequest *request) const {
+        if (request == nullptr || model_.DocumentPath().empty() ||
+            active_target_ >= model_.Project().target_count) return false;
+        const auto *run_target = ActiveRunTarget();
+        if (run_target == nullptr || run_target->plan == nullptr) return false;
+        const auto &target = model_.Project().targets[active_target_];
+        *request = {};
+        request->target_id = Text(target.id);
+        request->generated_directory = Text(target.output.resolved);
+        request->libporpoise_directory = libporpoise_directory_;
+        request->meson_executable = ResolveExecutable(meson_path_);
+        request->c_compiler = ResolveExecutable(c_compiler_path_);
+        request->cpp_compiler = ResolveExecutable(cpp_compiler_path_);
+        request->build_type = build_type_;
+        request->generated_plan_digest = Text(
+            porpoise_plan_digest(run_target->plan));
+        request->dvd_root = dvd_root_;
+        request->run_working_directory = !run_working_directory_.empty()
+            ? run_working_directory_
+            : dvd_root_.empty()
+                ? std::filesystem::path(model_.DocumentPath()).parent_path()
+                      .string()
+                : dvd_root_;
+        request->trace_file = trace_enabled_
+            ? (trace_path_.empty() ? DefaultTracePath() : trace_path_)
+            : std::string();
+        request->frame_limit = EffectiveRunFrameLimit();
+        request->allow_copy_fallback = allow_copy_fallback_;
+        request->run = run;
+        const auto add_runtime_directory = [&](const std::string &path) {
+            if (path.empty()) return;
+            const auto directory = std::filesystem::path(path).parent_path()
+                .string();
+            if (!directory.empty() && std::find(
+                    request->runtime_search_directories.begin(),
+                    request->runtime_search_directories.end(), directory) ==
+                    request->runtime_search_directories.end()) {
+                request->runtime_search_directories.push_back(directory);
+            }
+        };
+        add_runtime_directory(request->c_compiler);
+        add_runtime_directory(request->cpp_compiler);
+        return true;
+    }
+
+    void RequestRuntimePreflight() {
+        ApplyTargetDraft();
+        RefreshLibPorpoiseCapabilities();
+        if (target_draft_dirty_ || !RuntimeInputIssue().empty()) {
+            runtime_config_expanded_ = true;
+            select_setup_tab_ = true;
+            return;
+        }
+        if (model_.DocumentPath().empty()) {
+            if (!SaveProject(true)) return;
+        } else if ((model_.Dirty() || abi_drafts_dirty_) &&
+                   !SaveProject(false)) {
+            return;
+        }
+        BuildRunRequest request;
+        if (!BuildRequestForActiveTarget(false, &request)) return;
+        SaveMachineState();
+        runtime_config_expanded_ = true;
+        select_setup_tab_ = true;
+        last_operation_ = WorkerOperation::RuntimePreflight;
+        model_.StartRuntimePreflight(request);
     }
 
     bool OutputsExist(const RunRequest &request) const {
@@ -1025,12 +1630,14 @@ private:
             if (ImGui::Selectable(label.c_str(), active_target_ == index)) {
                 ApplyTargetDraft();
                 active_target_ = index;
+                cache_size_known_ = false;
                 SyncTargetDraft();
             }
         }
         if (ImGui::Button("Add target")) {
             if (model_.AddTarget("target")) {
                 active_target_ = model_.Project().target_count - 1;
+                cache_size_known_ = false;
                 SyncTargetDraft();
             }
         }
@@ -1039,6 +1646,8 @@ private:
         if (ImGui::Button("Remove")) {
             model_.RemoveTarget(active_target_);
             selected_rows_.clear();
+            cache_size_known_ = false;
+            built_target_id_.clear();
             SyncTargetDraft();
         }
         ImGui::EndDisabled();
@@ -1105,6 +1714,150 @@ private:
         return {};
     }
 
+    const PorpoiseRecoveryRunTarget *ActiveRunTarget() const {
+        const auto *result = model_.RunResult();
+        if (result == nullptr ||
+            active_target_ >= model_.Project().target_count) return nullptr;
+        const std::string id = Text(model_.Project().targets[active_target_].id);
+        for (std::size_t index = 0; index < result->target_count; ++index) {
+            const auto &candidate = result->targets[index];
+            if (candidate.target != nullptr &&
+                Text(candidate.target->id) == id) return &candidate;
+        }
+        return nullptr;
+    }
+
+    bool ActiveTargetAnalyzed() const {
+        const auto *target = ActiveRunTarget();
+        return target != nullptr && target->plan != nullptr;
+    }
+
+    bool ActiveTargetGenerated() const {
+        const auto *target = ActiveRunTarget();
+        return target != nullptr && target->plan != nullptr &&
+               target->generated && target->published;
+    }
+
+    std::string RuntimeInputIssue() const {
+        if (active_target_ >= model_.Project().target_count)
+            return "Create a target first.";
+        const auto &target = model_.Project().targets[active_target_];
+        if (!target.has_title_host)
+            return "Review and save a title-host profile for this target.";
+        if (libporpoise_directory_.empty())
+            return "Select the libPorpoise checkout.";
+        if (!IsLibPorpoiseCheckout(libporpoise_directory_))
+            return "The libPorpoise folder must contain meson.build.";
+        if (libporpoise_capability_path_ != libporpoise_directory_ ||
+            !libporpoise_capabilities_.canonical_fifo)
+            return "Select a libPorpoise checkout with canonical GX FIFO byte ingress API v1 or newer.";
+        if (ResolveExecutable(meson_path_).empty())
+            return "Select a Meson 1.2+ executable.";
+        if (ResolveExecutable(c_compiler_path_).empty())
+            return "Select the x64 C compiler.";
+        if (ResolveExecutable(cpp_compiler_path_).empty())
+            return "Select the matching x64 C++ compiler.";
+        if (target.title_host.initialize_dvd) {
+            std::error_code error;
+            if (dvd_root_.empty() ||
+                !std::filesystem::is_directory(dvd_root_, error) || error)
+                return "Select the extracted DVD root used by this target.";
+        }
+        if (!run_working_directory_.empty()) {
+            std::error_code error;
+            if (!std::filesystem::is_directory(
+                    run_working_directory_, error) || error)
+                return "Select an existing Run working directory or leave it blank.";
+        }
+        return {};
+    }
+
+    std::string RuntimeConfigurationIssue() const {
+        const auto input_issue = RuntimeInputIssue();
+        if (!input_issue.empty()) return input_issue;
+        BuildRunRequest request;
+        if (!BuildRequestForActiveTarget(false, &request))
+            return "Generate this target before validating its runtime.";
+        if (!model_.RuntimePreflightRequestMatches(request))
+            return "Validate Meson and the selected x64 C/C++ toolchain.";
+        if (model_.Operation() == WorkerOperation::RuntimePreflight &&
+            (model_.State() == WorkerState::Running ||
+             model_.State() == WorkerState::Cancelling))
+            return "Runtime validation is still running.";
+        if (model_.RuntimePreflightResult() == nullptr) {
+            const auto *diagnostic = model_.PrimaryDiagnostic();
+            if (diagnostic != nullptr && diagnostic->message != nullptr &&
+                diagnostic->message[0] != '\0') return diagnostic->message;
+            return model_.State() == WorkerState::Cancelled
+                ? "Runtime validation was cancelled."
+                : "Runtime validation failed; review the selected tools.";
+        }
+        return {};
+    }
+
+    bool ActiveTargetBuilt() const {
+        return model_.BuildResult() != nullptr &&
+               active_target_ < model_.Project().target_count &&
+               built_target_id_ == Text(model_.Project().targets[active_target_].id);
+    }
+
+    GuidedAction NextAction() const {
+        if (!SetupIssue().empty() || !ActiveTargetAnalyzed())
+            return GuidedAction::Analyze;
+        if (!ActiveTargetGenerated()) return GuidedAction::Generate;
+        if (!RuntimeConfigurationIssue().empty())
+            return GuidedAction::ConfigureRuntime;
+        if (!ActiveTargetBuilt()) return GuidedAction::Build;
+        return GuidedAction::Run;
+    }
+
+    std::filesystem::path ActiveBuildCacheRoot() const {
+        char target_cache_key[PORPOISE_RECOVERY_TARGET_CACHE_KEY_SIZE] = {};
+        if (model_.DocumentPath().empty() ||
+            active_target_ >= model_.Project().target_count) return {};
+        if (!porpoise_recovery_target_cache_key(
+                model_.Project().targets[active_target_].id,
+                target_cache_key)) return {};
+        return std::filesystem::path(model_.DocumentPath()).parent_path() /
+            ".porpoise-build" /
+            target_cache_key;
+    }
+
+    std::string DefaultTracePath() const {
+        const auto root = ActiveBuildCacheRoot();
+        return root.empty() ? std::string()
+                            : (root / "boot-trace.jsonl").string();
+    }
+
+    std::size_t EffectiveRunFrameLimit() const {
+        if (!trace_enabled_) return 0U;
+        return static_cast<std::size_t>(std::min<std::uint64_t>(
+            frame_limit_, std::numeric_limits<std::size_t>::max()));
+    }
+
+    void RuntimeSettingsChanged(bool invalidates_build = true) {
+        SaveMachineState();
+        if (invalidates_build) {
+            model_.ClearBuildResult();
+            model_.ClearRuntimePreflight();
+            built_target_id_.clear();
+        }
+    }
+
+    void RequestPrimaryAction() {
+        switch (NextAction()) {
+        case GuidedAction::Analyze: RequestRun(true); break;
+        case GuidedAction::Generate: RequestRun(false); break;
+        case GuidedAction::ConfigureRuntime:
+            runtime_config_expanded_ = true;
+            select_setup_tab_ = true;
+            if (RuntimeInputIssue().empty()) RequestRuntimePreflight();
+            break;
+        case GuidedAction::Build: RequestBuild(false); break;
+        case GuidedAction::Run: RequestBuild(true); break;
+        }
+    }
+
     void RenderRunStatusBanner() {
         if (model_.State() != WorkerState::Failed) return;
         const auto *primary = model_.PrimaryDiagnostic();
@@ -1112,9 +1865,16 @@ private:
                               ImVec4(.24f, .055f, .045f, 1.0f));
         ImGui::BeginChild("run-failure", ImVec2(0, 145), true,
                           ImGuiWindowFlags_NoScrollbar);
+        const char *operation =
+            last_operation_ == WorkerOperation::RuntimePreflight
+            ? "Runtime validation"
+            : last_operation_ == WorkerOperation::Build
+            ? "Build"
+            : last_operation_ == WorkerOperation::Run
+                ? "Run"
+                : last_run_analyze_only_ ? "Analysis" : "Generation";
         ImGui::TextColored(ImVec4(1.0f, .42f, .35f, 1.0f),
-                           "%s failed",
-                           last_run_analyze_only_ ? "Analysis" : "Generation");
+                           "%s failed", operation);
         ImGui::TextWrapped("%s", primary == nullptr
             ? "The operation failed without a diagnostic."
             : Text(primary->message).c_str());
@@ -1128,17 +1888,507 @@ private:
         if (ImGui::Button("Show diagnostics"))
             select_diagnostics_tab_ = true;
         ImGui::SameLine();
-        if (ImGui::Button("Retry")) RequestRun(last_run_analyze_only_);
+        if (last_operation_ == WorkerOperation::RuntimePreflight ||
+            last_operation_ == WorkerOperation::Build ||
+            last_operation_ == WorkerOperation::Run) {
+            if (ImGui::Button("Fix runtime settings")) {
+                runtime_config_expanded_ = true;
+                select_setup_tab_ = true;
+            }
+            ImGui::SameLine();
+        }
+        if (ImGui::Button("Retry")) {
+            if (last_operation_ == WorkerOperation::RuntimePreflight)
+                RequestRuntimePreflight();
+            else if (last_operation_ == WorkerOperation::Build)
+                RequestBuild(false);
+            else if (last_operation_ == WorkerOperation::Run)
+                RequestBuild(true);
+            else RequestRun(last_run_analyze_only_);
+        }
         ImGui::EndChild();
         ImGui::PopStyleColor();
+    }
+
+    void RenderTitleHostReview() {
+        if (active_target_ >= model_.Project().target_count ||
+            !ActiveTargetAnalyzed()) return;
+        const auto &target = model_.Project().targets[active_target_];
+        ImGui::SeparatorText("Title host");
+        if (!target.has_title_host) {
+            const std::string target_id = Text(target.id);
+            const auto *inferred =
+                model_.InferredTitleHostProfile(target_id);
+            if (inferred == nullptr) {
+                ImGui::TextColored(
+                    ImVec4(1.0f, .68f, .25f, 1.0f),
+                    "A reviewed title-host profile is required before Build.");
+                if (!model_.TitleHostInferenceIssue().empty()) {
+                    ImGui::TextWrapped("Automatic inference stopped: %s",
+                        model_.TitleHostInferenceIssue().c_str());
+                    ImGui::TextDisabled(
+                        "Add the missing map evidence, then Analyze again.");
+                } else {
+                    ImGui::TextWrapped(
+                        "Analyze with CodeWarrior map evidence to infer the "
+                        "entry, registers, arena, and startup locators.");
+                }
+                if (ImGui::Button("Try inference again")) {
+                    inferred_initialize_dvd_ = false;
+                    model_.InferTitleHostProfile(target_id);
+                }
+                return;
+            }
+
+            ImGui::TextColored(ImVec4(.5f, .78f, 1.0f, 1.0f),
+                               "Review inferred CodeWarrior bootstrap");
+            const auto *run_target = ActiveRunTarget();
+            const auto *entry = run_target == nullptr ||
+                                      run_target->plan == nullptr
+                ? nullptr : porpoise_plan_entry(run_target->plan);
+            ImGui::Text("Entry: %s (Lift)",
+                        entry == nullptr || entry->function == nullptr
+                            ? "resolved direct entry"
+                            : Text(entry->function->name).c_str());
+            ImGui::TextUnformatted(
+                "Stack/SDA registers and arena bounds are resolved.");
+            ImGui::Text("Startup functions: %zu  |  Initial words: %zu",
+                        inferred->startup_function_count,
+                        inferred->initial_word_count);
+            ImGui::Checkbox("Initialize DVD through libPorpoise",
+                            &inferred_initialize_dvd_);
+            ImGui::TextDisabled(
+                "Verify the values and DVD policy; inference never saves "
+                "or overwrites a profile by itself.");
+            if (ImGui::Button("Accept and save profile")) {
+                if (model_.AcceptInferredTitleHostProfile(
+                        target_id, inferred_initialize_dvd_)) {
+                    SaveProject(false);
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Discard suggestion"))
+                model_.DiscardInferredTitleHostProfile();
+            return;
+        }
+        const auto &profile = target.title_host;
+        const auto *run_target = ActiveRunTarget();
+        const auto *entry = run_target == nullptr || run_target->plan == nullptr
+            ? nullptr : porpoise_plan_entry(run_target->plan);
+        ImGui::Text("Reviewed entry: %s (Lift)",
+                    entry == nullptr || entry->function == nullptr
+                        ? "resolved direct entry"
+                        : Text(entry->function->name).c_str());
+        ImGui::TextUnformatted(
+            "Stack/SDA registers and arena bounds are configured.");
+        ImGui::Text("Startup functions: %zu  |  Initial words: %zu  |  DVD: %s",
+                    profile.startup_function_count,
+                    profile.initial_word_count,
+                    profile.initialize_dvd ? "native initialization" : "off");
+        ImGui::TextDisabled(
+            "Portable profile saved in the project; machine paths are below.");
+        if (ImGui::Button("Re-infer profile...")) {
+            pending_profile_reset_target_ = Text(target.id);
+            replacement_initialize_dvd_ = profile.initialize_dvd;
+            open_profile_reset_popup_ = true;
+        }
+    }
+
+    void RenderInlineSettingIssue(const std::string &message) {
+        if (message.empty()) return;
+        ImGui::TextColored(ImVec4(1.0f, .52f, .3f, 1.0f),
+                           "Fix: %s", message.c_str());
+    }
+
+    void RenderRuntimeConfiguration() {
+        const auto issue = RuntimeConfigurationIssue();
+        const auto input_issue = RuntimeInputIssue();
+        BuildRunRequest preflight_request;
+        const bool have_preflight_request =
+            BuildRequestForActiveTarget(false, &preflight_request);
+        const bool preflight_matches = have_preflight_request &&
+            model_.RuntimePreflightRequestMatches(preflight_request);
+        const auto *preflight = preflight_matches
+            ? model_.RuntimePreflightResult() : nullptr;
+        const bool should_open = runtime_config_expanded_ ||
+            NextAction() == GuidedAction::ConfigureRuntime;
+        if (should_open)
+            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+        runtime_config_expanded_ = false;
+        if (!ImGui::CollapsingHeader("Runtime configuration")) {
+            if (issue.empty())
+                ImGui::TextColored(ImVec4(.35f, .9f, .5f, 1.0f),
+                                   "Runtime configuration is ready.");
+            else ImGui::TextDisabled("Open to finish first-use setup.");
+            return;
+        }
+
+        ImGui::TextWrapped(
+            "These paths are stored only on this computer. Porpoise validates "
+            "Meson and the mixed C/C++ x64 toolchain before configuring the "
+            "title build.");
+        const bool busy = model_.State() == WorkerState::Running ||
+                          model_.State() == WorkerState::Cancelling;
+        ImGui::BeginDisabled(busy);
+        if (ImGui::Button("Auto-detect tools")) {
+            DiscoverRuntimeSettings();
+            RuntimeSettingsChanged();
+        }
+
+        bool changed = InputFolderPath(
+            "libPorpoise renderer checkout", libporpoise_directory_);
+        if (changed) {
+            RefreshLibPorpoiseCapabilities();
+            RuntimeSettingsChanged();
+        }
+        if (libporpoise_directory_.empty())
+            RenderInlineSettingIssue("select the libPorpoise source folder");
+        else if (!IsLibPorpoiseCheckout(libporpoise_directory_))
+            RenderInlineSettingIssue("this folder does not contain meson.build");
+        else {
+            if (!libporpoise_capabilities_.canonical_fifo) {
+                RenderInlineSettingIssue(
+                    "this checkout lacks canonical GX FIFO byte ingress v1+");
+            } else {
+                ImGui::TextColored(
+                    libporpoise_capabilities_.gpu_resident_xfb
+                        ? ImVec4(.35f, .9f, .5f, 1.0f)
+                        : ImVec4(1.0f, .76f, .32f, 1.0f),
+                    "Renderer: %s",
+                    libporpoise_capabilities_.gpu_resident_xfb
+                        ? "GPU-resident host-XFB capable"
+                        : libporpoise_capabilities_.host_xfb_observation
+                            ? "observable host-XFB (GPU residency not advertised)"
+                            : "host-XFB capability not advertised");
+                if (libporpoise_capabilities_.queued_canonical_fifo) {
+                    ImGui::TextColored(
+                        ImVec4(.35f, .9f, .5f, 1.0f),
+                        "GX FIFO: queued canonical bytes v%u",
+                        libporpoise_capabilities_.canonical_fifo_version);
+                } else {
+                    ImGui::TextColored(
+                        ImVec4(1.0f, .76f, .32f, 1.0f),
+                        "GX FIFO: synchronous canonical bytes v%u",
+                        libporpoise_capabilities_.canonical_fifo_version);
+                    ImGui::TextWrapped(
+                        "Compatible, but lifted code with frequent WGPIPE "
+                        "stores can run slowly. A checkout exposing queued "
+                        "canonical FIFO v2 is preferred.");
+                }
+                if (!libporpoise_capabilities_.host_xfb_observation) {
+                    ImGui::TextWrapped(
+                        "This checkout cannot report successful host-XFB "
+                        "presentations; a reached VIWaitForRetrace contract "
+                        "will fail closed.");
+                }
+            }
+            std::error_code carrier_error;
+            const auto carrier_header =
+                std::filesystem::path(libporpoise_directory_) / "include" /
+                "porpoise" / "host_thread_carrier.h";
+            if (!std::filesystem::is_regular_file(
+                    carrier_header, carrier_error) || carrier_error) {
+                ImGui::TextColored(
+                    ImVec4(1.0f, .76f, .32f, 1.0f),
+                    "single-thread compatibility only");
+                ImGui::TextDisabled(
+                    "Build/Run remain available; a reached carrier-dependent "
+                    "sleep, wake, suspend, resume, or exit faults precisely.");
+            }
+        }
+        ImGui::TextDisabled(
+            "This checkout/worktree path is remembered only for this project "
+            "on this computer.");
+
+        changed = InputOptionalPath("Meson executable", meson_path_, false,
+#if defined(_WIN32)
+                                    "*.exe"
+#else
+                                    "*"
+#endif
+        );
+        if (ResolveExecutable(meson_path_).empty())
+            RenderInlineSettingIssue("select Meson 1.2 or newer");
+        if (changed) RuntimeSettingsChanged();
+
+        changed = InputOptionalPath("C compiler", c_compiler_path_, false,
+#if defined(_WIN32)
+                                    "*.exe"
+#else
+                                    "*"
+#endif
+        );
+        if (ResolveExecutable(c_compiler_path_).empty())
+            RenderInlineSettingIssue("select the x64 C compiler");
+        if (changed) RuntimeSettingsChanged();
+
+        changed = InputOptionalPath("C++ compiler", cpp_compiler_path_, false,
+#if defined(_WIN32)
+                                    "*.exe"
+#else
+                                    "*"
+#endif
+        );
+        if (ResolveExecutable(cpp_compiler_path_).empty())
+            RenderInlineSettingIssue(
+                "select the matching compiler family, target, and version");
+        if (changed) RuntimeSettingsChanged();
+
+        ImGui::BeginDisabled(!input_issue.empty());
+        if (ImGui::Button(
+                preflight == nullptr ? "Validate runtime now"
+                                     : "Revalidate runtime")) {
+            RequestRuntimePreflight();
+        }
+        ImGui::EndDisabled();
+        if (model_.Operation() == WorkerOperation::RuntimePreflight &&
+            (model_.State() == WorkerState::Running ||
+             model_.State() == WorkerState::Cancelling)) {
+            const auto progress = model_.BuildProgress();
+            ImGui::TextColored(
+                ImVec4(.5f, .78f, 1.0f, 1.0f), "%s",
+                progress.detail.empty() ? "Validating runtime tools..."
+                                        : progress.detail.c_str());
+        } else if (preflight != nullptr) {
+            ImGui::TextColored(
+                ImVec4(.35f, .9f, .5f, 1.0f),
+                "Validated: Meson %s | %s %s | %s",
+                preflight->meson_version, preflight->compiler_family,
+                preflight->compiler_version, preflight->compiler_target);
+        } else if (preflight_matches && model_.PrimaryDiagnostic() != nullptr) {
+            ImGui::TextColored(
+                ImVec4(1.0f, .52f, .3f, 1.0f), "Runtime validation: %s",
+                Text(model_.PrimaryDiagnostic()->message).c_str());
+        } else if (input_issue.empty()) {
+            ImGui::TextColored(
+                ImVec4(1.0f, .68f, .25f, 1.0f),
+                "Validate these tools before Build becomes available.");
+        }
+
+        if (active_target_ < model_.Project().target_count &&
+            model_.Project().targets[active_target_].has_title_host &&
+            model_.Project().targets[active_target_]
+                .title_host.initialize_dvd) {
+            changed = InputFolderPath("DVD root", dvd_root_);
+            std::error_code error;
+            if (dvd_root_.empty() ||
+                !std::filesystem::is_directory(dvd_root_, error) || error)
+                RenderInlineSettingIssue("select the extracted game DVD root");
+            if (changed) RuntimeSettingsChanged(false);
+        }
+
+        changed = InputFolderPath(
+            "Run working directory (optional)", run_working_directory_);
+        if (!run_working_directory_.empty()) {
+            std::error_code error;
+            if (!std::filesystem::is_directory(
+                    run_working_directory_, error) || error)
+                RenderInlineSettingIssue(
+                    "select an existing folder or clear this field");
+        }
+        if (changed) RuntimeSettingsChanged(false);
+
+        const char *build_types[] = {"debugoptimized", "release", "debug"};
+        int build_type_index = build_type_ == "release" ? 1
+            : build_type_ == "debug" ? 2 : 0;
+        if (ImGui::Combo("Build type", &build_type_index, build_types, 3)) {
+            build_type_ = build_types[build_type_index];
+            RuntimeSettingsChanged();
+        }
+
+        bool trace_changed = ImGui::Checkbox(
+            "Write a boot trace on Run", &trace_enabled_);
+        if (trace_enabled_) {
+            trace_changed |= InputTextString(
+                "Trace file (blank = build cache)", trace_path_);
+            trace_changed |= ImGui::InputScalar(
+                "Boot trace frame limit (0 = unlimited)", ImGuiDataType_U64,
+                &frame_limit_);
+            if (frame_limit_ == 0U) {
+                ImGui::TextColored(
+                    ImVec4(1.0f, .68f, .25f, 1.0f),
+                    "Unlimited JSONL tracing can consume substantial disk "
+                    "space; disable tracing for normal play.");
+            }
+        }
+        if (trace_changed) RuntimeSettingsChanged(false);
+
+        bool copy_requested = allow_copy_fallback_;
+        if (ImGui::Checkbox(
+                "Allow confirmed dependency-copy fallback", &copy_requested)) {
+            if (copy_requested && !allow_copy_fallback_) {
+                open_copy_fallback_popup_ = true;
+            } else {
+                allow_copy_fallback_ = false;
+                RuntimeSettingsChanged();
+            }
+        }
+        ImGui::TextDisabled(
+            "Normally generated output and dependencies are linked into the "
+            "cache. Copying is used only after confirmation and a space check.");
+
+        if (!issue.empty())
+            ImGui::TextColored(ImVec4(1.0f, .68f, .25f, 1.0f),
+                               "Next fix: %s", issue.c_str());
+        else ImGui::TextColored(ImVec4(.35f, .9f, .5f, 1.0f),
+                                "Runtime preflight passed; Build is ready.");
+        ImGui::EndDisabled();
+    }
+
+    void RenderBuildCacheControls() {
+        if (model_.DocumentPath().empty() ||
+            active_target_ >= model_.Project().target_count) return;
+        ImGui::SeparatorText("Build cache");
+        const auto root = ActiveBuildCacheRoot();
+        ImGui::TextWrapped("%s", root.string().c_str());
+        ImGui::Text("Size: %s", cache_size_known_
+            ? HumanSize(cache_size_).c_str() : "not measured");
+        const bool busy = model_.State() == WorkerState::Running ||
+                          model_.State() == WorkerState::Cancelling;
+        ImGui::BeginDisabled(busy);
+        if (ImGui::Button("Measure size")) {
+            cache_size_ = DirectoryAllocatedSize(root);
+            cache_size_known_ = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reveal folder")) {
+            std::string url = "file:///" + root.lexically_normal()
+                .generic_string();
+            std::string escaped;
+            for (char character : url) {
+                if (character == ' ') escaped += "%20";
+                else escaped += character;
+            }
+            SDL_OpenURL(escaped.c_str());
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clean cache..."))
+            open_cache_cleanup_popup_ = true;
+        ImGui::EndDisabled();
+
+        if (const auto *build = model_.BuildResult(); build != nullptr) {
+            ImGui::Text("Last build: %s%s", build->cache_reused
+                ? "reused cache" : "compiled", build->executable_available
+                ? " | executable ready" : "");
+        }
+        if (!cache_cleanup_error_.empty())
+            ImGui::TextColored(ImVec4(1.0f, .52f, .3f, 1.0f),
+                               "Cleanup failed: %s",
+                               cache_cleanup_error_.c_str());
+    }
+
+    void RenderCopyFallbackPopup() {
+        if (open_copy_fallback_popup_) {
+            ImGui::OpenPopup("Allow dependency copies");
+            open_copy_fallback_popup_ = false;
+        }
+        if (!ImGui::BeginPopupModal(
+                "Allow dependency copies", nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize)) return;
+        ImGui::TextWrapped(
+            "If junctions or symlinks are unavailable, Porpoise may copy the "
+            "generated project and libPorpoise into the build cache after "
+            "checking free space. This can use substantial disk space.");
+        if (ImGui::Button("Allow for this computer")) {
+            allow_copy_fallback_ = true;
+            RuntimeSettingsChanged();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Keep links only")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    void RenderCacheCleanupPopup() {
+        if (open_cache_cleanup_popup_) {
+            ImGui::OpenPopup("Clean target build cache");
+            open_cache_cleanup_popup_ = false;
+        }
+        if (!ImGui::BeginPopupModal(
+                "Clean target build cache", nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize)) return;
+        const auto root = ActiveBuildCacheRoot();
+        ImGui::TextWrapped(
+            "Remove this target's generated build cache?\n%s\n\nThe recovery "
+            "project, source input, generated output, and libPorpoise checkout "
+            "are not removed.", root.string().c_str());
+        if (ImGui::Button("Remove cache")) {
+            if (RemoveTargetBuildCache(
+                    model_.DocumentPath(),
+                    Text(model_.Project().targets[active_target_].id),
+                    &cache_cleanup_error_)) {
+                model_.ClearBuildResult();
+                built_target_id_.clear();
+                cache_size_ = 0;
+                cache_size_known_ = true;
+            }
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    void RenderProfileResetPopup() {
+        if (open_profile_reset_popup_) {
+            model_.InferTitleHostProfile(pending_profile_reset_target_);
+            ImGui::OpenPopup("Review replacement title host");
+            open_profile_reset_popup_ = false;
+        }
+        if (!ImGui::BeginPopupModal(
+                "Review replacement title host", nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize)) return;
+        const auto *inferred = model_.InferredTitleHostProfile(
+            pending_profile_reset_target_);
+        if (inferred == nullptr) {
+            ImGui::TextWrapped(
+                "The saved profile was left unchanged. Inference could not "
+                "produce a replacement: %s",
+                model_.TitleHostInferenceIssue().empty()
+                    ? "the required map evidence is unavailable"
+                    : model_.TitleHostInferenceIssue().c_str());
+            if (ImGui::Button("Keep saved profile")) {
+                pending_profile_reset_target_.clear();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+            return;
+        }
+
+        ImGui::TextWrapped(
+            "Compare this newly inferred profile with the saved profile. "
+            "Nothing is replaced until you explicitly accept and save it.");
+        ImGui::TextUnformatted(
+            "Direct entry, stack/SDA registers, and arena bounds resolved.");
+        ImGui::Text("Startup functions: %zu  |  Initial words: %zu",
+                    inferred->startup_function_count,
+                    inferred->initial_word_count);
+        ImGui::Checkbox("Initialize DVD through libPorpoise",
+                        &replacement_initialize_dvd_);
+        if (ImGui::Button("Replace and save profile")) {
+            if (model_.AcceptInferredTitleHostProfile(
+                    pending_profile_reset_target_,
+                    replacement_initialize_dvd_)) {
+                SaveProject(false);
+                pending_profile_reset_target_.clear();
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Keep saved profile")) {
+            model_.DiscardInferredTitleHostProfile();
+            pending_profile_reset_target_.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
 
     void RenderSetup() {
         const bool busy = model_.State() == WorkerState::Running ||
                           model_.State() == WorkerState::Cancelling;
         ImGui::TextWrapped(
-            "Choose the source and output here, then Analyze. Porpoise saves "
-            "the project before every run and never rewrites the source.");
+            "Follow the single highlighted action below. Porpoise saves the "
+            "project before each step and never rewrites the source.");
         if (active_target_ >= model_.Project().target_count) {
             if (ImGui::Button("Create recovery target")) {
                 if (model_.AddTarget("target")) {
@@ -1169,6 +2419,14 @@ private:
             target.source_kind != PORPOISE_RECOVERY_SOURCE_MANAGED_ELF,
             target.source_kind == PORPOISE_RECOVERY_SOURCE_MANAGED_ELF
                 ? "*.elf" : "*.s;*.asm");
+        {
+            std::error_code error;
+            if (target_draft_.input.empty())
+                RenderInlineSettingIssue("choose the source input");
+            else if (!std::filesystem::exists(
+                         ResolveSetupPath(target_draft_.input), error) || error)
+                RenderInlineSettingIssue("the selected source does not exist");
+        }
 
         if (target.source_kind == PORPOISE_RECOVERY_SOURCE_MANAGED_ELF) {
             ImGui::SeparatorText("2. Choose DTK");
@@ -1179,6 +2437,12 @@ private:
                                   "*"
 #endif
             )) SaveMachineState();
+            std::error_code error;
+            if (dtk_path_.empty())
+                RenderInlineSettingIssue("choose the DTK executable");
+            else if (!std::filesystem::is_regular_file(dtk_path_, error) ||
+                     error)
+                RenderInlineSettingIssue("the selected DTK does not exist");
             ImGui::TextDisabled(
                 "This computer-specific tool path is remembered immediately.");
         }
@@ -1188,6 +2452,8 @@ private:
                 ? "3. Choose the output" : "2. Choose the output");
         target_draft_dirty_ |=
             InputFolderPath("Generated project folder", target_draft_.output);
+        if (target_draft_.output.empty() || target_draft_.output == ".")
+            RenderInlineSettingIssue("choose a dedicated output folder");
         ImGui::TextDisabled(
             "Use a new folder separate from the source and project file.");
 
@@ -1212,22 +2478,41 @@ private:
                                "Before Analyze: %s", issue.c_str());
         }
 
-        ImGui::BeginDisabled(busy || !issue.empty());
-        if (ImGui::Button("Analyze", ImVec2(150, 36))) RequestRun(true);
+        if (ActiveTargetAnalyzed()) {
+            ImGui::TextColored(ImVec4(.35f, .9f, .5f, 1.0f),
+                               "Analysis ready: %zu functions.",
+                               BuildRows().size());
+        }
+        RenderTitleHostReview();
+        RenderRuntimeConfiguration();
+        RenderBuildCacheControls();
+
+        const auto action = NextAction();
+        const bool primary_enabled = !busy &&
+            (action == GuidedAction::ConfigureRuntime || issue.empty());
+        ImGui::Spacing();
+        ImGui::SeparatorText("Next step");
+        ImGui::BeginDisabled(!primary_enabled);
+        if (ImGui::Button(GuidedActionName(action), ImVec2(210, 42)))
+            RequestPrimaryAction();
         ImGui::EndDisabled();
         ImGui::SameLine();
-        const bool ready_to_generate = !busy && issue.empty() &&
-            model_.State() == WorkerState::Succeeded &&
-            model_.RunResult() != nullptr;
-        ImGui::BeginDisabled(!ready_to_generate);
-        if (ImGui::Button("Generate", ImVec2(150, 36))) RequestRun(false);
-        ImGui::EndDisabled();
-
-        if (model_.State() == WorkerState::Succeeded &&
-            model_.RunResult() != nullptr) {
-            ImGui::TextColored(ImVec4(.35f, .9f, .5f, 1.0f),
-                               "Ready: %zu functions analyzed.",
-                               BuildRows().size());
+        switch (action) {
+        case GuidedAction::Analyze:
+            ImGui::TextDisabled("inspect input and build a reviewable plan");
+            break;
+        case GuidedAction::Generate:
+            ImGui::TextDisabled("publish the reviewed generated project");
+            break;
+        case GuidedAction::ConfigureRuntime:
+            ImGui::TextDisabled("finish the highlighted machine settings");
+            break;
+        case GuidedAction::Build:
+            ImGui::TextDisabled("preflight, configure, compile, and stage DLLs");
+            break;
+        case GuidedAction::Run:
+            ImGui::TextDisabled("launch the staged title host");
+            break;
         }
     }
 
@@ -1269,6 +2554,10 @@ private:
                     }
                     if (ImGui::BeginTabItem("ABI Contracts")) {
                         RenderAbiEditor();
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Title Host")) {
+                        RenderTitleHostAdvanced();
                         ImGui::EndTabItem();
                     }
                     if (ImGui::BeginTabItem("Report")) {
@@ -2275,9 +3564,82 @@ private:
         return changed;
     }
 
+    void RenderTitleHostAdvanced() {
+        if (active_target_ >= model_.Project().target_count) {
+            ImGui::TextDisabled("Select a target first.");
+            return;
+        }
+        const auto &target = model_.Project().targets[active_target_];
+        const auto *profile = target.has_title_host
+            ? &target.title_host
+            : model_.InferredTitleHostProfile(Text(target.id));
+        if (profile == nullptr) {
+            ImGui::TextDisabled(
+                "No reviewed or inferred title-host profile is available.");
+            return;
+        }
+        ImGui::TextUnformatted(target.has_title_host
+            ? "Reviewed portable profile" : "Unsaved inferred suggestion");
+        ImGui::Text("Entry: %s", Hex(profile->entry_address).c_str());
+        ImGui::Text("r1: %s   r2: %s   r13: %s",
+                    Hex(profile->gpr[1]).c_str(),
+                    Hex(profile->gpr[2]).c_str(),
+                    Hex(profile->gpr[13]).c_str());
+        ImGui::Text("Arena: %s..%s",
+                    Hex(profile->arena_lo).c_str(),
+                    Hex(profile->arena_hi).c_str());
+        ImGui::Text("Native DVD initialization: %s",
+                    profile->initialize_dvd ? "enabled" : "disabled");
+
+        ImGui::SeparatorText("Startup locators");
+        for (std::size_t index = 0;
+             index < profile->startup_function_count; ++index) {
+            const auto &function = profile->startup_functions[index];
+            ImGui::PushID(static_cast<int>(index));
+            ImGui::Text("%zu. %s +%u bytes%s", index + 1,
+                        Hex(function.address).c_str(), function.size,
+                        (function.flags &
+                         PORPOISE_RECOVERY_TITLE_STARTUP_ESTABLISH_GUEST_MAIN_THREAD_AFTER)
+                            != 0
+                            ? " | establish guest main thread" : "");
+            ImGui::TextWrapped("Module: %s | Fingerprint: %s",
+                               Text(function.module).c_str(),
+                               Text(function.normalized_fingerprint).c_str());
+            ImGui::PopID();
+        }
+
+        ImGui::SeparatorText("Initial memory words");
+        for (std::size_t index = 0; index < profile->initial_word_count;
+             ++index) {
+            const auto &word = profile->initial_words[index];
+            ImGui::Text("%s = %s", Hex(word.address).c_str(),
+                        Hex(word.value).c_str());
+        }
+        ImGui::TextDisabled(
+            "Return to Setup to accept, replace, or configure DVD policy.");
+    }
+
     void RenderDiagnostics() {
         ImGui::Text("Worker: %s · exit code %d",
                     WorkerStateName(model_.State()), model_.LastExitCode());
+        ImGui::Text("Operation: %s",
+                    WorkerOperationName(model_.Operation()));
+        if (const auto *preflight = model_.RuntimePreflightResult();
+            preflight != nullptr) {
+            ImGui::Text("Runtime validated: Meson %s | %s %s (%s)",
+                        preflight->meson_version,
+                        preflight->compiler_family,
+                        preflight->compiler_version,
+                        preflight->compiler_target);
+        }
+        if (const auto *build = model_.BuildResult(); build != nullptr) {
+            ImGui::TextWrapped("Build cache: %s", build->cache_directory);
+            ImGui::TextWrapped("Executable: %s", build->executable_path);
+            ImGui::Text("Compiler: %s %s (%s)",
+                        build->preflight.compiler_family,
+                        build->preflight.compiler_version,
+                        build->preflight.compiler_target);
+        }
         ImGui::SeparatorText("Diagnostics");
         ImGui::BeginChild("diagnostics", ImVec2(0, 260), true);
         const bool busy = model_.State() == WorkerState::Running ||
@@ -2346,6 +3708,16 @@ private:
     std::string recovery_document_;
     std::string dtk_path_;
     std::string runtime_directory_ = porpoise_default_runtime_directory();
+    std::string libporpoise_directory_;
+    std::string libporpoise_capability_path_;
+    LibPorpoiseCapabilities libporpoise_capabilities_;
+    std::string meson_path_;
+    std::string c_compiler_path_;
+    std::string cpp_compiler_path_;
+    std::string dvd_root_;
+    std::string run_working_directory_;
+    std::string build_type_ = "debugoptimized";
+    std::string trace_path_;
     std::string report_path_;
     std::string report_contents_;
     std::string filter_;
@@ -2356,6 +3728,21 @@ private:
     bool select_functions_tab_ = false;
     bool select_diagnostics_tab_ = false;
     bool last_run_analyze_only_ = true;
+    bool trace_enabled_ = true;
+    bool inferred_initialize_dvd_ = false;
+    bool allow_copy_fallback_ = false;
+    bool runtime_config_expanded_ = false;
+    bool open_copy_fallback_popup_ = false;
+    bool open_cache_cleanup_popup_ = false;
+    bool open_profile_reset_popup_ = false;
+    bool replacement_initialize_dvd_ = false;
+    bool cache_size_known_ = false;
+    std::uint64_t frame_limit_ = 3;
+    std::uintmax_t cache_size_ = 0;
+    WorkerOperation last_operation_ = WorkerOperation::None;
+    std::string built_target_id_;
+    std::string pending_profile_reset_target_;
+    std::string cache_cleanup_error_;
     std::size_t active_target_ = 0;
     TargetDraft target_draft_;
     bool target_draft_dirty_ = false;

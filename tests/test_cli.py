@@ -191,6 +191,8 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     assert "'-DLIBPORPOISE_BUILD_LINUX'" in no_entry_meson
     assert "'-D_POSIX_C_SOURCE=200112L'" in no_entry_meson
     assert no_entry_meson.count("c_args: porpoise_consumer_c_args") == 1
+    assert "cpp_args: porpoise_consumer_c_args" not in no_entry_meson
+    assert "'src/porpoise_libporpoise_presentation.cpp'" not in no_entry_meson
     registry_source = (
         no_entry / "src" / "porpoise_function_registry.c"
     ).read_text(encoding="utf-8")
@@ -246,7 +248,12 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "porpoise_resolve_address_8000(address);"
     ) in registry_source
     assert "porpoise_lifted_add_one" not in registry_source
-    assert "state->lifted_call_depth == UINT32_MAX" in registry_source
+    assert (
+        "state->lifted_call_depth >= PORPOISE_LIFTED_CALL_STACK_CAPACITY"
+        in registry_source
+    )
+    assert "state->lifted_return_stack[state->lifted_call_depth]" in registry_source
+    assert "porpoise_branch_address" in registry_source
     assert "state->lifted_call_depth++" in registry_source
     assert "state->lifted_call_depth--" in registry_source
     assert "porpoise_poll_host_events(state, address)" in registry_source
@@ -260,7 +267,7 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     assert (
         "case UINT32_C(0x80001000): return "
         "(struct porpoise_dispatch_target){porpoise_lifted_add_one, "
-        "PORPOISE_DISPATCH_LIFTED};"
+        'PORPOISE_DISPATCH_LIFTED, "add_one"};'
     ) in registry_shard_source
     public_consumer = no_entry / "tests" / "public_consumer.c"
     public_consumer.parent.mkdir(parents=True)
@@ -412,18 +419,14 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "subic", "subic.", "subis", "sync",
     }
     assert opcode_report["summary"]["unsupported"] == 0
-    conditional_return_detail = (
-        "taken LR branch returns through the C call stack instead of dispatching "
-        "the arbitrary guest LR target"
-    )
     for mnemonic in {"beqlr", "bnelr", "bgelr", "blelr", "bgtlr", "bltlr"}:
         entries = [
             instruction
             for instruction in opcode_report["instructions"]
             if instruction["mnemonic"] == mnemonic
         ]
-        assert entries and all(instruction["status"] == "approximate" for instruction in entries)
-        assert all(instruction["detail"] == conditional_return_detail for instruction in entries)
+        assert entries and all(instruction["status"] == "lowered" for instruction in entries)
+        assert all(instruction["detail"] == "" for instruction in entries)
         assert all(instruction["semantic_test"] for instruction in entries)
     for mnemonic in {
         "bdz", "beq+", "bla", "ble+", "blrl", "bne+", "divw", "divw.", "divwu", "divwu.",
@@ -504,25 +507,21 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         assert entries and all(instruction["status"] == "approximate" for instruction in entries)
         assert all(instruction["detail"] == paired_arithmetic_detail for instruction in entries)
         assert all(instruction["semantic_test"] for instruction in entries)
-    paired_multiply_detail = (
-        "host arithmetic does not reproduce PPC paired-single Force25, rounding, "
-        "exception, and FPSCR semantics"
-    )
-    for mnemonic in {"ps_muls0", "ps_muls1"}:
+    for mnemonic in {"ps_muls0", "ps_muls1", "ps_madds0", "ps_madds1"}:
         entries = [
             instruction
             for instruction in opcode_report["instructions"]
             if instruction["mnemonic"] == mnemonic
         ]
-        assert entries and all(instruction["status"] == "approximate" for instruction in entries)
-        assert all(instruction["detail"] == paired_multiply_detail for instruction in entries)
+        assert entries and all(instruction["status"] == "lowered" for instruction in entries)
+        assert all(instruction["detail"] == "" for instruction in entries)
         assert all(instruction["semantic_test"] for instruction in entries)
     paired_fused_detail = (
         "host arithmetic does not reproduce PPC paired-single Force25, fused rounding, "
         "exception, and FPSCR semantics"
     )
     for mnemonic in {
-        "ps_madd", "ps_madds0", "ps_madds1", "ps_msub", "ps_nmadd", "ps_nmsub",
+        "ps_madd", "ps_msub", "ps_nmadd", "ps_nmsub",
     }:
         entries = [
             instruction
@@ -553,6 +552,40 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     ).read_text(encoding="utf-8")
     assert extended_lifted_source.count("porpoise_psq_load(") == 9
     assert extended_lifted_source.count("porpoise_psq_store(") == 8
+    assert extended_lifted_source.count(
+        "porpoise_psq_transfer_is_exact("
+    ) == 17
+    assert (
+        "porpoise_trace_approximate(state, UINT32_C(0x80006D00), \"psq_l\"); "
+        "if (porpoise_state_has_fault(state)) return;"
+    ) in extended_lifted_source
+    assert (
+        "if (!porpoise_fp_binary_single_try_exact(state, 3U, 1U, 2U, "
+        "PORPOISE_FP_BINARY_ADD, 0)) {\n"
+        "        porpoise_trace_approximate(state, UINT32_C(0x80006980), \"fadds\");\n"
+        "        if (porpoise_state_has_fault(state)) return;"
+    ) in extended_lifted_source
+    assert extended_lifted_source.count("porpoise_ps_madds_scalar(") == 2
+    assert extended_lifted_source.count("porpoise_ps_muls_scalar(") == 2
+    for address, mnemonic in {
+        "0x80006A10": "ps_madds0",
+        "0x80006A14": "ps_madds1",
+        "0x80006A18": "ps_muls0",
+        "0x80006A1C": "ps_muls1",
+    }.items():
+        assert (
+            f'porpoise_trace_approximate(state, UINT32_C({address}), "{mnemonic}")'
+            not in extended_lifted_source
+        )
+    assert extended_lifted_source.count("porpoise_store_gx_fifo_u8(") == 1
+    assert (
+        "if (ea == UINT32_C(0xCC008000)) "
+        "porpoise_store_gx_fifo_u8(state, (uint8_t)state->gpr[3]); else "
+        "porpoise_store_u8(state, ea, (uint8_t)state->gpr[3]);"
+    ) in extended_lifted_source
+    assert (
+        "porpoise_store_u8(state, ea, (uint8_t)state->gpr[4]);"
+    ) in extended_lifted_source
     harness = opcodes / "tests" / "semantic_harness.c"
     harness.parent.mkdir(parents=True)
     harness.write_text(
@@ -569,7 +602,7 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "  PorpoiseHostAdapter host; PorpoisePpcState state; unsigned int raw_index;\n"
         "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
         "  CHECK(porpoise_generated_bind(&host) == PORPOISE_HOST_OK);\n"
-        "  porpoise_state_init(&state, &host);\n"
+        "  porpoise_state_init(&state, &host); state.msr |= PORPOISE_MSR_FP; state.hid2 |= PORPOISE_HID2_PSE;\n"
         "  porpoise_lifted_integer_semantics(&state);\n"
         "  CHECK(!porpoise_state_has_fault(&state));\n"
         "  CHECK(state.gpr[3] == 7U && state.gpr[5] == 3U);\n"
@@ -603,7 +636,7 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "  CHECK(porpoise_fpr_get_f64(&state, 12U, 0U) == 15.0 && porpoise_fpr_get_f64(&state, 12U, 1U) == 7.0);\n"
         "  CHECK(porpoise_fpr_get_f64(&state, 13U, 0U) == 5.0 && porpoise_fpr_get_f64(&state, 13U, 1U) == 15.0);\n"
         "  CHECK(porpoise_fpr_get_f64(&state, 14U, 0U) == 7.0 && porpoise_fpr_get_f64(&state, 14U, 1U) == 8.0);\n"
-        "  porpoise_fpr_set_bits(&state, 1U, 0U, UINT64_C(0x7FF800000000CAFE));\n"
+        "  porpoise_fpr_set_bits(&state, 1U, 0U, UINT64_C(0x7FF8000020000000));\n"
         "  porpoise_fpr_set_f64(&state, 1U, 1U, 2.0); porpoise_fpr_set_f64(&state, 2U, 0U, 1.0); porpoise_fpr_set_f64(&state, 2U, 1U, 1.0);\n"
         "  porpoise_fpr_set_f64(&state, 3U, 0U, 0.0); porpoise_fpr_set_f64(&state, 3U, 1U, 0.0);\n"
         "  porpoise_lifted_paired_advanced_arithmetic_semantics(&state);\n"
@@ -1367,20 +1400,37 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     imports_source = (imported / "src" / "porpoise_imports.c").read_text(encoding="utf-8")
     assert "porpoise_decode_pointer" in imports_source
     assert "PorpoiseStubReportAdapter(state)" in imports_source
+    imported_lifted_source = (
+        imported / "src" / "lifted" / "calls.c"
+    ).read_text(encoding="utf-8")
+    assert (
+        'porpoise_trace_call_enter(state, UINT32_C(0x80004000), '
+        '"imported", "PorpoiseStubAdd");'
+        in imported_lifted_source
+    )
+    assert (
+        'porpoise_trace_call_exit(state, UINT32_C(0x80004000), '
+        '"imported", "PorpoiseStubAdd");'
+        in imported_lifted_source
+    )
     abi_harness = imported / "tests" / "abi_harness.c"
     abi_harness.parent.mkdir(parents=True)
     abi_harness.write_text(
+        "#include <stdio.h>\n"
         "#include <stdlib.h>\n"
+        "#include <string.h>\n"
         "#include \"porpoise_generated.h\"\n"
         "#include \"porpoise_libporpoise_adapter.h\"\n"
         "#include \"generated/calls.h\"\n"
         "#include <porpoise/stub.h>\n"
         "#define CHECK(condition) do { if (!(condition)) abort(); } while (0)\n"
         "int main(void) {\n"
-        "  PorpoiseHostAdapter host; PorpoisePpcState state;\n"
+        "  PorpoiseHostAdapter host; PorpoisePpcState state; FILE *trace;\n"
+        "  char trace_contents[8192]; size_t trace_size;\n"
         "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
         "  CHECK(porpoise_generated_bind(&host) == PORPOISE_HOST_OK);\n"
         "  porpoise_state_init(&state, &host);\n"
+        "  trace = tmpfile(); CHECK(trace != NULL); state.trace_file = trace;\n"
         "  state.gpr[3] = 1U; state.gpr[4] = 2U;\n"
         "  porpoise_fpr_set_f64(&state, 1U, 0U, 1.5); porpoise_fpr_set_f64(&state, 2U, 0U, 2.25);\n"
         "  porpoise_lifted_call_imports(&state);\n"
@@ -1388,6 +1438,15 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "  CHECK(state.gpr[3] == 0x80000003U);\n"
         "  CHECK(porpoise_fpr_get_f64(&state, 1U, 0U) == 3.75);\n"
         "  CHECK(PorpoiseStubReportCount() == 1U);\n"
+        "  CHECK(state.trace_call_depth == 0U); CHECK(fflush(trace) == 0);\n"
+        "  CHECK(fseek(trace, 0L, SEEK_SET) == 0);\n"
+        "  trace_size = fread(trace_contents, 1U, sizeof(trace_contents) - 1U, trace);\n"
+        "  trace_contents[trace_size] = '\\0';\n"
+        "  CHECK(strstr(trace_contents, \"\\\"event\\\":\\\"call\\\",\\\"pc\\\":\\\"0x80004000\\\",\\\"function\\\":\\\"PorpoiseStubAdd\\\"\") != NULL);\n"
+        "  CHECK(strstr(trace_contents, \"\\\"phase\\\":\\\"enter\\\",\\\"address\\\":\\\"0x80004000\\\",\\\"kind\\\":\\\"imported\\\"\") != NULL);\n"
+        "  CHECK(strstr(trace_contents, \"\\\"phase\\\":\\\"exit\\\",\\\"address\\\":\\\"0x80004000\\\",\\\"kind\\\":\\\"imported\\\"\") != NULL);\n"
+        "  CHECK(strstr(trace_contents, \"\\\"stack\\\":[\\\"0x80004000\\\"]\") != NULL);\n"
+        "  porpoise_trace_close(&state);\n"
         "  porpoise_libporpoise_adapter_shutdown(&host);\n"
         "  return 0;\n"
         "}\n",
@@ -1414,25 +1473,31 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         "/* 80007004 00000004  4E 80 00 20 */ blr\n"
         ".endfn HostAdd\n\n"
         ".global call_host_by_name\n.fn call_host_by_name, global\n"
-        "/* 80007100 00000100  38 60 00 04 */ li r3, 4\n"
-        "/* 80007104 00000104  38 80 00 05 */ li r4, 5\n"
-        "/* 80007108 00000108  4B FF FE F9 */ bl HostAdd\n"
-        "/* 8000710C 0000010C  4E 80 00 20 */ blr\n"
+        "/* 80007100 00000100  7C 08 02 A6 */ mflr r0\n"
+        "/* 80007104 00000104  38 60 00 04 */ li r3, 4\n"
+        "/* 80007108 00000108  38 80 00 05 */ li r4, 5\n"
+        "/* 8000710C 0000010C  4B FF FE F5 */ bl HostAdd\n"
+        "/* 80007110 00000110  7C 08 03 A6 */ mtlr r0\n"
+        "/* 80007114 00000114  4E 80 00 20 */ blr\n"
         ".endfn call_host_by_name\n\n"
         ".global call_host_by_numeric\n.fn call_host_by_numeric, global\n"
-        "/* 80007200 00000200  38 60 00 06 */ li r3, 6\n"
-        "/* 80007204 00000204  38 80 00 07 */ li r4, 7\n"
-        "/* 80007208 00000208  4B FF FD F9 */ bl 0x80007000\n"
-        "/* 8000720C 0000020C  4E 80 00 20 */ blr\n"
+        "/* 80007200 00000200  7C 08 02 A6 */ mflr r0\n"
+        "/* 80007204 00000204  38 60 00 06 */ li r3, 6\n"
+        "/* 80007208 00000208  38 80 00 07 */ li r4, 7\n"
+        "/* 8000720C 0000020C  4B FF FD F5 */ bl 0x80007000\n"
+        "/* 80007210 00000210  7C 08 03 A6 */ mtlr r0\n"
+        "/* 80007214 00000214  4E 80 00 20 */ blr\n"
         ".endfn call_host_by_numeric\n\n"
         ".global call_host_by_ctr\n.fn call_host_by_ctr, global\n"
-        "/* 80007300 00000300  38 60 00 08 */ li r3, 8\n"
-        "/* 80007304 00000304  38 80 00 09 */ li r4, 9\n"
-        "/* 80007308 00000308  3D 80 80 00 */ lis r12, -32768\n"
-        "/* 8000730C 0000030C  61 8C 70 00 */ ori r12, r12, 0x7000\n"
-        "/* 80007310 00000310  7D 89 03 A6 */ mtctr r12\n"
-        "/* 80007314 00000314  4E 80 04 21 */ bctrl\n"
-        "/* 80007318 00000318  4E 80 00 20 */ blr\n"
+        "/* 80007300 00000300  7C 08 02 A6 */ mflr r0\n"
+        "/* 80007304 00000304  38 60 00 08 */ li r3, 8\n"
+        "/* 80007308 00000308  38 80 00 09 */ li r4, 9\n"
+        "/* 8000730C 0000030C  3D 80 80 00 */ lis r12, -32768\n"
+        "/* 80007310 00000310  61 8C 70 00 */ ori r12, r12, 0x7000\n"
+        "/* 80007314 00000314  7D 89 03 A6 */ mtctr r12\n"
+        "/* 80007318 00000318  4E 80 04 21 */ bctrl\n"
+        "/* 8000731C 0000031C  7C 08 03 A6 */ mtlr r0\n"
+        "/* 80007320 00000320  4E 80 00 20 */ blr\n"
         ".endfn call_host_by_ctr\n",
         encoding="utf-8",
     )
@@ -1477,7 +1542,7 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     assert (
         "case UINT32_C(0x80007000): return "
         "(struct porpoise_dispatch_target){porpoise_import_HostAdd, "
-        "PORPOISE_DISPATCH_IMPORT};"
+        'PORPOISE_DISPATCH_IMPORT, "HostAdd"};'
         in skipped_registry
     )
     assert "porpoise_lifted_HostAdd" not in skipped_registry
@@ -1700,6 +1765,11 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
             [gpr("pointer", 3)],
         ),
         (
+            "porpoise_libporpoise_demo_pad_init_adapter",
+            {"type": "void"},
+            [],
+        ),
+        (
             "porpoise_libporpoise_gx_init_adapter",
             gpr("pointer", 3),
             [gpr("pointer", 3), gpr("u32", 4)],
@@ -1883,6 +1953,11 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
             [gpr("pointer", 3)],
         ),
         (
+            "porpoise_libporpoise_dvd_init_adapter",
+            {"type": "void"},
+            [],
+        ),
+        (
             "porpoise_libporpoise_dvd_open_adapter",
             gpr("s32", 3),
             [gpr("pointer", 3), gpr("pointer", 4)],
@@ -1932,6 +2007,11 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
             "porpoise_libporpoise_os_init_message_queue_adapter",
             {"type": "void"},
             [gpr("pointer", 3), gpr("pointer", 4), gpr("s32", 5)],
+        ),
+        (
+            "porpoise_libporpoise_os_init_adapter",
+            {"type": "void"},
+            [],
         ),
         (
             "porpoise_libporpoise_os_receive_message_adapter",
@@ -1984,9 +2064,19 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
             [gpr("pointer", 3)],
         ),
         (
+            "porpoise_libporpoise_vi_init_adapter",
+            {"type": "void"},
+            [],
+        ),
+        (
             "porpoise_libporpoise_vi_set_next_frame_buffer_adapter",
             {"type": "void"},
             [gpr("pointer", 3)],
+        ),
+        (
+            "porpoise_libporpoise_vi_wait_for_retrace_adapter",
+            {"type": "void"},
+            [],
         ),
     )
     builtin_contracts_by_adapter = {
@@ -2002,6 +2092,10 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         ("ARQPostRequest", "porpoise_libporpoise_arq_post_request_adapter"),
         ("CARDProbeEx", "porpoise_libporpoise_card_probe_ex_adapter"),
         ("DSPAddTask", "porpoise_libporpoise_dsp_add_task_adapter"),
+        (
+            "DEMOPadInit",
+            "porpoise_libporpoise_demo_pad_init_adapter",
+        ),
         ("GXInit", "porpoise_libporpoise_gx_init_adapter"),
         (
             "GXSetDrawDoneCallback",
@@ -2107,6 +2201,7 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
             "DVDGetCommandBlockStatus",
             "porpoise_libporpoise_dvd_get_command_block_status_adapter",
         ),
+        ("DVDInit", "porpoise_libporpoise_dvd_init_adapter"),
         ("DVDOpen", "porpoise_libporpoise_dvd_open_adapter"),
         ("DVDReadPrio", "porpoise_libporpoise_dvd_read_prio_adapter"),
         (
@@ -2128,6 +2223,7 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
             "OSInitMessageQueue",
             "porpoise_libporpoise_os_init_message_queue_adapter",
         ),
+        ("OSInit", "porpoise_libporpoise_os_init_adapter"),
         (
             "OSReceiveMessage",
             "porpoise_libporpoise_os_receive_message_adapter",
@@ -2144,9 +2240,14 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
         ),
         ("OSWakeupThread", "porpoise_libporpoise_os_wakeup_thread_adapter"),
         ("VIConfigure", "porpoise_libporpoise_vi_configure_adapter"),
+        ("VIInit", "porpoise_libporpoise_vi_init_adapter"),
         (
             "VISetNextFrameBuffer",
             "porpoise_libporpoise_vi_set_next_frame_buffer_adapter",
+        ),
+        (
+            "VIWaitForRetrace",
+            "porpoise_libporpoise_vi_wait_for_retrace_adapter",
         ),
     )
     assert {adapter for _, adapter in protected_native_callables} == set(
@@ -2197,6 +2298,15 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
             '#include "porpoise_libporpoise_builtins_private.h"'
         ) == 1
         assert "#include <porpoise_libporpoise_adapter.h>" not in import_source
+        adapter_meson = (adapter_output / "meson.build").read_text(
+            encoding="utf-8"
+        )
+        if adapter == "porpoise_libporpoise_vi_wait_for_retrace_adapter":
+            assert "'c', 'cpp'" in adapter_meson
+            assert "'src/porpoise_libporpoise_presentation.cpp'" in adapter_meson
+            assert "cpp_args: porpoise_consumer_c_args" in adapter_meson
+        else:
+            assert "'src/porpoise_libporpoise_presentation.cpp'" not in adapter_meson
 
     def reject_builtin_manifest(
         label, manifest, diagnostic=None, input_path=terminal_import_input
@@ -3002,6 +3112,35 @@ with tempfile.TemporaryDirectory(prefix="porpoise-tests-", ignore_cleanup_errors
     )
     run(TOOL, approximate, "--output", temporary / "approximate-output")
     run(TOOL, approximate, "--output", temporary / "strict-output", "--strict", expected=3)
+
+    exact_estimate = temporary / "exact-estimate.s"
+    exact_estimate.write_text(
+        ".text\n.fn exact_estimate, global\n"
+        "/* 80000000 00000000  FC 40 08 34 */ frsqrte f2, f1\n"
+        "/* 80000004 00000004  FC 60 08 35 */ frsqrte. f3, f1\n"
+        "/* 80000008 00000008  4E 80 00 20 */ blr\n.endfn exact_estimate\n",
+        encoding="utf-8",
+    )
+    exact_estimate_output = temporary / "exact-estimate-output"
+    run(TOOL, exact_estimate, "--output", exact_estimate_output, "--strict")
+    exact_estimate_report = json.loads(
+        (exact_estimate_output / "porpoise-report.json").read_text(encoding="utf-8")
+    )
+    estimate_entries = [
+        instruction
+        for instruction in exact_estimate_report["instructions"]
+        if instruction["mnemonic"] in {"frsqrte", "frsqrte."}
+    ]
+    assert len(estimate_entries) == 2
+    assert all(instruction["status"] == "lowered" for instruction in estimate_entries)
+    assert all(instruction["semantic_test"] for instruction in estimate_entries)
+    exact_estimate_source = "\n".join(
+        source.read_text(encoding="utf-8")
+        for source in (exact_estimate_output / "src" / "lifted").rglob("*.c")
+    )
+    assert "porpoise_frsqrte(state, 2U, 1U, 0)" in exact_estimate_source
+    assert "porpoise_frsqrte(state, 3U, 1U, 1)" in exact_estimate_source
+    assert 'porpoise_trace_approximate(state, UINT32_C(0x80000000), "frsqrte")' not in exact_estimate_source
 
     paired_approximate = temporary / "paired-approximate.s"
     paired_approximate.write_text(

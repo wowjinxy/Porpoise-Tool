@@ -61,7 +61,7 @@ static void test_codewarrior(const char *source_root) {
     CHECK(porpoise_symbol_catalog_load_codewarrior(
               &catalog, path, &options, &diagnostics) == PORPOISE_EXIT_OK);
     CHECK(!porpoise_diagnostics_have_errors(&diagnostics));
-    CHECK(catalog.symbol_count == 6U);
+    CHECK(catalog.symbol_count == 9U);
 
     symbol = find_symbol(&catalog, "main", "MainFunc");
     CHECK(symbol != NULL);
@@ -100,6 +100,23 @@ static void test_codewarrior(const char *source_root) {
           catalog.symbols[index].address == UINT32_C(0x80001000));
     CHECK(porpoise_symbol_catalog_find_name(
               &catalog, "other", "MainFunc", 0U) == SIZE_MAX);
+
+    symbol = find_symbol(&catalog, "main", "_stack_addr");
+    CHECK(symbol != NULL);
+    if (symbol != NULL) {
+        CHECK(symbol->used && symbol->has_address && !symbol->has_size);
+        CHECK(symbol->address == UINT32_C(0x80004000));
+        CHECK(symbol->section == NULL);
+        CHECK(symbol->kind == PORPOISE_SYMBOL_KIND_LABEL);
+        CHECK(symbol->scope == PORPOISE_SYMBOL_SCOPE_GLOBAL);
+        CHECK(symbol->provenance.kind ==
+              PORPOISE_SYMBOL_SOURCE_CODEWARRIOR_MAP);
+        CHECK(symbol->provenance.line == 22U);
+    }
+    symbol = find_symbol(&catalog, "main", "_SDA_BASE_");
+    CHECK(symbol != NULL && symbol->address == UINT32_C(0x80005000));
+    symbol = find_symbol(&catalog, "main", "_SDA2_BASE_");
+    CHECK(symbol != NULL && symbol->address == UINT32_C(0x80006000));
 
     CHECK(strcmp(porpoise_symbol_kind_name(
                      PORPOISE_SYMBOL_KIND_FUNCTION), "function") == 0);
@@ -267,6 +284,17 @@ static void test_strict_failures_are_transactional(
     CHECK(diagnostics_contain(&diagnostics, "malformed"));
 
     porpoise_diagnostics_free(&diagnostics);
+    porpoise_diagnostics_init(&diagnostics);
+    CHECK(fixture_path(
+        symbols, sizeof(symbols), source_root, "malformed-linker.map"));
+    CHECK(porpoise_symbol_catalog_load_codewarrior(
+              &catalog, symbols, &options, &diagnostics) ==
+          PORPOISE_EXIT_TRANSLATION);
+    CHECK(catalog.symbol_count == original_count);
+    CHECK(diagnostics_contain(
+        &diagnostics, "linker-generated symbol record"));
+
+    porpoise_diagnostics_free(&diagnostics);
     porpoise_symbol_catalog_free(&catalog);
 }
 
@@ -285,6 +313,20 @@ static void test_nonstrict_skips_malformed(const char *source_root) {
     CHECK(porpoise_symbol_catalog_load_dtk(
               &catalog, path, NULL, &options, &diagnostics) ==
           PORPOISE_EXIT_OK);
+    CHECK(catalog.symbol_count == 0U);
+    CHECK(diagnostics.count == 1U);
+    CHECK(diagnostics.items[0].severity == PORPOISE_SEVERITY_WARNING);
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_symbol_catalog_free(&catalog);
+
+    CHECK(fixture_path(
+        path, sizeof(path), source_root, "malformed-linker.map"));
+    porpoise_symbol_catalog_init(&catalog);
+    porpoise_symbol_map_load_options_init(&options);
+    options.strict = false;
+    porpoise_diagnostics_init(&diagnostics);
+    CHECK(porpoise_symbol_catalog_load_codewarrior(
+              &catalog, path, &options, &diagnostics) == PORPOISE_EXIT_OK);
     CHECK(catalog.symbol_count == 0U);
     CHECK(diagnostics.count == 1U);
     CHECK(diagnostics.items[0].severity == PORPOISE_SEVERITY_WARNING);

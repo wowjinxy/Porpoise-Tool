@@ -3,6 +3,8 @@
 #endif
 
 #include "porpoise/recovery_project.h"
+#include "porpoise/recovery_title_host.h"
+#include "porpoise/sha256.h"
 
 #include "porpoise/util.h"
 #include "jsmn.h"
@@ -51,6 +53,7 @@ typedef struct RecoveryParseContext {
     const jsmntok_t *tokens;
     int token_count;
     PorpoiseDiagnostics *diagnostics;
+    uint32_t source_schema_version;
     int result;
 } RecoveryParseContext;
 
@@ -68,6 +71,61 @@ typedef struct RecoveryPathParts {
     const char *segments[PORPOISE_PATH_CAPACITY / 2U];
     size_t segment_count;
 } RecoveryPathParts;
+
+bool porpoise_recovery_target_id_is_valid(const char *id) {
+    return id != NULL && id[0] != '\0';
+}
+
+static unsigned char recovery_ascii_upper(unsigned char value) {
+    return value >= 'a' && value <= 'z'
+        ? (unsigned char)(value - ('a' - 'A')) : value;
+}
+
+static bool recovery_target_id_is_portable_path_component(const char *id) {
+    size_t length = strlen(id);
+    size_t index;
+    char upper[5] = "";
+    if (length == 0U || length > 64U) return false;
+    for (index = 0U; index < length; index++) {
+        const unsigned char value = (unsigned char)id[index];
+        if (!((value >= 'A' && value <= 'Z') ||
+              (value >= 'a' && value <= 'z') ||
+              (value >= '0' && value <= '9') || value == '_' ||
+              value == '-')) return false;
+        if (index < sizeof(upper) - 1U)
+            upper[index] = (char)recovery_ascii_upper(value);
+    }
+    if ((length == 3U &&
+         (strcmp(upper, "CON") == 0 || strcmp(upper, "PRN") == 0 ||
+          strcmp(upper, "AUX") == 0 || strcmp(upper, "NUL") == 0)) ||
+        (length == 4U &&
+         (strncmp(upper, "COM", 3U) == 0 ||
+          strncmp(upper, "LPT", 3U) == 0) &&
+         upper[3] >= '1' && upper[3] <= '9')) return false;
+    return true;
+}
+
+bool porpoise_recovery_target_cache_key(
+    const char *id,
+    char output[PORPOISE_RECOVERY_TARGET_CACHE_KEY_SIZE]) {
+    PorpoiseSha256Context context;
+    unsigned char digest[PORPOISE_SHA256_DIGEST_SIZE];
+    char hex[PORPOISE_SHA256_HEX_SIZE];
+    if (!porpoise_recovery_target_id_is_valid(id) || output == NULL)
+        return false;
+    if (recovery_target_id_is_portable_path_component(id)) {
+        return porpoise_copy_string(
+            output, PORPOISE_RECOVERY_TARGET_CACHE_KEY_SIZE, id);
+    }
+    porpoise_sha256_init(&context);
+    porpoise_sha256_update(&context, id, strlen(id));
+    porpoise_sha256_final(&context, digest);
+    porpoise_sha256_hex(digest, hex);
+    return snprintf(
+               output, PORPOISE_RECOVERY_TARGET_CACHE_KEY_SIZE,
+               "target-%s", hex) ==
+           (int)(sizeof("target-") - 1U + PORPOISE_SHA256_HEX_SIZE - 1U);
+}
 
 static int recovery_add_diagnostic(
     PorpoiseDiagnostics *diagnostics,
@@ -508,6 +566,7 @@ static void recovery_target_free(PorpoiseRecoveryTarget *target) {
         recovery_annotation_free(&target->annotations[index]);
     free(target->annotations);
     recovery_cache_free(&target->cache);
+    porpoise_recovery_title_host_profile_free(&target->title_host);
     memset(target, 0, sizeof(*target));
 }
 
@@ -2166,6 +2225,413 @@ static bool recovery_parse_cache(
     return true;
 }
 
+static bool recovery_parse_nullable_sha256(
+    RecoveryParseContext *context,
+    int token_index,
+    const char *description,
+    char **value_out) {
+    if (recovery_token_is(context, token_index, "null")) {
+        *value_out = NULL;
+        return true;
+    }
+    return recovery_parse_sha256(
+        context, token_index, description, value_out);
+}
+
+static bool recovery_parse_title_gpr(
+    RecoveryParseContext *context,
+    int array_index,
+    PorpoiseRecoveryTitleHostProfile *profile) {
+    const jsmntok_t *array;
+    int item_index;
+    size_t index;
+    if (array_index < 0 || array_index >= context->token_count ||
+        context->tokens[array_index].type != JSMN_ARRAY) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, array_index,
+            "title_host gpr must be an array");
+    }
+    array = &context->tokens[array_index];
+    if ((size_t)array->size != PORPOISE_RECOVERY_TITLE_HOST_GPR_COUNT) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, array_index,
+            "title_host gpr must contain exactly %u registers",
+            PORPOISE_RECOVERY_TITLE_HOST_GPR_COUNT);
+    }
+    item_index = array_index + 1;
+    for (index = 0U; index < PORPOISE_RECOVERY_TITLE_HOST_GPR_COUNT;
+         index++) {
+        if (!recovery_parse_uint32(
+                context, item_index, "title_host gpr value",
+                &profile->gpr[index])) return false;
+        item_index = recovery_token_after(context, item_index);
+        if (item_index < 0) {
+            return recovery_report(
+                context, PORPOISE_EXIT_USAGE, array_index,
+                "title_host gpr has invalid token structure");
+        }
+    }
+    return true;
+}
+
+static bool recovery_parse_title_startup_function(
+    RecoveryParseContext *context,
+    int object_index,
+    PorpoiseRecoveryTitleStartupFunction *function) {
+    enum {
+        FIELD_MODULE = 1U << 0,
+        FIELD_ADDRESS = 1U << 1,
+        FIELD_SIZE = 1U << 2,
+        FIELD_FINGERPRINT = 1U << 3,
+        FIELD_FLAGS = 1U << 4
+    };
+    const unsigned int required = FIELD_MODULE | FIELD_ADDRESS | FIELD_SIZE |
+        FIELD_FINGERPRINT | FIELD_FLAGS;
+    const jsmntok_t *object;
+    int member_index;
+    int member;
+    unsigned int seen = 0U;
+    if (object_index < 0 || object_index >= context->token_count ||
+        context->tokens[object_index].type != JSMN_OBJECT) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, object_index,
+            "title_host startup functions must be objects");
+    }
+    object = &context->tokens[object_index];
+    member_index = object_index + 1;
+    for (member = 0; member < object->size; member++) {
+        int key_index = member_index;
+        int value_index = key_index + 1;
+        char *key = NULL;
+        unsigned int bit;
+        if (!recovery_key(context, key_index, &key)) return false;
+        if (strcmp(key, "module") == 0) bit = FIELD_MODULE;
+        else if (strcmp(key, "address") == 0) bit = FIELD_ADDRESS;
+        else if (strcmp(key, "size") == 0) bit = FIELD_SIZE;
+        else if (strcmp(key, "fingerprint") == 0) bit = FIELD_FINGERPRINT;
+        else if (strcmp(key, "flags") == 0) bit = FIELD_FLAGS;
+        else {
+            bool result = recovery_report(
+                context, PORPOISE_EXIT_USAGE, key_index,
+                "unknown title_host startup function key '%s'", key);
+            free(key);
+            return result;
+        }
+        if ((seen & bit) != 0U) {
+            bool result = recovery_report(
+                context, PORPOISE_EXIT_USAGE, key_index,
+                "duplicate title_host startup function key '%s'", key);
+            free(key);
+            return result;
+        }
+        seen |= bit;
+        free(key);
+        if (bit == FIELD_MODULE) {
+            if (!recovery_decode_owned_string(
+                    context, value_index,
+                    "title_host startup function module", false,
+                    &function->module)) return false;
+        } else if (bit == FIELD_ADDRESS) {
+            if (!recovery_parse_uint32(
+                    context, value_index,
+                    "title_host startup function address",
+                    &function->address)) return false;
+        } else if (bit == FIELD_SIZE) {
+            if (!recovery_parse_uint32(
+                    context, value_index,
+                    "title_host startup function size",
+                    &function->size)) return false;
+        } else if (bit == FIELD_FINGERPRINT) {
+            if (!recovery_parse_sha256(
+                    context, value_index,
+                    "title_host startup function fingerprint",
+                    &function->normalized_fingerprint)) return false;
+        } else if (!recovery_parse_uint32(
+                       context, value_index,
+                       "title_host startup function flags",
+                       &function->flags)) return false;
+        member_index = recovery_token_after(context, value_index);
+        if (member_index < 0) {
+            return recovery_report(
+                context, PORPOISE_EXIT_USAGE, value_index,
+                "title_host startup function has invalid token structure");
+        }
+    }
+    if ((seen & required) != required) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, object_index,
+            "title_host startup function is missing required fields");
+    }
+    return true;
+}
+
+static bool recovery_parse_title_startup_functions(
+    RecoveryParseContext *context,
+    int array_index,
+    PorpoiseRecoveryTitleHostProfile *profile) {
+    const jsmntok_t *array;
+    int item_index;
+    int item;
+    if (array_index < 0 || array_index >= context->token_count ||
+        context->tokens[array_index].type != JSMN_ARRAY) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, array_index,
+            "title_host startup_functions must be an array");
+    }
+    array = &context->tokens[array_index];
+    if ((size_t)array->size >
+        PORPOISE_RECOVERY_TITLE_HOST_STARTUP_FUNCTION_CAPACITY) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, array_index,
+            "title_host has more than %u startup functions",
+            PORPOISE_RECOVERY_TITLE_HOST_STARTUP_FUNCTION_CAPACITY);
+    }
+    item_index = array_index + 1;
+    for (item = 0; item < array->size; item++) {
+        size_t index = profile->startup_function_count++;
+        if (!recovery_parse_title_startup_function(
+                context, item_index,
+                &profile->startup_functions[index])) return false;
+        item_index = recovery_token_after(context, item_index);
+        if (item_index < 0) {
+            return recovery_report(
+                context, PORPOISE_EXIT_USAGE, array_index,
+                "title_host startup_functions have invalid token structure");
+        }
+    }
+    return true;
+}
+
+static bool recovery_parse_title_initial_word(
+    RecoveryParseContext *context,
+    int object_index,
+    PorpoiseRecoveryTitleInitialWord *word) {
+    enum {
+        FIELD_ADDRESS = 1U << 0,
+        FIELD_VALUE = 1U << 1
+    };
+    const unsigned int required = FIELD_ADDRESS | FIELD_VALUE;
+    const jsmntok_t *object;
+    int member_index;
+    int member;
+    unsigned int seen = 0U;
+    if (object_index < 0 || object_index >= context->token_count ||
+        context->tokens[object_index].type != JSMN_OBJECT) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, object_index,
+            "title_host initial words must be objects");
+    }
+    object = &context->tokens[object_index];
+    member_index = object_index + 1;
+    for (member = 0; member < object->size; member++) {
+        int key_index = member_index;
+        int value_index = key_index + 1;
+        char *key = NULL;
+        unsigned int bit;
+        if (!recovery_key(context, key_index, &key)) return false;
+        if (strcmp(key, "address") == 0) bit = FIELD_ADDRESS;
+        else if (strcmp(key, "value") == 0) bit = FIELD_VALUE;
+        else {
+            bool result = recovery_report(
+                context, PORPOISE_EXIT_USAGE, key_index,
+                "unknown title_host initial word key '%s'", key);
+            free(key);
+            return result;
+        }
+        if ((seen & bit) != 0U) {
+            bool result = recovery_report(
+                context, PORPOISE_EXIT_USAGE, key_index,
+                "duplicate title_host initial word key '%s'", key);
+            free(key);
+            return result;
+        }
+        seen |= bit;
+        free(key);
+        if (bit == FIELD_ADDRESS) {
+            if (!recovery_parse_uint32(
+                    context, value_index,
+                    "title_host initial word address",
+                    &word->address)) return false;
+        } else if (!recovery_parse_uint32(
+                       context, value_index,
+                       "title_host initial word value",
+                       &word->value)) return false;
+        member_index = recovery_token_after(context, value_index);
+        if (member_index < 0) {
+            return recovery_report(
+                context, PORPOISE_EXIT_USAGE, value_index,
+                "title_host initial word has invalid token structure");
+        }
+    }
+    if ((seen & required) != required) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, object_index,
+            "title_host initial word is missing required fields");
+    }
+    return true;
+}
+
+static bool recovery_parse_title_initial_words(
+    RecoveryParseContext *context,
+    int array_index,
+    PorpoiseRecoveryTitleHostProfile *profile) {
+    const jsmntok_t *array;
+    int item_index;
+    int item;
+    if (array_index < 0 || array_index >= context->token_count ||
+        context->tokens[array_index].type != JSMN_ARRAY) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, array_index,
+            "title_host initial_words must be an array");
+    }
+    array = &context->tokens[array_index];
+    if ((size_t)array->size >
+        PORPOISE_RECOVERY_TITLE_HOST_INITIAL_WORD_CAPACITY) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, array_index,
+            "title_host has more than %u initial words",
+            PORPOISE_RECOVERY_TITLE_HOST_INITIAL_WORD_CAPACITY);
+    }
+    item_index = array_index + 1;
+    for (item = 0; item < array->size; item++) {
+        size_t index = profile->initial_word_count++;
+        if (!recovery_parse_title_initial_word(
+                context, item_index,
+                &profile->initial_words[index])) return false;
+        item_index = recovery_token_after(context, item_index);
+        if (item_index < 0) {
+            return recovery_report(
+                context, PORPOISE_EXIT_USAGE, array_index,
+                "title_host initial_words have invalid token structure");
+        }
+    }
+    return true;
+}
+
+static bool recovery_parse_title_host(
+    RecoveryParseContext *context,
+    int object_index,
+    PorpoiseRecoveryTarget *target) {
+    enum {
+        FIELD_ENTRY = 1U << 0,
+        FIELD_GPR = 1U << 1,
+        FIELD_ARENA_LO = 1U << 2,
+        FIELD_ARENA_HI = 1U << 3,
+        FIELD_STARTUP = 1U << 4,
+        FIELD_WORDS = 1U << 5,
+        FIELD_DVD = 1U << 6,
+        FIELD_INPUT = 1U << 7,
+        FIELD_SYMBOLS = 1U << 8,
+        FIELD_CATALOGS = 1U << 9
+    };
+    const unsigned int required = FIELD_ENTRY | FIELD_GPR | FIELD_ARENA_LO |
+        FIELD_ARENA_HI | FIELD_STARTUP | FIELD_WORDS | FIELD_DVD |
+        FIELD_INPUT | FIELD_SYMBOLS | FIELD_CATALOGS;
+    PorpoiseRecoveryTitleHostProfile *profile = &target->title_host;
+    const jsmntok_t *object;
+    int member_index;
+    int member;
+    unsigned int seen = 0U;
+    if (recovery_token_is(context, object_index, "null")) {
+        target->has_title_host = false;
+        return true;
+    }
+    if (object_index < 0 || object_index >= context->token_count ||
+        context->tokens[object_index].type != JSMN_OBJECT) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, object_index,
+            "target title_host must be an object or null");
+    }
+    target->has_title_host = true;
+    object = &context->tokens[object_index];
+    member_index = object_index + 1;
+    for (member = 0; member < object->size; member++) {
+        int key_index = member_index;
+        int value_index = key_index + 1;
+        char *key = NULL;
+        unsigned int bit;
+        if (!recovery_key(context, key_index, &key)) return false;
+        if (strcmp(key, "entry_address") == 0) bit = FIELD_ENTRY;
+        else if (strcmp(key, "gpr") == 0) bit = FIELD_GPR;
+        else if (strcmp(key, "arena_lo") == 0) bit = FIELD_ARENA_LO;
+        else if (strcmp(key, "arena_hi") == 0) bit = FIELD_ARENA_HI;
+        else if (strcmp(key, "startup_functions") == 0) bit = FIELD_STARTUP;
+        else if (strcmp(key, "initial_words") == 0) bit = FIELD_WORDS;
+        else if (strcmp(key, "initialize_dvd") == 0) bit = FIELD_DVD;
+        else if (strcmp(key, "input_sha256") == 0) bit = FIELD_INPUT;
+        else if (strcmp(key, "symbol_sources_sha256") == 0)
+            bit = FIELD_SYMBOLS;
+        else if (strcmp(key, "sdk_catalogs_sha256") == 0)
+            bit = FIELD_CATALOGS;
+        else {
+            bool result = recovery_report(
+                context, PORPOISE_EXIT_USAGE, key_index,
+                "unknown target title_host key '%s'", key);
+            free(key);
+            return result;
+        }
+        if ((seen & bit) != 0U) {
+            bool result = recovery_report(
+                context, PORPOISE_EXIT_USAGE, key_index,
+                "duplicate target title_host key '%s'", key);
+            free(key);
+            return result;
+        }
+        seen |= bit;
+        free(key);
+        if (bit == FIELD_ENTRY) {
+            if (!recovery_parse_uint32(
+                    context, value_index, "title_host entry_address",
+                    &profile->entry_address)) return false;
+        } else if (bit == FIELD_GPR) {
+            if (!recovery_parse_title_gpr(
+                    context, value_index, profile)) return false;
+        } else if (bit == FIELD_ARENA_LO) {
+            if (!recovery_parse_uint32(
+                    context, value_index, "title_host arena_lo",
+                    &profile->arena_lo)) return false;
+        } else if (bit == FIELD_ARENA_HI) {
+            if (!recovery_parse_uint32(
+                    context, value_index, "title_host arena_hi",
+                    &profile->arena_hi)) return false;
+        } else if (bit == FIELD_STARTUP) {
+            if (!recovery_parse_title_startup_functions(
+                    context, value_index, profile)) return false;
+        } else if (bit == FIELD_WORDS) {
+            if (!recovery_parse_title_initial_words(
+                    context, value_index, profile)) return false;
+        } else if (bit == FIELD_DVD) {
+            if (!recovery_parse_bool(
+                    context, value_index, "title_host initialize_dvd",
+                    &profile->initialize_dvd)) return false;
+        } else if (bit == FIELD_INPUT) {
+            if (!recovery_parse_sha256(
+                    context, value_index, "title_host input_sha256",
+                    &profile->input_sha256)) return false;
+        } else if (bit == FIELD_SYMBOLS) {
+            if (!recovery_parse_nullable_sha256(
+                    context, value_index,
+                    "title_host symbol_sources_sha256",
+                    &profile->symbol_sources_sha256)) return false;
+        } else if (!recovery_parse_nullable_sha256(
+                       context, value_index,
+                       "title_host sdk_catalogs_sha256",
+                       &profile->sdk_catalogs_sha256)) return false;
+        member_index = recovery_token_after(context, value_index);
+        if (member_index < 0) {
+            return recovery_report(
+                context, PORPOISE_EXIT_USAGE, value_index,
+                "target title_host has invalid token structure");
+        }
+    }
+    if ((seen & required) != required) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, object_index,
+            "target title_host is missing required fields");
+    }
+    return true;
+}
+
 static bool recovery_parse_source_kind(
     RecoveryParseContext *context,
     int token_index,
@@ -2283,9 +2749,18 @@ static bool recovery_find_target_id(
         char *key = NULL;
         if (!recovery_key(context, key_index, &key)) return false;
         if (strcmp(key, "id") == 0 && target->id == NULL) {
+            bool decoded;
             free(key);
-            return recovery_decode_owned_string(
+            decoded = recovery_decode_owned_string(
                 context, value_index, "target id", true, &target->id);
+            if (!decoded) return false;
+            if (!porpoise_recovery_target_id_is_valid(target->id)) {
+                return recovery_report(
+                    context, PORPOISE_EXIT_USAGE, value_index,
+                    "target id '%s' must not be empty",
+                    target->id);
+            }
+            return true;
         }
         free(key);
         member_index = recovery_token_after(context, value_index);
@@ -2317,9 +2792,10 @@ static bool recovery_parse_target(
         FIELD_SKIP_LIST = 1U << 9,
         FIELD_OVERRIDES = 1U << 10,
         FIELD_ANNOTATIONS = 1U << 11,
-        FIELD_CACHE = 1U << 12
+        FIELD_CACHE = 1U << 12,
+        FIELD_TITLE_HOST = 1U << 13
     };
-    const unsigned int required = FIELD_ID | FIELD_ENABLED |
+    unsigned int required = FIELD_ID | FIELD_ENABLED |
         FIELD_SOURCE_KIND | FIELD_INPUT | FIELD_OUTPUT | FIELD_ENTRY |
         FIELD_STRICT | FIELD_SDK_POLICY | FIELD_SYMBOL_SOURCES |
         FIELD_SKIP_LIST | FIELD_OVERRIDES | FIELD_ANNOTATIONS | FIELD_CACHE;
@@ -2337,6 +2813,10 @@ static bool recovery_parse_target(
     object = &context->tokens[object_index];
     target->enabled = true;
     target->sdk_policy = PORPOISE_SDK_POLICY_KEEP;
+    if (context->source_schema_version >=
+        PORPOISE_RECOVERY_PROJECT_SCHEMA_VERSION) {
+        required |= FIELD_TITLE_HOST;
+    }
     if (!recovery_find_target_id(context, object_index, target)) return false;
     member_index = object_index + 1;
     for (member = 0; member < object->size; member++) {
@@ -2359,6 +2839,10 @@ static bool recovery_parse_target(
         else if (strcmp(key, "overrides") == 0) bit = FIELD_OVERRIDES;
         else if (strcmp(key, "annotations") == 0) bit = FIELD_ANNOTATIONS;
         else if (strcmp(key, "cache") == 0) bit = FIELD_CACHE;
+        else if (strcmp(key, "title_host") == 0 &&
+                 context->source_schema_version >=
+                     PORPOISE_RECOVERY_PROJECT_SCHEMA_VERSION)
+            bit = FIELD_TITLE_HOST;
         else {
             bool result = recovery_report(
                 context, PORPOISE_EXIT_USAGE, key_index,
@@ -2431,8 +2915,11 @@ static bool recovery_parse_target(
         } else if (bit == FIELD_ANNOTATIONS) {
             if (!recovery_parse_annotations(
                     context, value_index, target)) return false;
-        } else if (!recovery_parse_cache(
-                       context, value_index, &target->cache)) return false;
+        } else if (bit == FIELD_CACHE) {
+            if (!recovery_parse_cache(
+                    context, value_index, &target->cache)) return false;
+        } else if (!recovery_parse_title_host(
+                       context, value_index, target)) return false;
 
         member_index = recovery_token_after(context, value_index);
         if (member_index < 0) {
@@ -2444,7 +2931,8 @@ static bool recovery_parse_target(
     if ((seen & required) != required) {
         return recovery_report(
             context, PORPOISE_EXIT_USAGE, object_index,
-            "target '%s' is missing required schema-v1 fields", target->id);
+            "target '%s' is missing required schema-v%u fields", target->id,
+            context->source_schema_version);
     }
     return recovery_validate_target_records(context, object_index, target);
 }
@@ -2489,6 +2977,65 @@ static bool recovery_parse_targets(
                 context, PORPOISE_EXIT_USAGE, array_index,
                 "project targets have invalid token structure");
         }
+    }
+    return true;
+}
+
+static bool recovery_discover_schema_version(
+    RecoveryParseContext *context) {
+    const jsmntok_t *root;
+    int member_index;
+    int member;
+    bool found = false;
+    if (context->token_count == 0 ||
+        context->tokens[0].type != JSMN_OBJECT) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, 0,
+            "project root must be an object");
+    }
+    root = &context->tokens[0];
+    member_index = 1;
+    for (member = 0; member < root->size; member++) {
+        int key_index = member_index;
+        int value_index = key_index + 1;
+        char *key = NULL;
+        if (!recovery_key(context, key_index, &key)) return false;
+        if (strcmp(key, "schema_version") == 0) {
+            uint32_t version;
+            free(key);
+            if (found) {
+                return recovery_report(
+                    context, PORPOISE_EXIT_USAGE, key_index,
+                    "duplicate project root key 'schema_version'");
+            }
+            if (!recovery_parse_uint32(
+                    context, value_index, "schema_version", &version)) {
+                return false;
+            }
+            if (version != PORPOISE_RECOVERY_PROJECT_LEGACY_SCHEMA_VERSION &&
+                version != PORPOISE_RECOVERY_PROJECT_SCHEMA_VERSION) {
+                return recovery_report(
+                    context, PORPOISE_EXIT_USAGE, value_index,
+                    "schema_version must be %u or %u",
+                    PORPOISE_RECOVERY_PROJECT_LEGACY_SCHEMA_VERSION,
+                    PORPOISE_RECOVERY_PROJECT_SCHEMA_VERSION);
+            }
+            context->source_schema_version = version;
+            found = true;
+        } else {
+            free(key);
+        }
+        member_index = recovery_token_after(context, value_index);
+        if (member_index < 0) {
+            return recovery_report(
+                context, PORPOISE_EXIT_USAGE, value_index,
+                "project root has invalid token structure");
+        }
+    }
+    if (!found) {
+        return recovery_report(
+            context, PORPOISE_EXIT_USAGE, 0,
+            "project root is missing required schema_version");
     }
     return true;
 }
@@ -2551,13 +3098,13 @@ static bool recovery_parse_root(
                     context, value_index, "schema_version", &version)) {
                 return false;
             }
-            if (version != PORPOISE_RECOVERY_PROJECT_SCHEMA_VERSION) {
+            if (version != context->source_schema_version) {
                 return recovery_report(
-                    context, PORPOISE_EXIT_USAGE, value_index,
-                    "schema_version must be %u",
-                    PORPOISE_RECOVERY_PROJECT_SCHEMA_VERSION);
+                    context, PORPOISE_EXIT_INTERNAL, value_index,
+                    "schema_version changed while parsing");
             }
-            project->schema_version = version;
+            project->schema_version =
+                PORPOISE_RECOVERY_PROJECT_SCHEMA_VERSION;
         } else if (bit == FIELD_SDK_CATALOGS) {
             if (!recovery_parse_path_array(
                     context, value_index, "sdk_catalogs",
@@ -2580,7 +3127,8 @@ static bool recovery_parse_root(
     if ((seen & required) != required) {
         return recovery_report(
             context, PORPOISE_EXIT_USAGE, 0,
-            "project root is missing required schema-v1 fields");
+            "project root is missing required schema-v%u fields",
+            context->source_schema_version);
     }
     return true;
 }
@@ -2750,6 +3298,7 @@ int porpoise_recovery_project_load(
     context.diagnostics = diagnostics;
     context.result = PORPOISE_EXIT_USAGE;
     if (!recovery_validate_json_document(&context) ||
+        !recovery_discover_schema_version(&context) ||
         !recovery_parse_root(&context, &parsed)) {
         result = context.result;
         free(tokens);
@@ -2801,6 +3350,16 @@ static bool recovery_cache_is_empty(
            cache->match_count == 0U;
 }
 
+static bool recovery_sha256_string_valid(const char *value) {
+    size_t index;
+    if (value == NULL || strlen(value) != 64U) return false;
+    for (index = 0U; index < 64U; index++) {
+        if (!((value[index] >= '0' && value[index] <= '9') ||
+              (value[index] >= 'a' && value[index] <= 'f'))) return false;
+    }
+    return true;
+}
+
 static int recovery_validate_for_save(
     const PorpoiseRecoveryProject *project,
     const char *path,
@@ -2810,7 +3369,7 @@ static int recovery_validate_for_save(
         project->schema_version != PORPOISE_RECOVERY_PROJECT_SCHEMA_VERSION) {
         return recovery_add_diagnostic(
             diagnostics, PORPOISE_EXIT_USAGE, path, 0U,
-            "cannot save a null or non-v1 recovery project");
+            "cannot save a null or non-v2 recovery project");
     }
     if ((project->sdk_catalog_count != 0U && project->sdk_catalogs == NULL) ||
         (project->abi_contract_count != 0U && project->abi_contracts == NULL) ||
@@ -2824,7 +3383,7 @@ static int recovery_validate_for_save(
         const PorpoiseRecoveryTarget *target =
             &project->targets[target_index];
         size_t other;
-        if (target->id == NULL || target->id[0] == '\0' ||
+        if (!porpoise_recovery_target_id_is_valid(target->id) ||
             target->input.resolved == NULL || target->output.resolved == NULL ||
             strcmp(porpoise_recovery_source_kind_name(target->source_kind),
                    "unknown") == 0 ||
@@ -2847,6 +3406,40 @@ static int recovery_validate_for_save(
             return recovery_add_diagnostic(
                 diagnostics, PORPOISE_EXIT_USAGE, path, 0U,
                 "target '%s' has an incomplete cache", target->id);
+        }
+        if (target->has_title_host) {
+            const PorpoiseRecoveryTitleHostProfile *profile =
+                &target->title_host;
+            size_t index;
+            if (!recovery_sha256_string_valid(profile->input_sha256) ||
+                (profile->symbol_sources_sha256 != NULL &&
+                 !recovery_sha256_string_valid(
+                     profile->symbol_sources_sha256)) ||
+                (profile->sdk_catalogs_sha256 != NULL &&
+                 !recovery_sha256_string_valid(
+                     profile->sdk_catalogs_sha256)) ||
+                profile->startup_function_count >
+                    PORPOISE_RECOVERY_TITLE_HOST_STARTUP_FUNCTION_CAPACITY ||
+                profile->initial_word_count >
+                    PORPOISE_RECOVERY_TITLE_HOST_INITIAL_WORD_CAPACITY) {
+                return recovery_add_diagnostic(
+                    diagnostics, PORPOISE_EXIT_USAGE, path, 0U,
+                    "target '%s' has an incomplete title_host profile",
+                    target->id);
+            }
+            for (index = 0U; index < profile->startup_function_count;
+                 index++) {
+                const PorpoiseRecoveryTitleStartupFunction *function =
+                    &profile->startup_functions[index];
+                if (function->module == NULL ||
+                    !recovery_sha256_string_valid(
+                        function->normalized_fingerprint)) {
+                    return recovery_add_diagnostic(
+                        diagnostics, PORPOISE_EXIT_USAGE, path, 0U,
+                        "target '%s' has an incomplete title_host startup function",
+                        target->id);
+                }
+            }
         }
     }
     return PORPOISE_EXIT_OK;
@@ -3065,6 +3658,74 @@ static bool recovery_write_cache(
     return !ferror(file);
 }
 
+static bool recovery_write_title_host(
+    FILE *file,
+    const PorpoiseRecoveryTarget *target) {
+    const PorpoiseRecoveryTitleHostProfile *profile = &target->title_host;
+    size_t index;
+    if (!target->has_title_host) return fputs("null", file) >= 0;
+    fprintf(file, "{\n        \"entry_address\": %" PRIu32
+            ",\n        \"gpr\": [",
+            profile->entry_address);
+    for (index = 0U; index < PORPOISE_RECOVERY_TITLE_HOST_GPR_COUNT;
+         index++) {
+        if (index != 0U) fputs(", ", file);
+        fprintf(file, "%" PRIu32, profile->gpr[index]);
+    }
+    fprintf(file, "],\n        \"arena_lo\": %" PRIu32
+            ",\n        \"arena_hi\": %" PRIu32
+            ",\n        \"startup_functions\": ",
+            profile->arena_lo, profile->arena_hi);
+    if (profile->startup_function_count == 0U) {
+        fputs("[]", file);
+    } else {
+        fputs("[\n", file);
+        for (index = 0U; index < profile->startup_function_count; index++) {
+            const PorpoiseRecoveryTitleStartupFunction *function =
+                &profile->startup_functions[index];
+            fputs("          {\"module\": ", file);
+            porpoise_json_write_string(file, function->module);
+            fprintf(file, ", \"address\": %" PRIu32
+                    ", \"size\": %" PRIu32 ", \"fingerprint\": ",
+                    function->address, function->size);
+            porpoise_json_write_string(
+                file, function->normalized_fingerprint);
+            fprintf(file, ", \"flags\": %" PRIu32 "}", function->flags);
+            if (index + 1U < profile->startup_function_count) fputc(',', file);
+            fputc('\n', file);
+        }
+        fputs("        ]", file);
+    }
+    fputs(",\n        \"initial_words\": ", file);
+    if (profile->initial_word_count == 0U) {
+        fputs("[]", file);
+    } else {
+        fputs("[\n", file);
+        for (index = 0U; index < profile->initial_word_count; index++) {
+            const PorpoiseRecoveryTitleInitialWord *word =
+                &profile->initial_words[index];
+            fprintf(file, "          {\"address\": %" PRIu32
+                    ", \"value\": %" PRIu32 "}",
+                    word->address, word->value);
+            if (index + 1U < profile->initial_word_count) fputc(',', file);
+            fputc('\n', file);
+        }
+        fputs("        ]", file);
+    }
+    fprintf(file, ",\n        \"initialize_dvd\": %s"
+            ",\n        \"input_sha256\": ",
+            profile->initialize_dvd ? "true" : "false");
+    porpoise_json_write_string(file, profile->input_sha256);
+    fputs(",\n        \"symbol_sources_sha256\": ", file);
+    if (!recovery_write_nullable_string(
+            file, profile->symbol_sources_sha256)) return false;
+    fputs(",\n        \"sdk_catalogs_sha256\": ", file);
+    if (!recovery_write_nullable_string(
+            file, profile->sdk_catalogs_sha256)) return false;
+    fputs("\n      }", file);
+    return !ferror(file);
+}
+
 static bool recovery_write_target(
     FILE *file,
     const PorpoiseRecoveryTarget *target,
@@ -3100,6 +3761,8 @@ static bool recovery_write_target(
     if (!recovery_write_overrides(file, target)) return false;
     fputs(",\n      \"annotations\": ", file);
     if (!recovery_write_annotations(file, target)) return false;
+    fputs(",\n      \"title_host\": ", file);
+    if (!recovery_write_title_host(file, target)) return false;
     fputs(",\n      \"cache\": ", file);
     if (!recovery_write_cache(
             file, &target->cache, destination_directory)) return false;
@@ -3112,7 +3775,8 @@ static bool recovery_write_document(
     const PorpoiseRecoveryProject *project,
     const char *destination_directory) {
     size_t target_index;
-    fputs("{\n  \"schema_version\": 1,\n  \"sdk_catalogs\": ", file);
+    fprintf(file, "{\n  \"schema_version\": %u,\n  \"sdk_catalogs\": ",
+            PORPOISE_RECOVERY_PROJECT_SCHEMA_VERSION);
     if (!recovery_write_path_array(
             file, project->sdk_catalogs, project->sdk_catalog_count,
             destination_directory, 4U)) return false;

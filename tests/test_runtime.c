@@ -1,6 +1,7 @@
 #include "porpoise_lifted.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -9,6 +10,13 @@
 typedef struct TestMemory {
     uint8_t bytes[64];
 } TestMemory;
+
+typedef struct TestGxFifo {
+    unsigned int generic_calls;
+    unsigned int fast_calls;
+    uint8_t last_value;
+    PorpoiseHostResult fast_result;
+} TestGxFifo;
 
 /* cppcheck-suppress constParameterCallback -- signature is fixed by the host ABI. */
 static PorpoiseHostResult read_bytes(
@@ -33,6 +41,71 @@ static PorpoiseHostResult write_bytes(
         return PORPOISE_HOST_UNMAPPED_ADDRESS;
     memcpy(&memory->bytes[address], source, size);
     return PORPOISE_HOST_OK;
+}
+
+static PorpoiseHostResult write_gx_fifo_bytes(
+    void *context,
+    uint32_t address,
+    const void *source,
+    size_t size)
+{
+    TestGxFifo *fifo = (TestGxFifo *)context;
+
+    if (address != UINT32_C(0xCC008000) || source == NULL || size != 1U) {
+        return PORPOISE_HOST_INVALID_ARGUMENT;
+    }
+    fifo->generic_calls++;
+    fifo->last_value = *(const uint8_t *)source;
+    return PORPOISE_HOST_OK;
+}
+
+static PorpoiseHostResult write_gx_fifo_u8(
+    void *context,
+    uint8_t value)
+{
+    TestGxFifo *fifo = (TestGxFifo *)context;
+
+    fifo->fast_calls++;
+    fifo->last_value = value;
+    return fifo->fast_result;
+}
+
+static void test_gx_fifo_u8_store(void)
+{
+    TestGxFifo fifo;
+    PorpoiseHostAdapter adapter;
+    PorpoisePpcState state;
+
+    memset(&fifo, 0, sizeof(fifo));
+    memset(&adapter, 0, sizeof(adapter));
+    adapter.context = &fifo;
+    adapter.write_bytes = write_gx_fifo_bytes;
+    porpoise_state_init(&state, &adapter);
+
+    porpoise_store_gx_fifo_u8(&state, UINT8_C(0x12));
+    CHECK(!porpoise_state_has_fault(&state));
+    CHECK(fifo.generic_calls == 1U && fifo.fast_calls == 0U);
+    CHECK(fifo.last_value == UINT8_C(0x12));
+
+    adapter.write_gx_fifo_u8 = write_gx_fifo_u8;
+    fifo.fast_result = PORPOISE_HOST_OK;
+    porpoise_store_gx_fifo_u8(&state, UINT8_C(0x34));
+    CHECK(!porpoise_state_has_fault(&state));
+    CHECK(fifo.generic_calls == 1U && fifo.fast_calls == 1U);
+    CHECK(fifo.last_value == UINT8_C(0x34));
+
+    fifo.fast_result = PORPOISE_HOST_UNSUPPORTED_MMIO;
+    porpoise_store_gx_fifo_u8(&state, UINT8_C(0x56));
+    CHECK(state.fault == PORPOISE_FAULT_UNSUPPORTED_MMIO);
+    CHECK(state.fault_address == UINT32_C(0xCC008000));
+    CHECK(fifo.fast_calls == 2U);
+    porpoise_store_gx_fifo_u8(&state, UINT8_C(0x78));
+    CHECK(fifo.fast_calls == 2U);
+
+    porpoise_state_init(&state, NULL);
+    porpoise_store_gx_fifo_u8(&state, UINT8_C(0x9A));
+    CHECK(state.fault == PORPOISE_FAULT_NO_HOST_ADAPTER);
+    CHECK(state.fault_address == UINT32_C(0xCC008000));
 }
 
 static PorpoiseHostResult decode_pointer(void *context, uint32_t address, void **result) {
@@ -357,6 +430,116 @@ static void test_raw_fpr_memory(void) {
     CHECK(memory.bytes[36] == 0xA5U && memory.bytes[39] == 0xA5U);
 }
 
+static void test_runtime_trace(void) {
+    PorpoisePpcState state;
+    FILE *output = tmpfile();
+    char contents[4096];
+    size_t size;
+
+    CHECK(output != NULL);
+    porpoise_state_init(&state, NULL);
+    state.status = PORPOISE_EXECUTION_RUNNING;
+    state.pc = UINT32_C(0x80001000);
+    state.trace_file = output;
+    state.trace_frame_limit = 2U;
+
+    porpoise_trace_call_enter(
+        &state,
+        UINT32_C(0x80001000),
+        "lifted",
+        "Trace\"Name");
+    porpoise_trace_approximate(
+        &state,
+        UINT32_C(0x80001004),
+        "mystery");
+    CHECK(state.approximation_count == UINT64_C(1));
+    CHECK(state.first_approximation_address == UINT32_C(0x80001004));
+    CHECK(strcmp(state.first_approximation_mnemonic, "mystery") == 0);
+    porpoise_trace_frame(&state, 0U);
+    CHECK(state.trace_frame_count == 0U);
+    CHECK(state.status == PORPOISE_EXECUTION_RUNNING);
+    porpoise_trace_frame(&state, UINT32_C(0x81234000));
+    CHECK(state.status == PORPOISE_EXECUTION_RUNNING);
+    porpoise_trace_frame(&state, UINT32_C(0x81234000));
+    CHECK(state.status == PORPOISE_EXECUTION_RETURNED);
+    state.status = PORPOISE_EXECUTION_RUNNING;
+    porpoise_state_set_fault(
+        &state,
+        PORPOISE_FAULT_UNSUPPORTED_OPERATION,
+        UINT32_C(0x80001008),
+        "trace test fault");
+    porpoise_trace_call_exit(
+        &state,
+        UINT32_C(0x80001000),
+        "lifted",
+        "Trace\"Name");
+
+    CHECK(fflush(output) == 0);
+    CHECK(fseek(output, 0L, SEEK_SET) == 0);
+    size = fread(contents, 1U, sizeof(contents) - 1U, output);
+    contents[size] = '\0';
+    CHECK(strstr(contents, "\"event\":\"call\"") != NULL);
+    CHECK(strstr(contents, "\"function\":\"Trace\\\"Name\"") != NULL);
+    CHECK(strstr(contents, "\"event\":\"approximate\"") != NULL);
+    CHECK(strstr(
+        contents,
+        "\"event\":\"approximate\",\"pc\":\"0x80001000\","
+        "\"function\":\"Trace\\\"Name\","
+        "\"function_address\":\"0x80001000\"") != NULL);
+    CHECK(strstr(contents, "\"mnemonic\":\"mystery\"") != NULL);
+    CHECK(strstr(contents, "\"event\":\"frame\"") != NULL);
+    CHECK(strstr(contents, "\"frame\":2") != NULL);
+    CHECK(strstr(contents, "\"event\":\"fault\"") != NULL);
+    CHECK(strstr(contents, "\"stack\":[\"0x80001000\"]") != NULL);
+    CHECK(state.trace_call_depth == 0U);
+    porpoise_trace_close(&state);
+    CHECK(state.trace_file == NULL);
+}
+
+static void test_runtime_approximation_gate(void) {
+    PorpoisePpcState state;
+
+    porpoise_state_init(&state, NULL);
+    state.status = PORPOISE_EXECUTION_RUNNING;
+    porpoise_trace_approximate(
+        &state,
+        UINT32_C(0x80002000),
+        "first");
+    CHECK(state.approximation_count == UINT64_C(1));
+    CHECK(state.fault == PORPOISE_FAULT_NONE);
+    CHECK(state.status == PORPOISE_EXECUTION_RUNNING);
+
+    state.reject_approximations = 1;
+    porpoise_trace_approximate(
+        &state,
+        UINT32_C(0x80002004),
+        "second");
+    CHECK(state.approximation_count == UINT64_C(2));
+    CHECK(state.first_approximation_address == UINT32_C(0x80002000));
+    CHECK(strcmp(state.first_approximation_mnemonic, "first") == 0);
+    CHECK(state.fault == PORPOISE_FAULT_UNSUPPORTED_OPERATION);
+    CHECK(state.fault_address == UINT32_C(0x80002004));
+    CHECK(state.status == PORPOISE_EXECUTION_FAULTED);
+    CHECK(strstr(
+              porpoise_state_fault_message(&state),
+              "unreviewed approximate instruction reached: second") != NULL);
+}
+
+static void test_lr_provenance(void) {
+    PorpoisePpcState state;
+
+    porpoise_state_init(&state, NULL);
+    state.lr = UINT32_C(0x80001234);
+    CHECK(porpoise_guest_lr_returns_to_caller(&state));
+    state.lifted_return_stack[0] = UINT32_C(0x80001234);
+    state.lifted_call_depth = 1U;
+    CHECK(porpoise_guest_lr_returns_to_caller(&state));
+    state.lr = UINT32_C(0x80005678);
+    CHECK(!porpoise_guest_lr_returns_to_caller(&state));
+    state.lifted_call_depth = PORPOISE_LIFTED_CALL_STACK_CAPACITY + 1U;
+    CHECK(!porpoise_guest_lr_returns_to_caller(&state));
+}
+
 int main(void) {
     TestMemory memory;
     PorpoiseHostAdapter adapter;
@@ -372,6 +555,10 @@ int main(void) {
     test_fsel();
     test_floating_format_conversions();
     test_raw_fpr_memory();
+    test_runtime_trace();
+    test_runtime_approximation_gate();
+    test_lr_provenance();
+    test_gx_fifo_u8_store();
     porpoise_state_init(&state, &adapter);
     CHECK(state.status == PORPOISE_EXECUTION_READY);
     CHECK(state.fpscr == 0U);

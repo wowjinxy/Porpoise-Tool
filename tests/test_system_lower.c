@@ -381,6 +381,8 @@ static void test_special_resolution_and_emission(void)
         "mtmsr", "r4", x_word(31U, 4U, 0U, 0U, 146U));
     CHECK(instruction.status == PORPOISE_APPROXIMATE);
     emit_text(&instruction, UINT32_C(0x80001004), text, sizeof(text));
+    CHECK(strstr(text, "porpoise_msr_transition_is_exact") != NULL);
+    check_before(text, "porpoise_msr_transition_is_exact", "porpoise_write_msr");
     CHECK(strstr(text, "porpoise_write_msr") != NULL);
 
     instruction = resolve_ok("mtcrf", "0x81, r5", mtcrf_word(5U, 0x81U));

@@ -685,6 +685,46 @@ static bool codewarrior_layout_header(
     return true;
 }
 
+static bool cw_parse_linker_symbol(
+    char *line,
+    const char *module,
+    const char *path,
+    size_t line_number,
+    PorpoiseSymbolCatalog *temporary,
+    PorpoiseMapParser *parser) {
+    char *tokens[3];
+    size_t token_count = split_tokens(line, tokens, 3U);
+    PorpoiseSymbol symbol;
+    uint32_t address;
+    if (token_count != 2U ||
+        !parse_unsigned(tokens[1], 16, false, &address)) {
+        return parser_message(
+            parser, path, line_number, false,
+            "malformed CodeWarrior linker-generated symbol record");
+    }
+    memset(&symbol, 0, sizeof(symbol));
+    if (!initialize_symbol_strings(
+            &symbol, tokens[0], NULL, module, NULL, NULL, path)) {
+        free_symbol(&symbol);
+        return parser_message(
+            parser, path, line_number, true,
+            "out of memory while reading CodeWarrior linker-generated symbol");
+    }
+    symbol.used = true;
+    symbol.has_address = true;
+    symbol.address = address;
+    symbol.kind = PORPOISE_SYMBOL_KIND_LABEL;
+    symbol.scope = PORPOISE_SYMBOL_SCOPE_GLOBAL;
+    symbol.provenance.kind = PORPOISE_SYMBOL_SOURCE_CODEWARRIOR_MAP;
+    symbol.provenance.line = line_number;
+    if (!catalog_accept_symbol(temporary, &symbol, parser)) {
+        free_symbol(&symbol);
+        return !parser->strict &&
+               !porpoise_diagnostics_have_errors(parser->diagnostics);
+    }
+    return true;
+}
+
 int porpoise_symbol_catalog_load_codewarrior(
     PorpoiseSymbolCatalog *catalog,
     const char *map_path,
@@ -700,6 +740,7 @@ int porpoise_symbol_catalog_load_codewarrior(
     size_t line_number = 0U;
     char *section = NULL;
     bool in_layout = false;
+    bool in_linker_symbols = false;
     bool layout_has_header = false;
     bool success = true;
     int read_result;
@@ -749,10 +790,39 @@ int porpoise_symbol_catalog_load_codewarrior(
             free(section);
             section = replacement;
             in_layout = true;
+            in_linker_symbols = false;
             layout_has_header = false;
             continue;
         }
+        porpoise_trim(header_line);
+        if (strcmp(header_line, "Linker generated symbols:") == 0) {
+            free(header_line);
+            in_layout = false;
+            in_linker_symbols = true;
+            continue;
+        }
         free(header_line);
+        if (in_linker_symbols) {
+            record_line = porpoise_strdup(line);
+            if (record_line == NULL) {
+                success = parser_message(
+                    &parser, map_path, line_number, true,
+                    "out of memory while reading CodeWarrior linker-generated symbols");
+                break;
+            }
+            porpoise_trim(record_line);
+            if (record_line[0] == '\0') {
+                free(record_line);
+                in_linker_symbols = false;
+                continue;
+            }
+            success = cw_parse_linker_symbol(
+                record_line, options->module, map_path, line_number,
+                &temporary, &parser);
+            free(record_line);
+            if (!success) break;
+            continue;
+        }
         if (!in_layout) {
             if (!cw_collect_metadata(line, &metadata)) {
                 success = parser_message(

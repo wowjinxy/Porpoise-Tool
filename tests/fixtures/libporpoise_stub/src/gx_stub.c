@@ -18,6 +18,7 @@ static u32 gx_init_last_size;
 static int gx_init_result_kind = PORPOISE_STUB_GX_INIT_TOKEN_RESULT;
 static GXDrawDoneCallback draw_done_callback;
 static unsigned int draw_done_setter_call_count;
+static unsigned int draw_done_call_count;
 static unsigned int copy_filter_call_count;
 static GXBool copy_filter_use_aa;
 static GXBool copy_filter_use_vertical;
@@ -110,6 +111,12 @@ GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback callback)
     draw_done_setter_call_count++;
     draw_done_callback = callback;
     return previous;
+}
+
+void GXDrawDone(void)
+{
+    draw_done_call_count++;
+    if (draw_done_callback != NULL) draw_done_callback();
 }
 
 void GXSetCopyFilter(
@@ -217,6 +224,7 @@ void GXLoadLightObjImm(const GXLightObj *light, GXLightID id)
 void PorpoiseStubGXBoundaryReset(void)
 {
     draw_done_setter_call_count = 0U;
+    draw_done_call_count = 0U;
     copy_filter_call_count = 0U;
     copy_filter_use_aa = GX_FALSE;
     copy_filter_use_vertical = GX_FALSE;
@@ -255,6 +263,11 @@ void PorpoiseStubGXBoundaryReset(void)
 unsigned int PorpoiseStubGXDrawDoneSetterCallCount(void)
 {
     return draw_done_setter_call_count;
+}
+
+unsigned int PorpoiseStubGXDrawDoneCallCount(void)
+{
+    return draw_done_call_count;
 }
 
 void PorpoiseStubGXSetForeignDrawDoneCallback(int enabled)

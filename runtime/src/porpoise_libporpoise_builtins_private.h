@@ -45,6 +45,71 @@ void porpoise_libporpoise_ar_get_size_adapter(
 void porpoise_libporpoise_gx_init_adapter(
     PorpoisePpcState *state);
 
+/* Preserve FIFO order across the lifted/imported boundary. Generated import
+ * wrappers call this before every host contract; empty flushes are no-ops. */
+int porpoise_libporpoise_gx_flush_pending(PorpoisePpcState *state);
+
+/*
+ * Exact gx.a/GXGeometry.c/GXBegin hybrid bridge. Native dirty GX state and
+ * the SDK flush primitive are committed first, but the begin opcode/count is
+ * submitted as one canonical big-endian byte span. Ordinary native GXBegin
+ * must not be used because lifted guest vertex payloads remain canonical.
+ */
+void porpoise_libporpoise_gx_begin_adapter(PorpoisePpcState *state);
+
+/*
+ * Exact gx.a scalar state adapters. These calls must update the native GX
+ * owner created by GXInit; executing their console bodies against lifted
+ * shadow globals would leave libPorpoise's renderer with divergent state.
+ * Every corresponding SDK contract is restricted to one audited
+ * archive/object/symbol identity.
+ */
+void porpoise_libporpoise_gx_clear_vtx_desc_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_vtx_desc_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_vtx_attr_fmt_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_invalidate_vtx_cache_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_num_tex_gens_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_num_chans_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_invalidate_tex_all_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_tev_op_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_tev_order_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_num_tev_stages_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_color_update_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_z_mode_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_pixel_fmt_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_viewport_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_scissor_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_disp_copy_src_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_get_y_scale_factor_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_disp_copy_y_scale_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_gx_set_disp_copy_gamma_adapter(
+    PorpoisePpcState *state);
+
+/* Exact gx.a/GXMisc.c/GXDrawDone binding. The adapter submits only the
+ * canonical PE-finish command so libPorpoise waits for preceding host GPU
+ * work without flushing its unrelated native GX shadow state over the lifted
+ * guest's FIFO state. Queued guest callbacks drain before return. */
+void porpoise_libporpoise_gx_draw_done_adapter(
+    PorpoisePpcState *state);
+
 /*
  * GX frame-buffer boundary adapters require the exact active GX owner.
  * Draw-done callbacks are represented as guest addresses and delivered only
@@ -165,6 +230,45 @@ void porpoise_libporpoise_dvd_get_command_block_status_adapter(
 void porpoise_libporpoise_dvd_cancel_adapter(
     PorpoisePpcState *state);
 
+/*
+ * Bootstrap calls are bound only to their exact audited SDK identities.
+ * OS and DVD validate/reuse the native initialization performed by the title
+ * host. VI and DEMOPad enter their native initialization exactly once.
+ */
+typedef struct PorpoiseLibporpoiseGuestSdkLayoutV1 {
+    uint32_t os_arena_lo_address;
+    uint32_t os_arena_hi_address;
+    uint32_t os_initialized_address;
+    uint32_t os_boot_info_address;
+    uint32_t os_bi2_debug_flag_address;
+    uint32_t dvd_long_file_name_flag_address;
+} PorpoiseLibporpoiseGuestSdkLayoutV1;
+
+/*
+ * Bind addresses generated from the exact os.a/OS.c/OSInit owner and its
+ * parsed data symbols. This private API carries addresses only; it never
+ * embeds title-specific values in the generic adapter. Repeating an identical
+ * binding is allowed, while changing one live title's layout is rejected.
+ */
+PorpoiseHostResult porpoise_libporpoise_bind_guest_sdk_layout_v1(
+    PorpoiseHostAdapter *adapter,
+    const PorpoiseLibporpoiseGuestSdkLayoutV1 *layout);
+
+void porpoise_libporpoise_os_init_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_dvd_init_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_vi_init_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_demo_pad_init_adapter(
+    PorpoisePpcState *state);
+
+/* Exact pad.a/Pad.c/PADRead bridge. The native four-element PADStatus array
+ * is copied into the complete checked 32-bit big-endian guest array; native
+ * structure storage is never exposed to lifted code. */
+void porpoise_libporpoise_pad_read_adapter(
+    PorpoisePpcState *state);
+
 /* Copy a big-endian guest GXRenderModeObj into native host layout before
  * calling libPorpoise's synchronous VIConfigure implementation. */
 void porpoise_libporpoise_vi_configure_adapter(
@@ -174,6 +278,16 @@ void porpoise_libporpoise_vi_configure_adapter(
  * versioned endpoint owns final-mode span validation and VI selection; no
  * decoded host-pointer fallback is permitted. */
 void porpoise_libporpoise_vi_set_next_frame_buffer_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_vi_set_black_adapter(
+    PorpoisePpcState *state);
+void porpoise_libporpoise_vi_flush_adapter(
+    PorpoisePpcState *state);
+
+/* Drive one native retrace. A frame event is emitted only when
+ * libPorpoise's successful host-XFB presentation counter advances; queuing a
+ * framebuffer or merely reaching a retrace never satisfies --frame-limit. */
+void porpoise_libporpoise_vi_wait_for_retrace_adapter(
     PorpoisePpcState *state);
 
 /*

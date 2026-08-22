@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://porpoise.invalid/schema/porpoise-project-v1.json",
+  "$id": "https://porpoise.invalid/schema/porpoise-project-v2.json",
   "title": "Porpoise Recovery Project",
   "type": "object",
   "additionalProperties": false,
@@ -12,7 +12,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": 1
+      "const": 2
     },
     "sdk_catalogs": {
       "type": "array",
@@ -487,6 +487,127 @@
         }
       }
     },
+    "title_startup_function": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "module",
+        "address",
+        "size",
+        "fingerprint",
+        "flags"
+      ],
+      "properties": {
+        "module": {
+          "type": "string"
+        },
+        "address": {
+          "$ref": "#/$defs/uint32"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "flags": {
+          "enum": [0, 1]
+        }
+      }
+    },
+    "title_initial_word": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "address",
+        "value"
+      ],
+      "properties": {
+        "address": {
+          "$ref": "#/$defs/uint32"
+        },
+        "value": {
+          "$ref": "#/$defs/uint32"
+        }
+      }
+    },
+    "title_host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entry_address",
+        "gpr",
+        "arena_lo",
+        "arena_hi",
+        "startup_functions",
+        "initial_words",
+        "initialize_dvd",
+        "input_sha256",
+        "symbol_sources_sha256",
+        "sdk_catalogs_sha256"
+      ],
+      "properties": {
+        "entry_address": {
+          "$ref": "#/$defs/uint32"
+        },
+        "gpr": {
+          "type": "array",
+          "minItems": 32,
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/uint32"
+          }
+        },
+        "arena_lo": {
+          "$ref": "#/$defs/uint32"
+        },
+        "arena_hi": {
+          "$ref": "#/$defs/uint32"
+        },
+        "startup_functions": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/title_startup_function"
+          }
+        },
+        "initial_words": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/title_initial_word"
+          }
+        },
+        "initialize_dvd": {
+          "type": "boolean"
+        },
+        "input_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "symbol_sources_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sdk_catalogs_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
     "target": {
       "type": "object",
       "additionalProperties": false,
@@ -503,6 +624,7 @@
         "skip_list",
         "overrides",
         "annotations",
+        "title_host",
         "cache"
       ],
       "properties": {
@@ -574,6 +696,16 @@
           "items": {
             "$ref": "#/$defs/annotation"
           }
+        },
+        "title_host": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/title_host"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "cache": {
           "oneOf": [

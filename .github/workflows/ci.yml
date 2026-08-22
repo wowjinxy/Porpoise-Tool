@@ -7,7 +7,130 @@ on:
 permissions:
   contents: read
 
+env:
+  LIBPORPOISE_COMPAT_REVISION: 5ac186098a22477d35c8e2dd96d29004cc163047
+
 jobs:
+  libporpoise-compat-linux:
+    name: Pinned libPorpoise compatibility (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: Porpoise-Tool
+      - uses: actions/checkout@v4
+        with:
+          repository: wowjinxy/libPorpoise
+          ref: 5ac186098a22477d35c8e2dd96d29004cc163047
+          path: libPorpoise
+      - name: Install compiler, Meson, Ninja, and SDL headers
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          gcc
+          g++
+          meson
+          ninja-build
+          libsdl2-dev
+      - name: Verify pinned dependency identity
+        run: >-
+          test "$(git -C libPorpoise rev-parse HEAD)" =
+          "$LIBPORPOISE_COMPAT_REVISION"
+      - name: Check generated runtime compatibility
+        run: >-
+          python3 Porpoise-Tool/tools/check_libporpoise_compat.py
+          libPorpoise
+          --source-root Porpoise-Tool
+          --target linux
+          --c-arg=-Wno-error=pointer-arith
+          --cxx g++
+          --cc gcc
+      - name: Configure real libPorpoise Build/Run smoke
+        run: >-
+          CC=gcc CXX=g++ meson setup Porpoise-Tool/build-real-lib-smoke
+          Porpoise-Tool
+          --werror
+          -Dlibporpoise_compat_path="$(realpath libPorpoise)"
+      - name: Compile real libPorpoise Build/Run smoke
+        run: >-
+          meson compile -C Porpoise-Tool/build-real-lib-smoke
+          test_libporpoise_build_run_smoke
+      - name: Run real libPorpoise Build/Run smoke
+        run: >-
+          meson test -C Porpoise-Tool/build-real-lib-smoke
+          --print-errorlogs
+          libporpoise-real-build-run-smoke
+
+  libporpoise-compat-windows:
+    name: Pinned libPorpoise compatibility (Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: Porpoise-Tool
+      - uses: actions/checkout@v4
+        with:
+          repository: wowjinxy/libPorpoise
+          ref: 5ac186098a22477d35c8e2dd96d29004cc163047
+          path: libPorpoise
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-SDL2
+      - name: Verify pinned dependency identity
+        run: |
+          test "$(git -C libPorpoise rev-parse HEAD)" = \
+            "$LIBPORPOISE_COMPAT_REVISION"
+          test -z "$(git -C libPorpoise ls-tree -r --name-only HEAD -- msys2)"
+          test -z "$(git -C libPorpoise status --porcelain)"
+          test ! -e libPorpoise/msys2
+      - name: Bind CI-provided Windows dependencies
+        run: |
+          mkdir libPorpoise/msys2
+          export PORPOISE_UCRT_LINK="$(cygpath -w "$PWD/libPorpoise/msys2/ucrt64")"
+          export PORPOISE_MINGW_ROOT="$(cygpath -w /mingw64)"
+          powershell.exe -NoProfile -NonInteractive -Command \
+            '$null = New-Item -ItemType Junction -Path $env:PORPOISE_UCRT_LINK -Target $env:PORPOISE_MINGW_ROOT'
+          test -f libPorpoise/msys2/ucrt64/include/SDL2/SDL.h
+          test -f libPorpoise/msys2/ucrt64/lib/libSDL2.dll.a
+          test -f libPorpoise/msys2/ucrt64/bin/SDL2.dll
+          test -z "$(git -C libPorpoise diff --name-only)"
+      - name: Check generated runtime compatibility
+        run: >-
+          python Porpoise-Tool/tools/check_libporpoise_compat.py
+          libPorpoise
+          --source-root Porpoise-Tool
+          --target win64
+          --c-arg=-Wno-error=pointer-arith
+          --cxx /mingw64/bin/g++.exe
+          --cc /mingw64/bin/gcc.exe
+      - name: Configure real libPorpoise Build/Run smoke
+        run: |
+          LIBPORPOISE_PATH="$(cygpath -m "$PWD/libPorpoise")"
+          CC=/mingw64/bin/gcc.exe CXX=/mingw64/bin/g++.exe \
+            meson setup Porpoise-Tool/build-real-lib-smoke \
+            Porpoise-Tool \
+            --werror \
+            "-Dlibporpoise_compat_path=$LIBPORPOISE_PATH"
+      - name: Compile real libPorpoise Build/Run smoke
+        run: >-
+          meson compile -C Porpoise-Tool/build-real-lib-smoke
+          test_libporpoise_build_run_smoke
+      - name: Run real libPorpoise Build/Run smoke
+        run: >-
+          meson test -C Porpoise-Tool/build-real-lib-smoke
+          --print-errorlogs
+          libporpoise-real-build-run-smoke
+
   linux-gcc:
     name: Linux (GCC)
     runs-on: ubuntu-latest

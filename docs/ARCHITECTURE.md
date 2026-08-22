@@ -121,6 +121,34 @@ The registry is emitted as a small deterministic router plus high-16-bit address
 
 The raw address dispatcher, its target types, and every per-input lifted declaration are generated beneath `src/` and remain private to the static-library build. Consumers bind the generated dispatcher only through `porpoise_generated_bind(PorpoiseHostAdapter *)`, declared by the public `porpoise_generated.h`. The facade performs the one-time/idempotent binding to `porpoise_libporpoise_run_guest`; neither generated `DolphinMain` nor a dependency consumer receives a declaration that can bypass that serialized boundary.
 
+### Paired-single arithmetic boundary
+
+Lifted `ps_muls0`, `ps_muls1`, `ps_madds0`, and `ps_madds1` execute through
+the Tool-owned PPC runtime rather than host `float` expressions or SDK
+matrix replacements. `runtime/src/porpoise_ppc_fp.c` is the host-FP-independent
+arithmetic core: it accepts raw binary32 encodings, forms the complete exact
+multiply or fused multiply-add with integer arithmetic, and rounds once at the
+Gekko paired-single destination boundary. It models all four FPSCR rounding
+modes, NaN selection and invalid causes, infinities, signed zero, subnormal
+operands/results, NI flushing, and enabled overflow/underflow exponent
+adjustment. No C floating-point environment, contraction setting, or extended
+precision can alter this layer.
+
+`porpoise_lifted.c` is the architectural wrapper. It selects the scalar lane,
+evaluates both destination lanes before committing either one, applies FPSCR
+cause/status and ps0 FPRF rules, honors record-form CR1 updates, suppresses the
+destination for enabled invalid operations, and stops explicitly when an
+enabled exception requires the not-yet-modeled guest program-exception vector.
+The wrapper's defined input domain is a valid paired-single value produced as
+two widened binary32 lanes. Gekko declares mixing paired-single and arbitrary
+double-precision register contents a programming error; the runtime reports
+that boundary instead of silently evaluating it with host arithmetic.
+
+SDK routines such as a lifted `PSMTXConcat` stay untouched and exercise these
+same instruction primitives. A future exact import for such a routine must use
+the same primitives so optimization cannot introduce a different arithmetic
+contract.
+
 ## Guest memory and pointer model
 
 Guest addresses remain `uint32_t` throughout generated code. The lifted runtime never adds a fake 256 MiB allocation or converts an address with a native pointer cast.
@@ -455,18 +483,22 @@ Unsupported instructions are recorded while lowering the temporary stage, but fa
 
 ## Testing and supported hosts
 
-The repository test suite covers runtime endian/address/fault behavior, raw scalar and paired floating-point state, quantized paired loads/stores, system-event callbacks, deferred ARQ and GX callback ordering, GX process ownership, fixed-object endian marshalling, authoritative guest-address copy rejection, exact VI XFB selection, CLI/config and atomic-output contracts, malformed and nested inputs, strict approximations, deterministic generation, title-runtime ordering and one-shot DVD configuration, and generated static-library/executable builds against a stable `libPorpoise` contract stub.
+The repository test suite covers runtime endian/address/fault behavior, raw scalar and paired floating-point state, exact raw-bit paired multiply/fused-multiply-add vectors and exception modes, quantized paired loads/stores, system-event callbacks, deferred ARQ and GX callback ordering, GX process ownership, fixed-object endian marshalling, authoritative guest-address copy rejection, exact VI XFB selection, CLI/config and atomic-output contracts, malformed and nested inputs, strict approximations, deterministic generation, title-runtime ordering and one-shot DVD configuration, and generated static-library/executable builds against a stable `libPorpoise` contract stub.
 
 CI targets:
 
 - Ubuntu with GCC, including ASan/UBSan and Cppcheck;
 - Windows with MSYS2 MinGW-w64 GCC.
 
-A local Meson option enables a read-only compatibility smoke test against a
-user-supplied `libPorpoise` checkout. The checker compiles temporary strict-C99
-consumer probes without configuring or building in the checkout and reports
-the currently required GX enum, canonical-byte, host-array, and versioned GX
-copy destination contracts one by one. The evolving checkout is opt-in
+A local Meson option enables two external compatibility gates against a
+user-supplied `libPorpoise` checkout. The compile-interface checker builds
+temporary strict-C99 consumer probes and reports the currently required GX
+enum, canonical-byte, host-array, and versioned GX copy destination contracts
+one by one. A second synthetic gate drives the same shared Build/Run core used
+by the CLI and GUI, links mixed C/C++ and stable libPorpoise arena symbols,
+requires a versioned guest `OK` status, verifies cache reuse, and reruns the
+cached executable. Both gates leave dependency source unchanged, and neither
+is present in a normal fixture-only test setup. The evolving checkout is opt-in
 rather than a blocking default dependency. macOS and MSVC are not currently
 supported claims.
 

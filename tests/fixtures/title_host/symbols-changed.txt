@@ -1,0 +1,9 @@
+main = .text:0x80001000; // type:function size:0x4 scope:global align:4
+__OSThreadInit = .text:0x80002000; // type:function size:0x4 scope:global align:4
+__init_user = .text:0x80003000; // type:function size:0x4 scope:global align:4
+DVDInit = .text:0x80004004; // type:function size:0x4 scope:global align:4
+_stack_addr = .bss:0x80008008; // type:label scope:global
+_SDA2_BASE_ = .sdata2:0x8000A000; // type:label scope:global
+_SDA_BASE_ = .sdata:0x80009000; // type:label scope:global
+__ArenaLo = .bss:0x80010000; // type:label scope:global
+__ArenaHi = .bss:0x81700000; // type:label scope:global

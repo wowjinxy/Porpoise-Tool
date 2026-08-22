@@ -37,6 +37,7 @@
 #define TEST_MAIN_SECOND_SRR0 UINT32_C(0x85678000)
 #define TEST_MAIN_SECOND_SRR1 UINT32_C(0x00002000)
 #define TEST_CURRENT_CONTEXT UINT32_C(0x800000D4)
+#define TEST_CURRENT_FPU_CONTEXT UINT32_C(0x800000D8)
 #define TEST_CURRENT_THREAD UINT32_C(0x800000E4)
 #define TEST_STACK_MAGIC UINT32_C(0xDEADBABE)
 #define TEST_RETURN_VALUE UINT32_C(0xC0DEC0DE)
@@ -248,6 +249,8 @@ static void initialize_guest_threads(PorpoiseHostAdapter *host)
     write_be_u32(word, TEST_MAIN_THREAD);
     store_bytes(host, TEST_CURRENT_CONTEXT, word, sizeof(word));
     store_bytes(host, TEST_CURRENT_THREAD, word, sizeof(word));
+    write_be_u32(word, 0U);
+    store_bytes(host, TEST_CURRENT_FPU_CONTEXT, word, sizeof(word));
 }
 
 static void check_guest_word(
@@ -265,8 +268,13 @@ int main(void)
     PorpoiseHostAdapter host;
     PorpoisePpcState state;
     uint8_t child_thread[TEST_THREAD_SIZE];
+    uint8_t word[4];
+    uint64_t preserved_fpr0_lane0;
+    uint64_t preserved_fpr0_lane1;
+    uint32_t preserved_fpscr;
 
     memset(&host, 0, sizeof(host));
+    CHECK(porpoise_libporpoise_has_host_thread_carrier_v1());
     PorpoiseStubDispatchReset();
     PorpoiseThreadCarrierStubResetObservers();
     CHECK(PorpoiseStubDispatchAddAddress(TEST_MAIN_RESUME));
@@ -284,8 +292,45 @@ int main(void)
     state.pc = TEST_MAIN_RESUME;
     state.srr0 = TEST_MAIN_SRR0;
     state.srr1 = TEST_MAIN_SRR1;
+    state.fpr[0].lane_bits[0] = UINT64_C(0x3FF0000000000000);
+    state.fpr[0].lane_bits[1] = UINT64_C(0x4000000000000000);
+    state.fpscr = UINT32_C(0x12345678);
+    preserved_fpr0_lane0 = state.fpr[0].lane_bits[0];
+    preserved_fpr0_lane1 = state.fpr[0].lane_bits[1];
+    preserved_fpscr = state.fpscr;
+
+    /* A different non-null FPU owner is incoherent at initial main-thread
+     * binding and must fail without changing either guest word. */
+    write_be_u32(word, TEST_CHILD_THREAD);
+    store_bytes(&host, TEST_CURRENT_FPU_CONTEXT, word, sizeof(word));
+    CHECK(porpoise_libporpoise_bind_guest_main_thread(&state) ==
+          PORPOISE_HOST_INVALID_ARGUMENT);
+    CHECK(porpoise_state_has_fault(&state));
+    CHECK(strstr(
+              porpoise_state_fault_message(&state),
+              "conflicting owner") != NULL);
+    check_guest_word(&host, TEST_CURRENT_FPU_CONTEXT, TEST_CHILD_THREAD);
+    check_guest_word(
+        &host,
+        TEST_MAIN_THREAD + TEST_CONTEXT_SRR1_OFFSET,
+        0U);
+    CHECK((state.msr & PORPOISE_MSR_FP) == 0U);
+    porpoise_state_clear_fault(&state);
+    state.status = PORPOISE_EXECUTION_RUNNING;
+    write_be_u32(word, 0U);
+    store_bytes(&host, TEST_CURRENT_FPU_CONTEXT, word, sizeof(word));
+
     CHECK(porpoise_libporpoise_bind_guest_main_thread(&state) ==
           PORPOISE_HOST_OK);
+    CHECK((state.msr & PORPOISE_MSR_FP) != 0U);
+    CHECK(state.fpr[0].lane_bits[0] == preserved_fpr0_lane0);
+    CHECK(state.fpr[0].lane_bits[1] == preserved_fpr0_lane1);
+    CHECK(state.fpscr == preserved_fpscr);
+    check_guest_word(&host, TEST_CURRENT_FPU_CONTEXT, TEST_MAIN_THREAD);
+    check_guest_word(
+        &host,
+        TEST_MAIN_THREAD + TEST_CONTEXT_SRR1_OFFSET,
+        PORPOISE_MSR_FP);
     porpoise_libporpoise_os_get_current_thread_adapter(&state);
     CHECK(!porpoise_state_has_fault(&state));
     CHECK(state.gpr[3] == TEST_MAIN_THREAD);

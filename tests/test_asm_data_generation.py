@@ -172,6 +172,172 @@ with tempfile.TemporaryDirectory(
     )
     run(executable, cwd=generated)
 
+    jump_generated = temporary / "address-taken-generated"
+    run(
+        TOOL,
+        FIXTURES / "inputs" / "address_taken_jump_table",
+        "--output",
+        jump_generated,
+    )
+    jump_source = (
+        jump_generated / "src" / "lifted" / "code.c"
+    ).read_text(encoding="utf-8")
+    registry_source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(
+            (jump_generated / "src").glob("porpoise_function_registry_*.c")
+        )
+    )
+    # The first table destination is deliberately duplicated.  It must still
+    # produce exactly one resume case and one global registry entry.
+    assert jump_source.count("case UINT32_C(0x80008014)") == 1
+    assert jump_source.count("case UINT32_C(0x8000801C)") == 1
+    assert registry_source.count("case UINT32_C(0x80008014)") == 1
+    assert registry_source.count("case UINT32_C(0x8000801C)") == 1
+
+    jump_harness = jump_generated / "tests" / "address_taken_harness.c"
+    jump_harness.parent.mkdir(parents=True)
+    jump_harness.write_text(
+        "#include <stdint.h>\n"
+        "#include <stdlib.h>\n"
+        "#include <porpoise_generated.h>\n"
+        "#include \"porpoise_data_private.h\"\n"
+        "#include \"porpoise_dispatch_private.h\"\n"
+        "#define CHECK(condition) do { if (!(condition)) abort(); } while (0)\n"
+        "static void run_case(PorpoisePpcState *state, uint32_t index, uint32_t expected) {\n"
+        "  state->gpr[3] = index;\n"
+        "  CHECK(porpoise_call_address(state, UINT32_C(0x80008000)));\n"
+        "  CHECK(!porpoise_state_has_fault(state));\n"
+        "  CHECK(state->gpr[3] == expected);\n"
+        "}\n"
+        "int main(void) {\n"
+        "  PorpoiseHostAdapter host;\n"
+        "  PorpoisePpcState state;\n"
+        "  CHECK(porpoise_libporpoise_adapter_init(&host) == PORPOISE_HOST_OK);\n"
+        "  CHECK(porpoise_generated_bind(&host) == PORPOISE_HOST_OK);\n"
+        "  porpoise_state_init(&state, &host);\n"
+        "  porpoise_initialize_data(&state);\n"
+        "  CHECK(!porpoise_state_has_fault(&state));\n"
+        "  run_case(&state, UINT32_C(0), UINT32_C(17));\n"
+        "  run_case(&state, UINT32_C(1), UINT32_C(17));\n"
+        "  run_case(&state, UINT32_C(2), UINT32_C(34));\n"
+        "  porpoise_libporpoise_adapter_shutdown(&host);\n"
+        "  return 0;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    with (jump_generated / "meson.build").open("a", encoding="utf-8") as meson_file:
+        meson_file.write(
+            "\naddress_taken_harness = executable(\n"
+            "  'address_taken_harness',\n"
+            "  'tests/address_taken_harness.c',\n"
+            "  dependencies: porpoise_lifted_dep,\n"
+            "  include_directories: include_directories('src'),\n"
+            ")\n"
+        )
+    add_stub(jump_generated)
+    run(
+        "meson",
+        "setup",
+        "build",
+        "--wrap-mode=forcefallback",
+        *CHILD_MESON_ARGS,
+        cwd=jump_generated,
+    )
+    run("meson", "compile", "-C", "build", cwd=jump_generated)
+    jump_executable = jump_generated / "build" / (
+        "address_taken_harness.exe"
+        if os.name == "nt"
+        else "address_taken_harness"
+    )
+    run(jump_executable, cwd=jump_generated)
+
+    invalid_fixups = {
+        "misaligned": (
+            "/* 80009000 00000000  4E 80 00 20 */ blr\n",
+            "jump_owner+0x1",
+            "misaligned code address",
+        ),
+        "out-of-range": (
+            "/* 80009000 00000000  4E 80 00 20 */ blr\n",
+            "jump_owner+0x4",
+            "outside its owning function",
+        ),
+        "not-an-instruction": (
+            "/* 80009000 00000000  60 00 00 00 */ nop\n"
+            "/* 80009008 00000008  4E 80 00 20 */ blr\n",
+            "jump_owner+0x4",
+            "does not resolve to a real instruction",
+        ),
+    }
+    for case_name, (instructions, expression, expected_message) in invalid_fixups.items():
+        invalid = temporary / f"invalid-address-taken-{case_name}.s"
+        invalid.write_text(
+            ".text\n"
+            ".fn jump_owner, global\n"
+            f"{instructions}"
+            ".endfn jump_owner\n"
+            "# 0x80011000..0x80011004 | size: 0x4\n"
+            ".data\n"
+            "# .data:0x0 | 0x80011000 | size: 0x4\n"
+            ".obj bad_jump_table, global\n"
+            f"  .4byte {expression}\n"
+            ".endobj bad_jump_table\n",
+            encoding="utf-8",
+        )
+        invalid_result = run(
+            TOOL,
+            invalid,
+            "--output",
+            temporary / f"invalid-address-taken-{case_name}-output",
+            expected=3,
+        )
+        assert expected_message in invalid_result.stderr
+
+    jump_skip_list = temporary / "address-taken-skip.txt"
+    jump_skip_list.write_text("jump_dispatch\n", encoding="utf-8")
+    omitted_result = run(
+        TOOL,
+        FIXTURES / "inputs" / "address_taken_jump_table",
+        "--output",
+        temporary / "address-taken-omitted-output",
+        "--skip-list",
+        jump_skip_list,
+        expected=3,
+    )
+    assert "interior entry points must remain lifted" in omitted_result.stderr
+
+    jump_abi = temporary / "address-taken-import.json"
+    jump_abi.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "functions": [
+                    {
+                        "kind": "import",
+                        "symbol": "jump_dispatch",
+                        "header": "porpoise/stub.h",
+                        "return": {"type": "void"},
+                        "arguments": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    imported_result = run(
+        TOOL,
+        FIXTURES / "inputs" / "address_taken_jump_table",
+        "--output",
+        temporary / "address-taken-imported-output",
+        "--skip-list",
+        jump_skip_list,
+        "--abi",
+        jump_abi,
+        expected=3,
+    )
+    assert "interior entry points must remain lifted" in imported_result.stderr
+
     unresolved = temporary / "unresolved.s"
     unresolved.write_text(
         "# 0x80011000..0x80011004 | size: 0x4\n"

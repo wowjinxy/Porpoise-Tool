@@ -1,0 +1,3 @@
+option('build_target', type: 'combo', choices: ['win64', 'linux'], value: 'linux')
+option('tests', type: 'feature', value: 'disabled')
+option('benchmarks', type: 'feature', value: 'disabled')

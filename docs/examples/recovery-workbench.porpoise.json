@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "sdk_catalogs": [
     "catalogs/local-sdk.json"
   ],
@@ -28,6 +28,7 @@
       "skip_list": null,
       "overrides": [],
       "annotations": [],
+      "title_host": null,
       "cache": null
     },
     {
@@ -51,6 +52,7 @@
       "skip_list": null,
       "overrides": [],
       "annotations": [],
+      "title_host": null,
       "cache": null
     }
   ]

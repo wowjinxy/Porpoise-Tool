@@ -8,7 +8,26 @@
 extern "C" {
 #endif
 
-#define PORPOISE_RECOVERY_PROJECT_SCHEMA_VERSION 1U
+#define PORPOISE_RECOVERY_PROJECT_SCHEMA_VERSION 2U
+#define PORPOISE_RECOVERY_PROJECT_LEGACY_SCHEMA_VERSION 1U
+
+/* Schema-v1 accepted every nonempty JSON string as a target id. Preserve that
+ * contract while deriving a portable filesystem component whenever an id is
+ * used below .porpoise-build. Simple portable IDs remain readable; other IDs
+ * receive an opaque SHA-256 key. */
+bool porpoise_recovery_target_id_is_valid(const char *id);
+#define PORPOISE_RECOVERY_TARGET_CACHE_KEY_SIZE 72U
+bool porpoise_recovery_target_cache_key(
+    const char *id,
+    char output[PORPOISE_RECOVERY_TARGET_CACHE_KEY_SIZE]);
+
+#define PORPOISE_RECOVERY_TITLE_HOST_GPR_COUNT 32U
+#define PORPOISE_RECOVERY_TITLE_HOST_STARTUP_FUNCTION_CAPACITY 8U
+#define PORPOISE_RECOVERY_TITLE_HOST_INITIAL_WORD_CAPACITY 16U
+#define PORPOISE_RECOVERY_TITLE_STARTUP_ESTABLISH_GUEST_MAIN_THREAD_AFTER \
+    UINT32_C(0x00000001)
+#define PORPOISE_RECOVERY_TITLE_STARTUP_KNOWN_FLAGS \
+    PORPOISE_RECOVERY_TITLE_STARTUP_ESTABLISH_GUEST_MAIN_THREAD_AFTER
 
 /*
  * Paths retain the spelling read from the project while also exposing the
@@ -102,6 +121,46 @@ typedef struct PorpoiseRecoveryTargetCache {
     size_t match_count;
 } PorpoiseRecoveryTargetCache;
 
+/*
+ * Portable, reviewed bootstrap metadata for a direct lifted title entry.
+ * Function fingerprints are relocation-aware canonical SHA-256 identities.
+ * The provenance digests bind the review to the symbol/catalog evidence used
+ * to derive it. A provenance digest is NULL exactly when that optional
+ * evidence class was absent; inferred profiles capture every loaded evidence
+ * class and Build/Run validation rejects appearance, disappearance, or a
+ * semantic identity change. Machine-local runtime paths never belong in this
+ * structure.
+ */
+typedef struct PorpoiseRecoveryTitleStartupFunction {
+    char *module;
+    uint32_t address;
+    uint32_t size;
+    char *normalized_fingerprint;
+    uint32_t flags;
+} PorpoiseRecoveryTitleStartupFunction;
+
+typedef struct PorpoiseRecoveryTitleInitialWord {
+    uint32_t address;
+    uint32_t value;
+} PorpoiseRecoveryTitleInitialWord;
+
+typedef struct PorpoiseRecoveryTitleHostProfile {
+    uint32_t entry_address;
+    uint32_t gpr[PORPOISE_RECOVERY_TITLE_HOST_GPR_COUNT];
+    uint32_t arena_lo;
+    uint32_t arena_hi;
+    PorpoiseRecoveryTitleStartupFunction startup_functions[
+        PORPOISE_RECOVERY_TITLE_HOST_STARTUP_FUNCTION_CAPACITY];
+    size_t startup_function_count;
+    PorpoiseRecoveryTitleInitialWord initial_words[
+        PORPOISE_RECOVERY_TITLE_HOST_INITIAL_WORD_CAPACITY];
+    size_t initial_word_count;
+    bool initialize_dvd;
+    char *input_sha256;
+    char *symbol_sources_sha256;
+    char *sdk_catalogs_sha256;
+} PorpoiseRecoveryTitleHostProfile;
+
 typedef struct PorpoiseRecoveryTarget {
     char *id;
     bool enabled;
@@ -122,6 +181,8 @@ typedef struct PorpoiseRecoveryTarget {
     PorpoiseRecoveryAnnotation *annotations;
     size_t annotation_count;
     PorpoiseRecoveryTargetCache cache;
+    PorpoiseRecoveryTitleHostProfile title_host;
+    bool has_title_host;
 } PorpoiseRecoveryTarget;
 
 typedef struct PorpoiseRecoveryProject {
@@ -146,7 +207,8 @@ int porpoise_recovery_project_load(
     PorpoiseDiagnostics *diagnostics);
 
 /*
- * Write canonical schema-v1 JSON. Paths are rebased against path when both
+ * Write canonical schema-v2 JSON. A schema-v1 project loaded into memory is
+ * migrated on save. Paths are rebased against path when both
  * locations share a volume/root; foreign or cross-volume paths stay absolute.
  * Serialization is completed in an adjacent file before an atomic filesystem
  * replacement, so a failed save leaves an existing project unchanged.

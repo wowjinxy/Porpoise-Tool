@@ -1,8 +1,10 @@
 # Recovery project files and CLI
 
 A `.porpoise.json` file is the durable, authoritative description of a recovery
-workspace. Schema version 1 has shared SDK/ABI inputs and one or more named
-targets. Parsing is strict: unknown or duplicate keys, missing required keys,
+workspace. Schema version 2 adds reviewed title-host bootstrap profiles to the
+shared SDK/ABI inputs and named targets introduced by version 1. Version 1
+projects remain readable and are migrated to canonical version 2 when saved.
+Parsing is strict: unknown or duplicate keys, missing required keys,
 wrong JSON types, malformed UTF-8/escapes, noncanonical hashes, and trailing
 content are errors.
 
@@ -17,7 +19,7 @@ All four root keys are required, even when an array is empty:
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer `1` | Project format version. |
+| `schema_version` | integer `2` | Project format version. Version 1 is accepted only as a legacy input. |
 | `sdk_catalogs` | path array | Additive exact SDK catalogs, in load order. |
 | `abi_contracts` | path array | Additive ABI manifests, in load order. Exact duplicate contracts coalesce; incompatible duplicates fail. |
 | `targets` | target array | Named recovery targets. IDs must be unique. |
@@ -28,7 +30,7 @@ Every target key is required. Use `null` or an empty array where appropriate.
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `id` | nonempty string | Stable target identity and `--target` selector. |
+| `id` | nonempty string | Stable logical target identity and `--target` selector. Unsafe/path-like schema-v1 IDs receive a SHA-256-based managed-cache key; ordinary portable IDs remain readable. |
 | `enabled` | boolean | Included by an unqualified project run. An explicit selector may run a disabled target. |
 | `source_kind` | enum | `assembly`, `managed_elf`, or `dtk_prepared_assembly`. |
 | `input` | path | Source file/tree or ELF. |
@@ -40,6 +42,7 @@ Every target key is required. Use `null` or an empty array where appropriate.
 | `skip_list` | path or `null` | Existing exact-symbol skip list. |
 | `overrides` | array | Stable reviewed function decisions. |
 | `annotations` | array | Stable read-only interpretations of existing bytes. |
+| `title_host` | object or `null` | Reviewed direct-entry bootstrap profile used by Build/Run. |
 | `cache` | object or `null` | Compact, non-authoritative dependency/match cache. |
 
 A symbol source requires `kind` and `path`. Its nullable `auxiliary_path`,
@@ -49,6 +52,31 @@ record loading. `kind` is `codewarrior_map` or `dtk_symbols`. A CodeWarrior
 source cannot have a non-null auxiliary path; for DTK it is the optional paired
 `splits.txt`. The empty module denotes the main/unnamed module. See [Symbol
 maps](SYMBOL_MAPS.md).
+
+## Title-host profile
+
+`title_host` is `null` until a direct-entry bootstrap has been reviewed. A
+profile records the entry address, exactly 32 GPR values, optional arena bounds,
+up to eight ordered startup-function locators, up to sixteen initial guest
+words, native DVD initialization intent, the input SHA-256, and optional
+canonical symbol/catalog provenance digests. Startup locators contain module, address,
+size, relocation-aware fingerprint, and flags. Flag `1` requests guest-main-
+thread binding after that initializer.
+
+Build/Run validation requires aligned nonzero `r1`, nonzero `r2` and `r13`, a
+current input digest, a lifted entry at the recorded address, and every startup
+locator to retain its fingerprint and `Lift` action. Stale bootstrap metadata
+blocks Build/Run but does not block Analyze. Generated title-host code reads the
+machine-local DVD directory only from `PORPOISE_DVD_ROOT`; absolute machine
+paths are never written into the project.
+
+The inference API recognizes only the standard CodeWarrior evidence set:
+`_stack_addr`, `_SDA2_BASE_`, `_SDA_BASE_`, `__ArenaLo`, `__ArenaHi`, a lifted
+`__OSThreadInit`, and a lifted `__init_user`. It derives the conventional
+eight-byte direct-main frame and its two sentinel words, then leaves native DVD
+initialization disabled for review. Missing, ambiguous, imported, or omitted
+evidence produces a precise blocker and leaves the prior profile untouched;
+the tool never guesses replacement addresses.
 
 ## Paths
 

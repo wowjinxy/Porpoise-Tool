@@ -45,6 +45,14 @@ typedef enum PorpoiseVerbosity {
 typedef struct PorpoiseOptions {
     char project_path[PORPOISE_PATH_CAPACITY];
     char dtk_path[PORPOISE_PATH_CAPACITY];
+    char libporpoise_path[PORPOISE_PATH_CAPACITY];
+    char meson_path[PORPOISE_PATH_CAPACITY];
+    char cc_path[PORPOISE_PATH_CAPACITY];
+    char cxx_path[PORPOISE_PATH_CAPACITY];
+    char dvd_root_path[PORPOISE_PATH_CAPACITY];
+    char trace_path[PORPOISE_PATH_CAPACITY];
+    char build_type[32];
+    size_t frame_limit;
     char target_ids[PORPOISE_TARGET_SELECTOR_LIMIT][PORPOISE_NAME_CAPACITY];
     size_t target_id_count;
     char report_path[PORPOISE_PATH_CAPACITY];
@@ -62,6 +70,8 @@ typedef struct PorpoiseOptions {
     PorpoiseSdkPolicy sdk_policy;
     PorpoiseVerbosity verbosity;
     bool analyze_only;
+    bool build;
+    bool run;
     bool force;
     bool strict;
     bool show_help;

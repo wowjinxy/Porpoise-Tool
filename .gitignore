@@ -14,6 +14,12 @@
 *.dll
 *.dylib
 
+# Tiny text fixtures used to exercise Windows dependency discovery/staging.
+!tests/fixtures/build_core/libPorpoise/msys2/ucrt64/bin/SDL2.dll
+!tests/fixtures/build_core/libPorpoise/msys2/ucrt64/lib/libSDL2.dll.a
+!tests/fixtures/build_core/libPorpoise/msys2/ucrt64/lib/libSDL2.a
+!tests/fixtures/build_core/libPorpoise/msys2/ucrt64/lib/libmingw32.a
+
 # Python test artifacts
 __pycache__/
 *.py[cod]
@@ -23,6 +29,7 @@ __pycache__/
 .*.porpoise-backup-*
 .*.porpoise-journal-*
 .porpoise-cache/
+.porpoise-build/
 .porpoise-autosave.json
 
 # Editor/IDE files

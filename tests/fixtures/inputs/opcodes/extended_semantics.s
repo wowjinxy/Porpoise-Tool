@@ -588,6 +588,13 @@ counter_zero_branch_done:
 /* 80006E8C 00000E8C  4E 80 00 20 */ blr
 .endfn absolute_link_branch_semantics
 
+.global gx_fifo_u8_fast_path_semantics
+.fn gx_fifo_u8_fast_path_semantics, global
+/* 80006EA0 00000EA0  98 7F 80 00 */ stb r3, -0x8000(r31)
+/* 80006EA4 00000EA4  98 9F 80 01 */ stb r4, -0x7fff(r31)
+/* 80006EA8 00000EA8  4E 80 00 20 */ blr
+.endfn gx_fifo_u8_fast_path_semantics
+
 .global absolute_branch_target
 .fn absolute_branch_target, global
 /* 00000060 00000060  38 C0 00 33 */ li r6, 0x33

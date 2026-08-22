@@ -2,7 +2,7 @@ option(
   'libporpoise_compat_path',
   type: 'string',
   value: '',
-  description: 'Opt-in path to a user-supplied libPorpoise checkout for a read-only compile-interface compatibility smoke test',
+  description: 'Opt-in path to a user-supplied libPorpoise checkout for read-only compile-interface and shared Build/Run compatibility smoke tests',
 )
 
 option(

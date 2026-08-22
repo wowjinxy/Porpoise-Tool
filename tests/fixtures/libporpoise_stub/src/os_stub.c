@@ -2,6 +2,7 @@
 #include <dolphin/ar.h>
 #include <dolphin/dsp.h>
 #include <dolphin/dvd.h>
+#include <dolphin/pad.h>
 #include <dolphin/vi.h>
 #include <porpoise/stub.h>
 #include <simulator/sim_gx_CommandProcessor.h>
@@ -51,6 +52,11 @@ static u8 stub_memory[STUB_MEMORY_SIZE];
 #endif
 static u8 native_pointer_bytes[OS_HOST_ADDRESS_TOKEN_SLOT_COUNT + 1U];
 static unsigned int os_init_count;
+static unsigned int pad_init_count;
+static unsigned int demo_pad_init_count;
+static unsigned int pad_read_count;
+static PADStatus pad_read_status[PAD_MAX_CONTROLLERS];
+static u32 pad_read_motor_mask;
 static __thread BOOL interrupts_enabled = TRUE;
 static pthread_mutex_t interrupt_execution_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t interrupt_observer_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -94,16 +100,25 @@ static DVDFileInfo *dvd_last_open_file_info;
 static DVDFileInfo *dvd_last_read_file_info;
 static BOOL gx_fifo_accept = TRUE;
 static unsigned int gx_fifo_call_count;
+static unsigned int gx_fifo_queued_call_count;
+static unsigned int gx_fifo_synchronous_call_count;
 static unsigned int gx_fifo_call_sizes[STUB_GX_FIFO_MAX_CALLS];
 static unsigned int gx_fifo_byte_count;
 static u8 gx_fifo_bytes[STUB_GX_FIFO_MAX_BYTES];
 static unsigned int gx_numeric_write_count;
 static unsigned int vi_configure_count;
+static unsigned int vi_init_count;
 static GXRenderModeObj vi_last_render_mode;
 static unsigned int vi_set_next_frame_buffer_call_count;
 static u32 vi_next_frame_buffer_guest_address;
 static u32 vi_pending_frame_buffer_guest_address;
+static u32 vi_current_frame_buffer_guest_address;
 static BOOL vi_set_next_frame_buffer_result = TRUE;
+static unsigned int vi_wait_for_retrace_call_count;
+static uint64_t vi_presentation_count;
+static unsigned int vi_set_black_call_count;
+static BOOL vi_black;
+static unsigned int vi_flush_call_count;
 static ARDMAResult ar_dma_result = AR_DMA_RESULT_SUCCESS;
 static unsigned int ar_dma_call_count;
 static u32 ar_dma_type;
@@ -164,7 +179,7 @@ void SIM_GX_CommandProcessor_SendF32(f32 data) {
     gx_numeric_write_count++;
 }
 
-GXBool SIM_GX_CommandProcessor_SendCanonicalBytes(
+static GXBool porpoise_stub_gx_fifo_record(
     const u8 *data,
     u32 size)
 {
@@ -183,11 +198,71 @@ GXBool SIM_GX_CommandProcessor_SendCanonicalBytes(
     return GX_TRUE;
 }
 
+GXBool SIM_GX_CommandProcessor_SendCanonicalBytes(
+    const u8 *data,
+    u32 size)
+{
+    gx_fifo_synchronous_call_count++;
+    return porpoise_stub_gx_fifo_record(data, size);
+}
+
+GXBool SIM_GX_CommandProcessor_QueueCanonicalBytes(
+    const u8 *data,
+    u32 size)
+{
+    gx_fifo_queued_call_count++;
+    return porpoise_stub_gx_fifo_record(data, size);
+}
+
 void VIConfigure(const GXRenderModeObj *mode) {
     if (mode != NULL) {
         vi_last_render_mode = *mode;
         vi_configure_count++;
     }
+}
+
+void VIInit(void) {
+    vi_init_count++;
+}
+
+void VIWaitForRetrace(void) {
+    vi_wait_for_retrace_call_count++;
+    if (vi_pending_frame_buffer_guest_address != 0U) {
+        vi_current_frame_buffer_guest_address =
+            vi_pending_frame_buffer_guest_address;
+        vi_pending_frame_buffer_guest_address = 0U;
+    }
+    if (vi_current_frame_buffer_guest_address != 0U) {
+        vi_presentation_count++;
+    }
+}
+
+void VISetBlack(BOOL black) {
+    vi_set_black_call_count++;
+    vi_black = black;
+}
+
+void VIFlush(void) {
+    vi_flush_call_count++;
+}
+
+BOOL PADInit(void) {
+    pad_init_count++;
+    return TRUE;
+}
+
+u32 PADRead(PADStatus *status) {
+    pad_read_count++;
+    memcpy(
+        status,
+        pad_read_status,
+        sizeof(pad_read_status));
+    return pad_read_motor_mask;
+}
+
+void DEMOPadInit(void) {
+    demo_pad_init_count++;
+    (void)PADInit();
 }
 
 #ifndef PORPOISE_STUB_DISABLE_VI_NEXT_FRAMEBUFFER_GUEST_ADDRESS_CONTRACT
@@ -851,6 +926,48 @@ unsigned int PorpoiseStubOSInitCount(void) {
     return os_init_count;
 }
 
+unsigned int PorpoiseStubPADInitCount(void) {
+    return pad_init_count;
+}
+
+unsigned int PorpoiseStubDEMOPadInitCount(void) {
+    return demo_pad_init_count;
+}
+
+void PorpoiseStubPADReadReset(void) {
+    memset(pad_read_status, 0, sizeof(pad_read_status));
+    pad_read_status[0].button = UINT16_C(0x1234);
+    pad_read_status[0].stickX = INT8_C(-128);
+    pad_read_status[0].stickY = INT8_C(127);
+    pad_read_status[0].substickX = INT8_C(-2);
+    pad_read_status[0].substickY = INT8_C(2);
+    pad_read_status[0].triggerLeft = UINT8_C(0x56);
+    pad_read_status[0].triggerRight = UINT8_C(0x78);
+    pad_read_status[0].analogA = UINT8_C(0x9A);
+    pad_read_status[0].analogB = UINT8_C(0xBC);
+    pad_read_status[0].err = INT8_C(-3);
+
+    pad_read_status[1].button = UINT16_C(0xABCD);
+    pad_read_status[1].stickX = INT8_C(-1);
+    pad_read_status[1].stickY = INT8_C(1);
+    pad_read_status[1].substickX = INT8_C(-64);
+    pad_read_status[1].substickY = INT8_C(64);
+    pad_read_status[1].triggerLeft = UINT8_C(0x10);
+    pad_read_status[1].triggerRight = UINT8_C(0x20);
+    pad_read_status[1].analogA = UINT8_C(0x30);
+    pad_read_status[1].analogB = UINT8_C(0x40);
+
+    pad_read_status[2].button = UINT16_C(0x1000);
+    pad_read_status[2].err = INT8_C(-1);
+    pad_read_status[3].err = INT8_C(-2);
+    pad_read_motor_mask = UINT32_C(0xA0000000);
+    pad_read_count = 0U;
+}
+
+unsigned int PorpoiseStubPADReadCount(void) {
+    return pad_read_count;
+}
+
 void PorpoiseStubInterruptReset(void) {
     if (!interrupts_enabled) {
         abort();
@@ -982,6 +1099,8 @@ const void *PorpoiseStubDVDLastReadFileInfo(void) {
 void PorpoiseStubGXFifoReset(void) {
     gx_fifo_accept = TRUE;
     gx_fifo_call_count = 0U;
+    gx_fifo_queued_call_count = 0U;
+    gx_fifo_synchronous_call_count = 0U;
     memset(gx_fifo_call_sizes, 0, sizeof(gx_fifo_call_sizes));
     gx_fifo_byte_count = 0U;
     memset(gx_fifo_bytes, 0, sizeof(gx_fifo_bytes));
@@ -994,6 +1113,14 @@ void PorpoiseStubGXFifoSetAccept(int accept) {
 
 unsigned int PorpoiseStubGXFifoCallCount(void) {
     return gx_fifo_call_count;
+}
+
+unsigned int PorpoiseStubGXFifoQueuedCallCount(void) {
+    return gx_fifo_queued_call_count;
+}
+
+unsigned int PorpoiseStubGXFifoSynchronousCallCount(void) {
+    return gx_fifo_synchronous_call_count;
 }
 
 unsigned int PorpoiseStubGXFifoCallSize(unsigned int index) {
@@ -1030,7 +1157,17 @@ void PorpoiseStubVIReset(void) {
     vi_set_next_frame_buffer_call_count = 0U;
     vi_next_frame_buffer_guest_address = 0U;
     vi_pending_frame_buffer_guest_address = 0U;
+    vi_current_frame_buffer_guest_address = 0U;
     vi_set_next_frame_buffer_result = TRUE;
+    vi_wait_for_retrace_call_count = 0U;
+    vi_presentation_count = UINT64_C(0);
+    vi_set_black_call_count = 0U;
+    vi_black = FALSE;
+    vi_flush_call_count = 0U;
+}
+
+unsigned int PorpoiseStubVIInitCount(void) {
+    return vi_init_count;
 }
 
 unsigned int PorpoiseStubVIConfigureCount(void) {
@@ -1047,6 +1184,30 @@ void PorpoiseStubVISetNextFrameBufferResult(int result) {
 
 unsigned int PorpoiseStubVISetNextFrameBufferCallCount(void) {
     return vi_set_next_frame_buffer_call_count;
+}
+
+unsigned int PorpoiseStubVIWaitForRetraceCallCount(void) {
+    return vi_wait_for_retrace_call_count;
+}
+
+unsigned int PorpoiseStubVISetBlackCallCount(void) {
+    return vi_set_black_call_count;
+}
+
+uint32_t PorpoiseStubVIBlack(void) {
+    return vi_black != FALSE ? UINT32_C(1) : UINT32_C(0);
+}
+
+unsigned int PorpoiseStubVIFlushCallCount(void) {
+    return vi_flush_call_count;
+}
+
+uint64_t PorpoiseStubVIPresentationCount(void) {
+    return vi_presentation_count;
+}
+
+uint32_t PorpoiseStubVICurrentFrameBufferGuestAddress(void) {
+    return (uint32_t)vi_current_frame_buffer_guest_address;
 }
 
 uint32_t PorpoiseStubVINextFrameBufferGuestAddress(void) {

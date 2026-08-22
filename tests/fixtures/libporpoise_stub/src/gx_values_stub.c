@@ -23,6 +23,10 @@ static uint8_t last_bytes[STUB_GX_VALUE_MAX_BYTES];
 static size_t last_byte_count;
 static float projection_output[7];
 static float viewport_output[6];
+static float y_scale_factor_output;
+static uint32_t disp_copy_y_scale_output;
+static struct __GXData_struct gx_data;
+struct __GXData_struct *gx = &gx_data;
 
 static void begin_call(PorpoiseStubGXValueCall call)
 {
@@ -56,6 +60,10 @@ void PorpoiseStubGXValuesReset(void)
     last_byte_count = 0U;
     memset(projection_output, 0, sizeof(projection_output));
     memset(viewport_output, 0, sizeof(viewport_output));
+    y_scale_factor_output = 0.0f;
+    disp_copy_y_scale_output = 0U;
+    gx_data.dirtyState = 0U;
+    gx_data.flushReady = GX_TRUE;
 }
 
 unsigned int PorpoiseStubGXValueCallCount(PorpoiseStubGXValueCall call)
@@ -116,6 +124,36 @@ void PorpoiseStubGXValueSetProjectionOutput(const float values[7])
 void PorpoiseStubGXValueSetViewportOutput(const float values[6])
 {
     memcpy(viewport_output, values, sizeof(viewport_output));
+}
+
+void PorpoiseStubGXValueSetYScaleFactorOutput(float value)
+{
+    y_scale_factor_output = value;
+}
+
+void PorpoiseStubGXValueSetDispCopyYScaleOutput(uint32_t value)
+{
+    disp_copy_y_scale_output = value;
+}
+
+void PorpoiseStubGXValueSetBeginPreamble(
+    uint32_t dirty_state,
+    int flush_ready)
+{
+    gx_data.dirtyState = dirty_state;
+    gx_data.flushReady = flush_ready ? GX_TRUE : GX_FALSE;
+}
+
+void __GXSetDirtyState(void)
+{
+    call_counts[PORPOISE_STUB_GX_SET_DIRTY_STATE]++;
+    gx_data.dirtyState = 0U;
+}
+
+void __GXSendFlushPrim(void)
+{
+    call_counts[PORPOISE_STUB_GX_SEND_FLUSH_PRIM]++;
+    gx_data.flushReady = GX_TRUE;
 }
 
 void GXCallDisplayList(const void *list, u32 nbytes)
@@ -266,4 +304,156 @@ void GXSetTevIndirect(
     last_u32[7] = (uint32_t)add_previous;
     last_u32[8] = (uint32_t)indirect_lod;
     last_u32[9] = (uint32_t)alpha;
+}
+
+void GXClearVtxDesc(void)
+{
+    begin_call(PORPOISE_STUB_GX_CLEAR_VTX_DESC);
+}
+
+void GXSetVtxDesc(GXAttr attr, GXAttrType type)
+{
+    begin_call(PORPOISE_STUB_GX_SET_VTX_DESC);
+    last_u32[0] = (uint32_t)attr;
+    last_u32[1] = (uint32_t)type;
+}
+
+void GXSetVtxAttrFmt(
+    GXVtxFmt format,
+    GXAttr attr,
+    GXCompCnt count,
+    GXCompType type,
+    u8 fraction)
+{
+    begin_call(PORPOISE_STUB_GX_SET_VTX_ATTR_FMT);
+    last_u32[0] = (uint32_t)format;
+    last_u32[1] = (uint32_t)attr;
+    last_u32[2] = (uint32_t)count;
+    last_u32[3] = (uint32_t)type;
+    last_u32[4] = (uint32_t)fraction;
+}
+
+void GXInvalidateVtxCache(void)
+{
+    begin_call(PORPOISE_STUB_GX_INVALIDATE_VTX_CACHE);
+}
+
+void GXSetNumTexGens(u8 count)
+{
+    begin_call(PORPOISE_STUB_GX_SET_NUM_TEX_GENS);
+    last_u32[0] = (uint32_t)count;
+}
+
+void GXSetNumChans(u8 count)
+{
+    begin_call(PORPOISE_STUB_GX_SET_NUM_CHANS);
+    last_u32[0] = (uint32_t)count;
+}
+
+void GXInvalidateTexAll(void)
+{
+    begin_call(PORPOISE_STUB_GX_INVALIDATE_TEX_ALL);
+}
+
+void GXSetTevOp(GXTevStageID stage, GXTevMode mode)
+{
+    begin_call(PORPOISE_STUB_GX_SET_TEV_OP);
+    last_u32[0] = (uint32_t)stage;
+    last_u32[1] = (uint32_t)mode;
+}
+
+void GXSetTevOrder(
+    GXTevStageID stage,
+    GXTexCoordID coordinate,
+    GXTexMapID map,
+    GXChannelID color)
+{
+    begin_call(PORPOISE_STUB_GX_SET_TEV_ORDER);
+    last_u32[0] = (uint32_t)stage;
+    last_u32[1] = (uint32_t)coordinate;
+    last_u32[2] = (uint32_t)map;
+    last_u32[3] = (uint32_t)color;
+}
+
+void GXSetNumTevStages(u8 count)
+{
+    begin_call(PORPOISE_STUB_GX_SET_NUM_TEV_STAGES);
+    last_u32[0] = (uint32_t)count;
+}
+
+void GXSetColorUpdate(u8 enable)
+{
+    begin_call(PORPOISE_STUB_GX_SET_COLOR_UPDATE);
+    last_u32[0] = (uint32_t)enable;
+}
+
+void GXSetZMode(u8 compare, GXCompare function, u8 update)
+{
+    begin_call(PORPOISE_STUB_GX_SET_Z_MODE);
+    last_u32[0] = (uint32_t)compare;
+    last_u32[1] = (uint32_t)function;
+    last_u32[2] = (uint32_t)update;
+}
+
+void GXSetPixelFmt(GXPixelFmt pixel_format, GXZFmt16 depth_format)
+{
+    begin_call(PORPOISE_STUB_GX_SET_PIXEL_FMT);
+    last_u32[0] = (uint32_t)pixel_format;
+    last_u32[1] = (uint32_t)depth_format;
+}
+
+void GXSetViewport(
+    f32 left,
+    f32 top,
+    f32 width,
+    f32 height,
+    f32 near_z,
+    f32 far_z)
+{
+    begin_call(PORPOISE_STUB_GX_SET_VIEWPORT);
+    last_float[0] = left;
+    last_float[1] = top;
+    last_float[2] = width;
+    last_float[3] = height;
+    last_float[4] = near_z;
+    last_float[5] = far_z;
+}
+
+void GXSetScissor(u32 left, u32 top, u32 width, u32 height)
+{
+    begin_call(PORPOISE_STUB_GX_SET_SCISSOR);
+    last_u32[0] = (uint32_t)left;
+    last_u32[1] = (uint32_t)top;
+    last_u32[2] = (uint32_t)width;
+    last_u32[3] = (uint32_t)height;
+}
+
+void GXSetDispCopySrc(u16 left, u16 top, u16 width, u16 height)
+{
+    begin_call(PORPOISE_STUB_GX_SET_DISP_COPY_SRC);
+    last_u32[0] = (uint32_t)left;
+    last_u32[1] = (uint32_t)top;
+    last_u32[2] = (uint32_t)width;
+    last_u32[3] = (uint32_t)height;
+}
+
+f32 GXGetYScaleFactor(u16 efb_height, u16 xfb_height)
+{
+    begin_call(PORPOISE_STUB_GX_GET_Y_SCALE_FACTOR);
+    last_u32[0] = (uint32_t)efb_height;
+    last_u32[1] = (uint32_t)xfb_height;
+    return y_scale_factor_output;
+}
+
+u32 GXSetDispCopyYScale(f32 scale)
+{
+    begin_call(PORPOISE_STUB_GX_SET_DISP_COPY_Y_SCALE);
+    last_float[0] = scale;
+    return (u32)disp_copy_y_scale_output;
+}
+
+void GXSetDispCopyGamma(GXGamma gamma)
+{
+    begin_call(PORPOISE_STUB_GX_SET_DISP_COPY_GAMMA);
+    last_u32[0] = (uint32_t)gamma;
 }

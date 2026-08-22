@@ -143,6 +143,7 @@ static void initialize_gx(
 
 static void check_no_boundary_native_calls(void)
 {
+    CHECK(PorpoiseStubGXDrawDoneCallCount() == 0U);
     CHECK(PorpoiseStubGXDrawDoneSetterCallCount() == 0U);
     CHECK(PorpoiseStubGXCopyFilterCallCount() == 0U);
     CHECK(PorpoiseStubGXCopyClearCallCount() == 0U);
@@ -160,6 +161,10 @@ static void test_all_calls_require_active_gx(
     PorpoisePpcState *state)
 {
     PorpoiseStubGXBoundaryReset();
+
+    prepare_call(state, host);
+    porpoise_libporpoise_gx_draw_done_adapter(state);
+    check_fault(state, PORPOISE_FAULT_INVALID_STATE, TEST_PC);
 
     prepare_call(state, host);
     state->gpr[3] = 0U;
@@ -204,6 +209,46 @@ static void test_all_calls_require_active_gx(
     check_fault(state, PORPOISE_FAULT_INVALID_STATE, TEST_PC);
 
     check_no_boundary_native_calls();
+}
+
+static void test_draw_done(PorpoiseHostAdapter *host, PorpoisePpcState *state)
+{
+    static const uint8_t expected_command[] = {
+        UINT8_C(0x61),
+        UINT8_C(0x45),
+        UINT8_C(0x00),
+        UINT8_C(0x00),
+        UINT8_C(0x02)
+    };
+    size_t index;
+
+    PorpoiseStubGXFifoReset();
+    prepare_call(state, host);
+    state->gpr[3] = UINT32_C(0xA5A5A5A5);
+    porpoise_libporpoise_gx_draw_done_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(state->gpr[3] == UINT32_C(0xA5A5A5A5));
+    CHECK(PorpoiseStubGXDrawDoneCallCount() == 0U);
+    CHECK(PorpoiseStubGXFifoCallCount() == 1U);
+    CHECK(PorpoiseStubGXFifoQueuedCallCount() == 0U);
+    CHECK(PorpoiseStubGXFifoSynchronousCallCount() == 1U);
+    CHECK(PorpoiseStubGXFifoCallSize(0U) == sizeof(expected_command));
+    CHECK(PorpoiseStubGXFifoByteCount() == sizeof(expected_command));
+    for (index = 0U; index < sizeof(expected_command); index++) {
+        CHECK(PorpoiseStubGXFifoByte((unsigned int)index) ==
+              expected_command[index]);
+    }
+
+    PorpoiseStubGXFifoSetAccept(0);
+    prepare_call(state, host);
+    porpoise_libporpoise_gx_draw_done_adapter(state);
+    check_fault(state, PORPOISE_FAULT_HOST_IO, TEST_PC);
+    CHECK(strcmp(
+              porpoise_state_fault_message(state),
+              "libPorpoise rejected the canonical GX draw-done command") ==
+          0);
+    CHECK(PorpoiseStubGXDrawDoneCallCount() == 0U);
+    PorpoiseStubGXFifoSetAccept(1);
 }
 
 static void test_draw_done_callback(
@@ -272,8 +317,14 @@ static void test_draw_done_callback(
     CHECK(state->gpr[3] == UINT32_C(0xA5A5A5A5));
     CHECK(state->lr == 0U);
 
-    /* The native trampoline snapshots the guest callback at signal time. */
-    PorpoiseStubGXTriggerDrawDone();
+    /* The draw-done boundary snapshots the guest callback at signal time and
+     * does not flush native GX SDK shadow state into the canonical FIFO. */
+    prepare_call(state, host);
+    state->msr &= ~PORPOISE_MSR_EE;
+    porpoise_libporpoise_gx_draw_done_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(callback_count == 1U);
+    CHECK(PorpoiseStubGXDrawDoneCallCount() == 0U);
     prepare_call(state, host);
     state->gpr[3] = CALLBACK_B;
     porpoise_libporpoise_gx_set_draw_done_callback_adapter(state);
@@ -1157,6 +1208,7 @@ int main(int argc, char **argv)
     }
 
     test_draw_done_callback(&host, &state);
+    test_draw_done(&host, &state);
     test_copy_filter(&host, &state);
     test_copy_clear(&host, &state);
     test_copy_destinations_and_spans(&host, &state);

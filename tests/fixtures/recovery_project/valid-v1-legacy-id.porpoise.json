@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "sdk_catalogs": [],
+  "abi_contracts": [],
+  "targets": [
+    {
+      "id": "legacy.overlay/one",
+      "enabled": true,
+      "source_kind": "assembly",
+      "input": "input",
+      "output": "output",
+      "entry": null,
+      "strict": false,
+      "sdk_policy": "keep",
+      "symbol_sources": [],
+      "skip_list": null,
+      "overrides": [],
+      "annotations": [],
+      "cache": null
+    }
+  ]
+}

@@ -295,6 +295,18 @@ void porpoise_libporpoise_gx_init_adapter(PorpoisePpcState *state)
     state->gpr[3] = guest_token;
 }
 
+void porpoise_libporpoise_gx_draw_done_adapter(PorpoisePpcState *state)
+{
+    if (state == NULL || porpoise_state_should_stop(state) ||
+        !porpoise_libporpoise_gx_complete_draw(state)) {
+        return;
+    }
+
+    if (!porpoise_state_should_stop(state)) {
+        (void)porpoise_poll_host_events(state, state->pc);
+    }
+}
+
 void porpoise_libporpoise_gx_set_draw_done_callback_adapter(
     PorpoisePpcState *state)
 {

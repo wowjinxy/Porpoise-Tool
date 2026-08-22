@@ -116,6 +116,23 @@ def main() -> int:
         }
         project_path.write_text(json.dumps(project, indent=2), encoding="utf-8")
 
+        multi_run_project = temporary / "multi-run.porpoise.json"
+        multi_run = json.loads(json.dumps(project))
+        multi_run["targets"][1]["enabled"] = True
+        multi_run_project.write_text(
+            json.dumps(multi_run, indent=2), encoding="utf-8"
+        )
+        rejected_multi_run = run(
+            tool, "--project", str(multi_run_project), "--run",
+            "--libporpoise", str(temporary / "unused-libporpoise"),
+        )
+        assert rejected_multi_run.returncode == 2
+        assert "--run requires exactly one enabled target; found 2" in (
+            rejected_multi_run.stderr
+        )
+        assert not project_output.exists()
+        assert not (temporary / "out-overlay").exists()
+
         report_directory = temporary / "existing-report-directory"
         report_directory.mkdir()
         (report_directory / "sentinel.bin").write_bytes(

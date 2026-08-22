@@ -28,6 +28,11 @@ PorpoiseHostResult porpoise_libporpoise_adapter_init_for_title(
     const char *dvd_root_directory,
     int initialize_dvd);
 
+/* Nonzero only when this build has the exact libPorpoise host-thread carrier
+ * API v1. A zero result means lifted execution is limited to one guest thread;
+ * carrier-dependent SDK imports fail with an explicit runtime fault. */
+int porpoise_libporpoise_has_host_thread_carrier_v1(void);
+
 /*
  * Bind the generated address dispatcher to the active adapter. The raw
  * dispatcher remains private to the adapter; host callbacks are routed

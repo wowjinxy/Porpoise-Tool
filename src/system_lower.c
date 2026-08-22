@@ -1310,7 +1310,12 @@ static bool emit_storage_transfer(
     if (instruction->storage == PORPOISE_SYSTEM_STORAGE_MSR && write) {
         return file_printf(
             output,
+            "    if (!porpoise_msr_transition_is_exact(state, state->gpr[%u])) "
+            "{ porpoise_trace_approximate(state, UINT32_C(0x%08lX), \"mtmsr\"); "
+            "if (porpoise_state_has_fault(state)) return; }\n"
             "    if (!porpoise_write_msr(state, UINT32_C(0x%08lX), state->gpr[%u])) return;\n",
+            instruction->source_register,
+            (unsigned long)address,
             (unsigned long)address,
             instruction->source_register);
     }

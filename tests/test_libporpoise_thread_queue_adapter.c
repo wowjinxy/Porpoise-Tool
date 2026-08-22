@@ -594,7 +594,8 @@ static void test_exit_treats_r3_as_an_opaque_value(void)
         &expected,
         PORPOISE_FAULT_UNSUPPORTED_OPERATION,
         state.pc,
-        "OSExitThread requires a guest thread scheduler mirror");
+        "OSExitThread requires libPorpoise host-thread carrier API v1; "
+        "this runtime supports single-thread guest execution only");
     memcpy(before, memory.bytes, sizeof(before));
 
     porpoise_libporpoise_os_exit_thread_adapter(&state);
@@ -606,6 +607,7 @@ static void test_exit_treats_r3_as_an_opaque_value(void)
 
 int main(void)
 {
+    CHECK(!porpoise_libporpoise_has_host_thread_carrier_v1());
     test_empty_wakeup_is_guest_safe_noop(0U);
     test_empty_wakeup_is_guest_safe_noop(PORPOISE_MSR_EE);
     test_nonempty_wakeup_fails_closed();
@@ -628,10 +630,12 @@ int main(void)
     test_host_result_mapping();
     test_thread_operation_fails_closed(
         porpoise_libporpoise_os_resume_thread_adapter,
-        "OSResumeThread requires a guest thread scheduler mirror");
+        "OSResumeThread requires libPorpoise host-thread carrier API v1; "
+        "this runtime supports single-thread guest execution only");
     test_thread_operation_fails_closed(
         porpoise_libporpoise_os_suspend_thread_adapter,
-        "OSSuspendThread requires a guest thread scheduler mirror");
+        "OSSuspendThread requires libPorpoise host-thread carrier API v1; "
+        "this runtime supports single-thread guest execution only");
     test_thread_lifecycle_state_validation(
         porpoise_libporpoise_os_resume_thread_adapter);
     test_thread_lifecycle_state_validation(

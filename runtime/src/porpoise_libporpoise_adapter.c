@@ -10,6 +10,7 @@
 #pragma GCC diagnostic ignored "-Wunused-variable"
 #endif
 #include <dolphin/ar.h>
+#include <dolphin/demo/DEMOPad.h>
 #include <dolphin/dsp.h>
 #include <dolphin/dvd.h>
 #include <dolphin/os/OSArena.h>
@@ -17,6 +18,7 @@
 #include <dolphin/os/OSHostMemory.h>
 #include <dolphin/os/OSInterrupt.h>
 #include <dolphin/os/OSTime.h>
+#include <dolphin/pad.h>
 #include <dolphin/vi.h>
 #include <simulator/sim_gx_CommandProcessor.h>
 #if defined(__GNUC__)
@@ -31,6 +33,22 @@
 
 #include "porpoise_dispatch_private.h"
 #include "porpoise_libporpoise_gx_headers.h"
+#include "porpoise_libporpoise_presentation_private.h"
+
+#if !defined(PORPOISE_HAVE_LIBPORPOISE_PRESENTATION_STATS_BRIDGE)
+int porpoise_libporpoise_presentation_snapshot(
+    uint64_t *presentation_count_out,
+    uint32_t *guest_frame_buffer_out)
+{
+    if (presentation_count_out != NULL) {
+        *presentation_count_out = UINT64_C(0);
+    }
+    if (guest_frame_buffer_out != NULL) {
+        *guest_frame_buffer_out = UINT32_C(0);
+    }
+    return 0;
+}
+#endif
 
 /* libPorpoise currently declares OSInit only through its broad os.h facade. */
 extern void OSInit(void);
@@ -68,7 +86,12 @@ static const uint32_t porpoise_libporpoise_canonical_system_call_vector[
 #define PORPOISE_GUEST_DVD_CALLBACK_OFFSET 0x38U
 #define PORPOISE_DVD_TRANSFER_ALIGNMENT 32U
 #define PORPOISE_GUEST_GX_RENDER_MODE_SIZE 0x3CU
+#define PORPOISE_GUEST_PAD_STATUS_SIZE 0x0CU
+#define PORPOISE_GUEST_PAD_STATUS_COUNT 4U
+#define PORPOISE_GUEST_PAD_STATUS_ARRAY_SIZE \
+    (PORPOISE_GUEST_PAD_STATUS_SIZE * PORPOISE_GUEST_PAD_STATUS_COUNT)
 #define PORPOISE_GX_DRAW_DONE_EVENT_CAPACITY 64U
+#define PORPOISE_GX_FIFO_PENDING_CAPACITY 4096U
 #define PORPOISE_GUEST_ARQ_REQUEST_SIZE 0x20U
 #define PORPOISE_GUEST_ARQ_NEXT_OFFSET 0x00U
 #define PORPOISE_GUEST_ARQ_OWNER_OFFSET 0x04U
@@ -160,7 +183,12 @@ typedef struct PorpoiseLibporpoiseContext {
     int arena_restore_pending;
     int arena_configuration_poisoned;
     int arena_configured;
+    PorpoiseLibporpoiseGuestSdkLayoutV1 guest_sdk_layout;
+    int guest_sdk_layout_bound;
+    int os_guest_state_mirrored;
     u32 gx_fifo_token;
+    uint8_t gx_fifo_pending[PORPOISE_GX_FIFO_PENDING_CAPACITY];
+    size_t gx_fifo_pending_size;
     uint32_t gx_draw_done_callback;
     uint32_t gx_draw_done_events[PORPOISE_GX_DRAW_DONE_EVENT_CAPACITY];
     size_t gx_draw_done_event_head;
@@ -174,10 +202,14 @@ typedef struct PorpoiseLibporpoiseContext {
     PorpoiseLibporpoiseGxCopyDestination gx_tex_copy_destination;
     int gx_disp_copy_destination_configured;
     int gx_tex_copy_destination_configured;
+    uint32_t vi_xfb_span_bytes;
+    int vi_xfb_layout_configured;
 } PorpoiseLibporpoiseContext;
 
 static int porpoise_libporpoise_os_initialized;
 static int porpoise_libporpoise_dvd_initialized;
+static int porpoise_libporpoise_vi_initialized;
+static int porpoise_libporpoise_demo_pad_initialized;
 static int porpoise_libporpoise_dvd_root_is_explicit;
 static char *porpoise_libporpoise_dvd_root_directory;
 static PorpoiseLibporpoiseContext *porpoise_libporpoise_active_context;
@@ -350,7 +382,77 @@ static int porpoise_is_unsupported_mmio_span(
                PORPOISE_EFFECTIVE_MMIO_END);
 }
 
+int porpoise_libporpoise_gx_queue_canonical_bytes(
+    const uint8_t *bytes,
+    size_t size)
+{
+    if ((bytes == NULL && size != 0U) || size > (size_t)UINT32_MAX) {
+        return 0;
+    }
+#if defined(SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION) && \
+    SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION >= 1
+#if SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION >= 2
+    return SIM_GX_CommandProcessor_QueueCanonicalBytes(
+               (const u8 *)bytes, (u32)size)
+        ? 1 : 0;
+#else
+    return SIM_GX_CommandProcessor_SendCanonicalBytes(
+               (const u8 *)bytes, (u32)size)
+        ? 1 : 0;
+#endif
+#else
+    (void)bytes;
+    (void)size;
+    return 0;
+#endif
+}
+
+static PorpoiseHostResult porpoise_libporpoise_flush_gx_fifo_context(
+    PorpoiseLibporpoiseContext *context)
+{
+    if (context == NULL) {
+        return PORPOISE_HOST_INVALID_ARGUMENT;
+    }
+    if (context->gx_fifo_pending_size == 0U) {
+        return PORPOISE_HOST_OK;
+    }
+    if (!porpoise_libporpoise_gx_queue_canonical_bytes(
+            context->gx_fifo_pending,
+            context->gx_fifo_pending_size)) {
+        return PORPOISE_HOST_IO_ERROR;
+    }
+    context->gx_fifo_pending_size = 0U;
+    return PORPOISE_HOST_OK;
+}
+
+static PorpoiseHostResult porpoise_libporpoise_buffer_gx_fifo(
+    PorpoiseLibporpoiseContext *context,
+    const void *source,
+    size_t size)
+{
+    PorpoiseHostResult result;
+
+    if (context == NULL || (source == NULL && size != 0U) ||
+        size > PORPOISE_GX_FIFO_PENDING_CAPACITY) {
+        return PORPOISE_HOST_INVALID_ARGUMENT;
+    }
+    if (size > PORPOISE_GX_FIFO_PENDING_CAPACITY -
+                   context->gx_fifo_pending_size) {
+        result = porpoise_libporpoise_flush_gx_fifo_context(context);
+        if (result != PORPOISE_HOST_OK) {
+            return result;
+        }
+    }
+    memcpy(
+        &context->gx_fifo_pending[context->gx_fifo_pending_size],
+        source,
+        size);
+    context->gx_fifo_pending_size += size;
+    return PORPOISE_HOST_OK;
+}
+
 static PorpoiseHostResult porpoise_libporpoise_write_gx_fifo(
+    PorpoiseLibporpoiseContext *context,
     const void *source,
     size_t size)
 {
@@ -364,13 +466,27 @@ static PorpoiseHostResult porpoise_libporpoise_write_gx_fifo(
     if (size != 1U && size != 2U && size != 4U && size != 8U) {
         return PORPOISE_HOST_UNSUPPORTED_MMIO;
     }
-    return SIM_GX_CommandProcessor_SendCanonicalBytes(
-               (const u8 *)source, (u32)size)
-               ? PORPOISE_HOST_OK
-               : PORPOISE_HOST_IO_ERROR;
+    return porpoise_libporpoise_buffer_gx_fifo(context, source, size);
 #else
     (void)source;
     (void)size;
+    return PORPOISE_HOST_UNSUPPORTED_MMIO;
+#endif
+}
+
+static PorpoiseHostResult porpoise_libporpoise_write_gx_fifo_u8(
+    void *opaque_context,
+    uint8_t value)
+{
+#if defined(SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION) && \
+    SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION >= 1
+    return porpoise_libporpoise_buffer_gx_fifo(
+        (PorpoiseLibporpoiseContext *)opaque_context,
+        &value,
+        sizeof(value));
+#else
+    (void)opaque_context;
+    (void)value;
     return PORPOISE_HOST_UNSUPPORTED_MMIO;
 #endif
 }
@@ -494,7 +610,10 @@ static PorpoiseHostResult porpoise_libporpoise_write_bytes(
         return PORPOISE_HOST_OK;
     }
     if (guest_address == PORPOISE_GX_FIFO_ADDRESS) {
-        return porpoise_libporpoise_write_gx_fifo(source, size);
+        return porpoise_libporpoise_write_gx_fifo(
+            (PorpoiseLibporpoiseContext *)context,
+            source,
+            size);
     }
 
     destination = NULL;
@@ -706,6 +825,23 @@ porpoise_libporpoise_context_for_state(PorpoisePpcState *state)
         return NULL;
     }
     return context;
+}
+
+int porpoise_libporpoise_gx_flush_pending(PorpoisePpcState *state)
+{
+    PorpoiseLibporpoiseContext *context;
+    PorpoiseHostResult result;
+
+    context = porpoise_libporpoise_context_for_state(state);
+    if (context == NULL) {
+        return 0;
+    }
+    result = porpoise_libporpoise_flush_gx_fifo_context(context);
+    if (result != PORPOISE_HOST_OK) {
+        porpoise_libporpoise_set_host_fault(state, result, state->pc);
+        return 0;
+    }
+    return 1;
 }
 
 PorpoiseLibporpoiseThreadRegistry *
@@ -1150,6 +1286,61 @@ static void porpoise_libporpoise_gx_draw_done_callback(void)
         context->gx_draw_done_callback;
     context->gx_draw_done_event_count++;
     OSRestoreInterrupts(interrupts_were_enabled);
+}
+
+int porpoise_libporpoise_gx_complete_draw(PorpoisePpcState *state)
+{
+    static const u8 draw_done_command[] = {
+        UINT8_C(0x61),
+        UINT8_C(0x45),
+        UINT8_C(0x00),
+        UINT8_C(0x00),
+        UINT8_C(0x02)
+    };
+    PorpoiseLibporpoiseContext *context;
+
+    if (!porpoise_libporpoise_gx_require_active(state)) {
+        return 0;
+    }
+    context = porpoise_libporpoise_context_for_state(state);
+    if (context == NULL) {
+        return 0;
+    }
+
+    /*
+     * GXDrawDone normally writes the PE-finish BP command and then GXFlushes
+     * native SDK dirty state. The command processor consumes canonical bytes
+     * synchronously, and its 0x45 handler waits for host GPU completion. Send
+     * only that exact finish command so native dirty VCD/VAT state cannot
+     * replace the lifted guest's active vertex layout.
+     */
+#if defined(SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION) && \
+    SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION >= 1
+    if (!SIM_GX_CommandProcessor_SendCanonicalBytes(
+            draw_done_command, (u32)sizeof(draw_done_command))) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_HOST_IO,
+            state->pc,
+            "libPorpoise rejected the canonical GX draw-done command");
+        return 0;
+    }
+#else
+    porpoise_state_set_fault(
+        state,
+        PORPOISE_FAULT_UNSUPPORTED_OPERATION,
+        state->pc,
+        "GXDrawDone requires libPorpoise canonical FIFO bytes API v1");
+    return 0;
+#endif
+
+    /* The command-processor finish handler waits synchronously but does not
+     * invoke the SDK draw-done callback. Mirror that event explicitly while
+     * retaining the guest callback address registered at completion time. */
+    if (context->gx_draw_done_callback != 0U) {
+        porpoise_libporpoise_gx_draw_done_callback();
+    }
+    return 1;
 }
 
 int porpoise_libporpoise_gx_set_draw_done_callback(
@@ -1624,6 +1815,72 @@ PorpoiseHostResult porpoise_libporpoise_bind_guest_runtime(
         adapter, dispatcher, export_state_binder, 1);
 }
 
+PorpoiseHostResult porpoise_libporpoise_bind_guest_sdk_layout_v1(
+    PorpoiseHostAdapter *adapter,
+    const PorpoiseLibporpoiseGuestSdkLayoutV1 *layout)
+{
+    PorpoiseLibporpoiseContext *context;
+    const uint32_t addresses[] = {
+        layout != NULL ? layout->os_arena_lo_address : 0U,
+        layout != NULL ? layout->os_arena_hi_address : 0U,
+        layout != NULL ? layout->os_initialized_address : 0U,
+        layout != NULL ? layout->os_boot_info_address : 0U,
+        layout != NULL ? layout->os_bi2_debug_flag_address : 0U,
+        layout != NULL ? layout->dvd_long_file_name_flag_address : 0U
+    };
+    size_t index;
+    BOOL interrupts_were_enabled;
+    PorpoiseHostResult result = PORPOISE_HOST_OK;
+
+    if (adapter == NULL || layout == NULL) {
+        return PORPOISE_HOST_INVALID_ARGUMENT;
+    }
+    for (index = 0U;
+         index < sizeof(addresses) / sizeof(addresses[0]);
+         index++) {
+        size_t earlier;
+        if (addresses[index] == 0U ||
+            (addresses[index] & UINT32_C(3)) != 0U) {
+            return PORPOISE_HOST_INVALID_ARGUMENT;
+        }
+        for (earlier = 0U; earlier < index; earlier++) {
+            if (addresses[index] == addresses[earlier]) {
+                return PORPOISE_HOST_INVALID_ARGUMENT;
+            }
+        }
+    }
+
+    interrupts_were_enabled = OSDisableInterrupts();
+    if (!porpoise_libporpoise_adapter_is_active(adapter)) {
+        result = PORPOISE_HOST_INVALID_ARGUMENT;
+    } else {
+        context = (PorpoiseLibporpoiseContext *)adapter->context;
+        if (context->guest_sdk_layout_bound) {
+            result = memcmp(
+                         &context->guest_sdk_layout,
+                         layout,
+                         sizeof(*layout)) == 0
+                         ? PORPOISE_HOST_OK
+                         : PORPOISE_HOST_INVALID_ARGUMENT;
+        } else {
+            for (index = 0U;
+                 index < sizeof(addresses) / sizeof(addresses[0]);
+                 index++) {
+                void *mapped = NULL;
+                result = porpoise_libporpoise_decode_span(
+                    context, addresses[index], sizeof(uint32_t), &mapped);
+                if (result != PORPOISE_HOST_OK) break;
+            }
+            if (result == PORPOISE_HOST_OK) {
+                context->guest_sdk_layout = *layout;
+                context->guest_sdk_layout_bound = 1;
+            }
+        }
+    }
+    OSRestoreInterrupts(interrupts_were_enabled);
+    return result;
+}
+
 int porpoise_libporpoise_run_guest(
     PorpoisePpcState *state,
     uint32_t guest_function_address)
@@ -1731,6 +1988,14 @@ static void porpoise_libporpoise_write_be32(
     destination[1] = (uint8_t)(value >> 16U);
     destination[2] = (uint8_t)(value >> 8U);
     destination[3] = (uint8_t)value;
+}
+
+static void porpoise_libporpoise_write_be16(
+    uint8_t *destination,
+    uint16_t value)
+{
+    destination[0] = (uint8_t)(value >> 8U);
+    destination[1] = (uint8_t)value;
 }
 
 static uint16_t porpoise_libporpoise_read_be16(const uint8_t *source)
@@ -2937,6 +3202,8 @@ void porpoise_libporpoise_vi_configure_adapter(PorpoisePpcState *state)
 {
     PorpoiseLibporpoiseContext *context;
     GXRenderModeObj native_mode;
+    uint64_t padded_width;
+    uint64_t span_bytes;
     uint32_t guest_mode;
     size_t index;
 
@@ -2991,7 +3258,243 @@ void porpoise_libporpoise_vi_configure_adapter(PorpoisePpcState *state)
     if (porpoise_state_has_fault(state)) {
         return;
     }
+    if (native_mode.fbWidth == 0U || native_mode.xfbHeight == 0U) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_ARGUMENT,
+            guest_mode,
+            "VIConfigure requires nonzero XFB dimensions");
+        return;
+    }
+    padded_width = ((uint64_t)native_mode.fbWidth + UINT64_C(15)) &
+        ~UINT64_C(15);
+    span_bytes = padded_width * UINT64_C(2) *
+        (uint64_t)native_mode.xfbHeight;
+    if (span_bytes == 0U || span_bytes > UINT32_MAX) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_ARGUMENT,
+            guest_mode,
+            "VIConfigure XFB span is outside the supported guest range");
+        return;
+    }
     VIConfigure(&native_mode);
+    context->vi_xfb_span_bytes = (uint32_t)span_bytes;
+    context->vi_xfb_layout_configured = 1;
+}
+
+void porpoise_libporpoise_os_init_adapter(PorpoisePpcState *state)
+{
+    PorpoiseLibporpoiseContext *context =
+        porpoise_libporpoise_context_for_state(state);
+
+    if (context == NULL) {
+        return;
+    }
+    if (!porpoise_libporpoise_os_initialized) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_STATE,
+            state->pc,
+            "OSInit import requires native runtime initialization");
+        return;
+    }
+    if (context->guest_sdk_layout_bound &&
+        !context->os_guest_state_mirrored) {
+        const uint32_t addresses[] = {
+            context->guest_sdk_layout.os_arena_lo_address,
+            context->guest_sdk_layout.os_arena_hi_address,
+            context->guest_sdk_layout.os_initialized_address,
+            context->guest_sdk_layout.os_boot_info_address,
+            context->guest_sdk_layout.os_bi2_debug_flag_address,
+            context->guest_sdk_layout.dvd_long_file_name_flag_address
+        };
+        const uint32_t values[] = {
+            context->arena_guest_lo,
+            context->arena_guest_hi,
+            UINT32_C(1),
+            UINT32_C(0x80000000),
+            UINT32_C(0),
+            UINT32_C(1)
+        };
+        uint8_t *destinations[
+            sizeof(addresses) / sizeof(addresses[0])];
+        size_t index;
+
+        if (!context->arena_configured) {
+            porpoise_state_set_fault(
+                state,
+                PORPOISE_FAULT_INVALID_STATE,
+                state->pc,
+                "exact OSInit import requires configured guest arena bounds");
+            return;
+        }
+        for (index = 0U;
+             index < sizeof(addresses) / sizeof(addresses[0]);
+             index++) {
+            void *destination = NULL;
+            PorpoiseHostResult result =
+                porpoise_libporpoise_decode_span(
+                    context,
+                    addresses[index],
+                    sizeof(uint32_t),
+                    &destination);
+            if (result != PORPOISE_HOST_OK) {
+                porpoise_libporpoise_set_host_fault(
+                    state, result, addresses[index]);
+                return;
+            }
+            destinations[index] = (uint8_t *)destination;
+        }
+        for (index = 0U;
+             index < sizeof(addresses) / sizeof(addresses[0]);
+             index++) {
+            porpoise_libporpoise_write_be32(
+                destinations[index], values[index]);
+        }
+        context->os_guest_state_mirrored = 1;
+    }
+}
+
+void porpoise_libporpoise_dvd_init_adapter(PorpoisePpcState *state)
+{
+    if (porpoise_libporpoise_context_for_state(state) == NULL) {
+        return;
+    }
+    if (!porpoise_libporpoise_dvd_initialized ||
+        DVDGetFSTLocation() == NULL) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_UNSUPPORTED_OPERATION,
+            state->pc,
+            "DVDInit import requires title-host native DVD initialization");
+    }
+}
+
+void porpoise_libporpoise_vi_init_adapter(PorpoisePpcState *state)
+{
+    if (porpoise_libporpoise_context_for_state(state) == NULL) {
+        return;
+    }
+    if (!porpoise_libporpoise_vi_initialized) {
+        VIInit();
+        porpoise_libporpoise_vi_initialized = 1;
+    }
+}
+
+void porpoise_libporpoise_demo_pad_init_adapter(PorpoisePpcState *state)
+{
+    if (porpoise_libporpoise_context_for_state(state) == NULL) {
+        return;
+    }
+    if (!porpoise_libporpoise_demo_pad_initialized) {
+        DEMOPadInit();
+        porpoise_libporpoise_demo_pad_initialized = 1;
+    }
+}
+
+void porpoise_libporpoise_pad_read_adapter(PorpoisePpcState *state)
+{
+    PorpoiseLibporpoiseContext *context;
+    PorpoiseHostResult result;
+    PADStatus native_status[PORPOISE_GUEST_PAD_STATUS_COUNT];
+    uint8_t encoded_status[PORPOISE_GUEST_PAD_STATUS_ARRAY_SIZE];
+    uint8_t *guest_status;
+    void *guest_status_span;
+    uint32_t guest_address;
+    uint32_t motor_mask;
+    size_t index;
+
+    context = porpoise_libporpoise_context_for_state(state);
+    if (context == NULL) {
+        return;
+    }
+    guest_address = state->gpr[3];
+    if (guest_address == 0U) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_POINTER,
+            guest_address,
+            "PADRead status array is NULL");
+        return;
+    }
+    if ((guest_address & UINT32_C(1)) != 0U) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_ARGUMENT,
+            guest_address,
+            "PADRead status array is not two-byte aligned");
+        return;
+    }
+
+    guest_status_span = NULL;
+    result = porpoise_libporpoise_decode_span(
+        context,
+        guest_address,
+        sizeof(encoded_status),
+        &guest_status_span);
+    if (result != PORPOISE_HOST_OK) {
+        porpoise_libporpoise_set_host_fault(state, result, guest_address);
+        return;
+    }
+    guest_status = (uint8_t *)guest_status_span;
+
+    /* PADRead produces four fixed 12-byte console records. Native layout and
+     * host endianness are deliberately kept behind this copy boundary. Keep
+     * the guest's byte 0x0B padding intact, matching the SDK implementation,
+     * which writes only the semantic fields through err at byte 0x0A. The
+     * complete destination is preflighted before the stateful native read and
+     * committed once, so no rejected call can partially update guest RAM. */
+    memcpy(encoded_status, guest_status, sizeof(encoded_status));
+    memset(native_status, 0, sizeof(native_status));
+    motor_mask = (uint32_t)PADRead(native_status);
+    for (index = 0U;
+         index < PORPOISE_GUEST_PAD_STATUS_COUNT;
+         index++) {
+        uint8_t *destination =
+            encoded_status + index * PORPOISE_GUEST_PAD_STATUS_SIZE;
+        const PADStatus *source = &native_status[index];
+
+        porpoise_libporpoise_write_be16(destination, source->button);
+        destination[2U] = (uint8_t)source->stickX;
+        destination[3U] = (uint8_t)source->stickY;
+        destination[4U] = (uint8_t)source->substickX;
+        destination[5U] = (uint8_t)source->substickY;
+        destination[6U] = source->triggerLeft;
+        destination[7U] = source->triggerRight;
+        destination[8U] = source->analogA;
+        destination[9U] = source->analogB;
+        destination[10U] = (uint8_t)source->err;
+    }
+    memcpy(guest_status, encoded_status, sizeof(encoded_status));
+    state->gpr[3] = motor_mask;
+}
+
+void porpoise_libporpoise_vi_set_black_adapter(PorpoisePpcState *state)
+{
+    uint32_t value;
+
+    if (porpoise_libporpoise_context_for_state(state) == NULL) {
+        return;
+    }
+    value = state->gpr[3];
+    if (value > 1U) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_ARGUMENT,
+            value,
+            "VISetBlack requires a Boolean value");
+        return;
+    }
+    VISetBlack(value != 0U ? TRUE : FALSE);
+}
+
+void porpoise_libporpoise_vi_flush_adapter(PorpoisePpcState *state)
+{
+    if (porpoise_libporpoise_context_for_state(state) == NULL) {
+        return;
+    }
+    VIFlush();
 }
 
 void porpoise_libporpoise_vi_set_next_frame_buffer_adapter(
@@ -3053,6 +3556,101 @@ void porpoise_libporpoise_vi_set_next_frame_buffer_adapter(
         guest_address,
         "libPorpoise does not advertise the VI next-framebuffer guest-address contract");
 #endif
+}
+
+void porpoise_libporpoise_vi_wait_for_retrace_adapter(
+    PorpoisePpcState *state)
+{
+    PorpoiseLibporpoiseContext *context;
+    uint64_t presentations_before;
+    uint64_t presentations_after;
+    uint32_t guest_frame_buffer_before;
+    uint32_t guest_frame_buffer_after;
+
+    context = porpoise_libporpoise_context_for_state(state);
+    if (context == NULL) {
+        return;
+    }
+    if (!porpoise_libporpoise_presentation_snapshot(
+            &presentations_before,
+            &guest_frame_buffer_before)) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_UNSUPPORTED_OPERATION,
+            state->pc,
+            "libPorpoise does not expose the host-XFB presentation statistics required by the VIWaitForRetrace contract");
+        return;
+    }
+
+    (void)guest_frame_buffer_before;
+    VIWaitForRetrace();
+
+    if (!porpoise_libporpoise_presentation_snapshot(
+            &presentations_after,
+            &guest_frame_buffer_after)) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_STATE,
+            state->pc,
+            "libPorpoise host-XFB presentation statistics became unavailable during VIWaitForRetrace");
+        return;
+    }
+    if (presentations_after < presentations_before) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_STATE,
+            state->pc,
+            "libPorpoise host-XFB presentation counter moved backwards during VIWaitForRetrace");
+        return;
+    }
+    if (presentations_after - presentations_before > UINT64_C(1)) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_STATE,
+            state->pc,
+            "more than one host-XFB presentation occurred during one VIWaitForRetrace call");
+        return;
+    }
+    if (presentations_after > presentations_before) {
+        if (state->trace_file != NULL &&
+            context->vi_xfb_layout_configured != 0) {
+            void *native_frame_buffer = NULL;
+            PorpoiseHostResult result = porpoise_libporpoise_decode_span(
+                context,
+                guest_frame_buffer_after,
+                context->vi_xfb_span_bytes,
+                &native_frame_buffer);
+            const uint8_t *bytes;
+            uint64_t content_hash;
+            size_t index;
+            int content_varied;
+
+            if (result != PORPOISE_HOST_OK) {
+                porpoise_libporpoise_set_host_fault(
+                    state, result, guest_frame_buffer_after);
+                return;
+            }
+            bytes = (const uint8_t *)native_frame_buffer;
+            content_hash = UINT64_C(14695981039346656037);
+            content_varied = 0;
+            for (index = 0U;
+                 index < (size_t)context->vi_xfb_span_bytes;
+                 index++) {
+                content_hash ^= (uint64_t)bytes[index];
+                content_hash *= UINT64_C(1099511628211);
+                if (index >= 4U && bytes[index] != bytes[index % 4U]) {
+                    content_varied = 1;
+                }
+            }
+            porpoise_trace_frame_observed(
+                state,
+                guest_frame_buffer_after,
+                content_hash,
+                content_varied);
+        } else {
+            porpoise_trace_frame(state, guest_frame_buffer_after);
+        }
+    }
 }
 
 static int porpoise_libporpoise_copy_guest_path(
@@ -3638,6 +4236,8 @@ static PorpoiseHostResult porpoise_libporpoise_adapter_init_internal(
     adapter->read_time_base = porpoise_libporpoise_read_time_base;
     adapter->system_call = porpoise_libporpoise_system_call;
     adapter->poll_events = porpoise_libporpoise_poll_events;
+    adapter->write_gx_fifo_u8 =
+        porpoise_libporpoise_write_gx_fifo_u8;
     context->owner_adapter = adapter;
     if (!porpoise_libporpoise_thread_registry_create(
             adapter, &context->thread_registry)) {
@@ -3769,6 +4369,14 @@ void porpoise_libporpoise_adapter_shutdown(
     if (context != porpoise_libporpoise_active_context) {
         memset(adapter, 0, sizeof(*adapter));
         return;
+    }
+
+    if (context != NULL &&
+        porpoise_libporpoise_flush_gx_fifo_context(context) !=
+            PORPOISE_HOST_OK) {
+        (void)fprintf(
+            stderr,
+            "Porpoise: failed to submit pending GX FIFO bytes during adapter shutdown\n");
     }
 
     interrupts_were_enabled = OSDisableInterrupts();

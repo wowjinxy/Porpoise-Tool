@@ -35,7 +35,11 @@ typedef struct _GXRenderModeObj {
     u8 vfilter[7];
 } GXRenderModeObj;
 
+void VIInit(void);
 void VIConfigure(const GXRenderModeObj *mode);
+void VIWaitForRetrace(void);
+void VISetBlack(BOOL black);
+void VIFlush(void);
 #ifndef PORPOISE_STUB_DISABLE_VI_NEXT_FRAMEBUFFER_GUEST_ADDRESS_CONTRACT
 BOOL VIHostSetNextFrameBufferGuestAddress(u32 guest_address);
 #endif

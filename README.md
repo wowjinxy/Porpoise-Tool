@@ -60,21 +60,23 @@ meson compile -C build-gui porpoise-gui
 
 See [Desktop recovery workbench](docs/RECOVERY_GUI.md).
 
-To check a local, consumer-supplied `libPorpoise` checkout against the generated
-runtime's compile-time contracts, opt in at configure time:
+To check a local, consumer-supplied `libPorpoise` checkout against both the
+generated runtime's compile-time contracts and the shared Build/Run core, opt
+in at configure time:
 
 ```sh
 meson setup build -Dlibporpoise_compat_path=/path/to/libPorpoise
 meson test -C build --print-errorlogs
 ```
 
-The same check can be run directly without reconfiguring Porpoise Tool:
+The compile-interface half can be run directly without reconfiguring Porpoise
+Tool:
 
 ```sh
 python tools/check_libporpoise_compat.py /path/to/libPorpoise
 ```
 
-This is a read-only compile-time contract probe. It writes C probes only to a
+That script is a read-only compile-time contract probe. It writes C probes only to a
 temporary sibling-independent directory; it never configures, builds, copies,
 or writes inside the supplied checkout. With `-std=c99`, strict warnings, and
 the generated project's current Linux or Win64 consumer defines, it reports
@@ -82,12 +84,15 @@ each gate separately: public-header usability, canonical GX texture/copy enum
 values, distinct `GX_CTF_YUVA8`/`GX_CTF_A8`, canonical FIFO-byte API version
 and signature, the canonical sized host-array API, the advertised version and
 declaration for each GX copy guest-address endpoint, and the advertised exact
-guest-address VI next-framebuffer endpoint. A missing declaration or version
-gate produces
+guest-address VI next-framebuffer endpoint. The host-thread carrier is an
+optional capability: a checkout without its versioned header is accepted with
+an explicit `single-thread compatibility only` limitation, while a present or
+explicitly forced incompatible carrier contract fails its named gate. A
+missing required declaration or version gate produces
 a named `FAIL` and a nonzero result instead of being hidden by a later build
 failure.
 
-The checker does not link or execute `libPorpoise`. A `COMPILE-COMPATIBLE`
+The compile-interface checker does not link or execute `libPorpoise`. A `COMPILE-COMPATIBLE`
 result is therefore not evidence of full-span validation, canonical XFB
 materialization, VI latching or presentation, exactly-once clearing, or any
 other runtime semantic conformance. Those properties require `libPorpoise`
@@ -97,9 +102,22 @@ consumer, and `2` means the probe itself could not run (for example, an unusable
 compiler environment). `--target linux` and `--target win64` select the
 corresponding generated-consumer defines; the default selects the current host.
 
-The default test suite self-tests this checker against in-repository positive
-and negative contract fixtures. It does not require or inspect a working
-`libPorpoise` checkout; probing one remains explicitly opt in.
+The opt-in Meson configuration also adds
+`libporpoise-real-build-run-smoke`. That test gives the shared
+`porpoise_project_build`/`porpoise_project_run` core a synthetic, non-title
+generated project. It configures the external checkout as a subproject with
+downloads, tests, and benchmarks disabled; links C and C++ plus stable
+`OSSetArenaLo`/`OSGetArenaLo` calls; requires a `PORPOISE_STATUS_V1 OK` result;
+then verifies and reruns the managed cache. Build output stays under the Tool's
+test build directory, and the dependency source is bound read-only rather than
+written. The default test suite still uses only in-repository fixtures and does
+not require or inspect a working `libPorpoise` checkout.
+
+CI runs both external gates on Linux and Windows against
+`libPorpoise` revision `5ac186098a22477d35c8e2dd96d29004cc163047` as the
+automated compatibility baseline. That pin belongs only to CI: generated
+projects and users may still select a different local checkout, and Porpoise
+Tool does not download or rewrite it.
 
 ## Command line
 
@@ -112,7 +130,11 @@ porpoise INPUT --output DIR [--config FILE] [--abi FILE]
          [--quiet | --verbose]
 
 porpoise --project FILE [--target ID ...] [--analyze-only]
-         [--report FILE] [--dtk FILE] [--force]
+         [--report FILE] [--dtk FILE] [--force] [--build] [--run]
+         [--libporpoise DIR] [--meson FILE] [--cc FILE] [--cxx FILE]
+         [--dvd-root DIR]
+         [--build-type debugoptimized|debug|release]
+         [--trace FILE] [--frame-limit N]
          [--quiet | --verbose]
 ```
 
@@ -130,6 +152,16 @@ porpoise --project FILE [--target ID ...] [--analyze-only]
 | `--sdk-catalog FILE` | Add a strict exact-signature SDK catalog. |
 | `--sdk-policy POLICY` | `keep` (default), `imported`, or `omit`; fuzzy, ambiguous, and map-only evidence never changes output. |
 | `--dtk FILE` | Project mode only: select the DTK executable used by managed ELF targets instead of `PORPOISE_DTK` or `PATH`. |
+| `--build` | Project mode only: generate and build the selected targets after their plans and title-host profiles validate. |
+| `--run` | Project mode only: build and run exactly one target. It implies `--build`. |
+| `--libporpoise DIR` | Select the machine-local libPorpoise checkout for Build/Run. |
+| `--meson FILE` | Select the Meson executable used by Build/Run. Meson 1.2 or newer is required. |
+| `--cc FILE` | Select the x64 C compiler used by Build/Run. |
+| `--cxx FILE` | Select the matching x64 C++ compiler. Its family, target, version, and runtime must agree with `--cc`. |
+| `--dvd-root DIR` | Supply `PORPOISE_DVD_ROOT` while running a title whose reviewed profile enables native DVD initialization. |
+| `--build-type TYPE` | Use `debugoptimized` (default), `debug`, or `release` for the managed build. |
+| `--trace FILE` | Write optional JSONL call, return, approximation, frame, and first-fault evidence while running. Relative paths use the directory where Porpoise was invoked; missing parent directories are created before Run. |
+| `--frame-limit N` | Stop a test run after `N` presented frames; `N` must be at least 1. |
 | `--module NAME` | Scope map evidence to a DOL/REL module identity. |
 | `--entry SYMBOL` | Select a translated function for the generated `DolphinMain`. |
 | `--force` | Atomically replace an existing nonempty destination after generation succeeds. This is CLI-only. |
@@ -143,14 +175,60 @@ Duplicate options, extra positional arguments, unknown options, and using both `
 
 ### Recovery project mode
 
-A strict schema-version 1 `.porpoise.json` file can describe shared SDK/ABI
-inputs and several named targets. With no selector, every enabled target is
+A strict schema-version 2 `.porpoise.json` file describes shared SDK/ABI
+inputs and several named targets. Version 1 projects remain readable; their
+next canonical save writes version 2 and adds `title_host: null` until a
+bootstrap profile has been reviewed. With no selector, every enabled target is
 analyzed, staged, and published all-or-nothing. `--target` is repeatable and an
-explicit selector may run a disabled target. `--analyze-only` builds and
+explicit selector may process a disabled target. `--analyze-only` builds and
 validates plans without publishing; `--report` writes the aggregate schema-v3
-report. `--force` remains operational and is never saved.
+report. Translation analysis remains available when a title-host profile is
+missing or stale.
 
-`--dtk FILE` is also operational and is never saved. It selects the executable
+Schema version 2 adds a portable per-target `title_host` profile. It binds a
+reviewed entry address and 32 GPRs, arena bounds, ordered lifted startup
+functions, bounded initial guest words, DVD initialization intent, and source
+digests to the current analysis. Build/Run rejects stale fingerprints, invalid
+register or arena state, and startup functions that no longer resolve to
+`Lift`. The generated C99 title-host is created inside managed build staging;
+assembly and generated translation output remain immutable.
+
+`--build` runs the managed Preflight, Bind Dependencies, Configure, Compile,
+and Stage Runtime phases. `--run` implies Build and requires exactly one
+resolved target. Build/Run validates Meson 1.2+, an x64 matched C/C++
+toolchain, and a mixed-language link probe before configuring the title. The
+default build type is `debugoptimized`.
+
+The libPorpoise checkout, Meson and compiler executables, DVD root, trace file,
+and other operational paths are machine-local. CLI overrides, `--dtk`, and
+`--force` are never written into the shared project file. The desktop
+workbench stores reusable selections in per-project machine state instead.
+Build caches live beside the project under `.porpoise-build/`.
+
+A libPorpoise checkout without the versioned host-thread carrier is supported
+as **single-thread compatibility only**. Build and ordinary single-thread boot
+may proceed, but a reached sleep, wake, suspend, resume, exit, or other
+carrier-dependent path fails explicitly; Porpoise Tool does not invent a
+private thread carrier.
+
+For example, build one reviewed target with a matched local toolchain:
+
+```sh
+porpoise --project recovery.porpoise.json --target main-dol --build \
+  --libporpoise /path/to/libPorpoise --meson /path/to/meson \
+  --cc /path/to/gcc --cxx /path/to/g++ --build-type debugoptimized
+```
+
+Run it with bounded first-boot evidence:
+
+```sh
+porpoise --project recovery.porpoise.json --target main-dol --run \
+  --libporpoise /path/to/libPorpoise --meson /path/to/meson \
+  --cc /path/to/gcc --cxx /path/to/g++ --dvd-root /path/to/dvd-root \
+  --trace traces/first-boot.jsonl --frame-limit 300
+```
+
+`--dtk FILE` is operational and is never saved. It selects the executable
 for managed ELF imports, which makes local or patched DTK builds reproducible.
 Canonical DTK `link_order.txt` object entries such as `path/to/foo.o` resolve
 to `asm/path/to/foo.s`; prepared trees may list `.s`/`.S` paths directly. See
@@ -158,7 +236,8 @@ the [workbench input stages](docs/RECOVERY_WORKBENCH.md#input-stages) for the
 scoped DTK 1.8.3 executable-import patch and patched-binary workflow.
 
 Project mode is mutually exclusive with positional `INPUT`, `--output`,
-`--config`, and all classic input-setting flags. See
+`--config`, and all classic input-setting flags. `--analyze-only` cannot be
+combined with `--build` or `--run`. See
 [Recovery project files and CLI](docs/RECOVERY_PROJECT.md) and the
 [redacted example](docs/examples/recovery-workbench.porpoise.json).
 

@@ -13,12 +13,14 @@
 #include <limits>
 #include <sstream>
 #include <system_error>
+#include <utility>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -49,6 +51,57 @@ bool Replace(char *&destination, const std::string &value,
 
 std::string NullToEmpty(const char *value) {
     return value == nullptr ? std::string() : std::string(value);
+}
+
+void AppendBoundedLog(
+    std::vector<std::string> *logs,
+    std::string line) {
+    constexpr std::size_t kMaximumLines = 4096U;
+    constexpr std::size_t kTrimLines = 1024U;
+    constexpr std::size_t kMaximumLineLength = 4096U;
+    if (logs == nullptr || line.empty()) return;
+    if (line.size() > kMaximumLineLength) {
+        line.resize(kMaximumLineLength - 3U);
+        line.append("...");
+    }
+    if (logs->size() >= kMaximumLines) {
+        logs->erase(
+            logs->begin(),
+            logs->begin() + static_cast<std::ptrdiff_t>(kTrimLines));
+    }
+    logs->push_back(std::move(line));
+}
+
+bool IsFilesystemLink(const std::filesystem::path &path, bool *is_link) {
+    if (is_link == nullptr) return false;
+    *is_link = false;
+#if defined(_WIN32)
+    const DWORD attributes = GetFileAttributesA(path.string().c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        const DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+    }
+    *is_link = (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U;
+    return true;
+#else
+    struct stat status;
+    if (lstat(path.string().c_str(), &status) != 0) return errno == ENOENT;
+    *is_link = S_ISLNK(status.st_mode);
+    return true;
+#endif
+}
+
+bool SameRuntimePreflightRequest(
+    const BuildRunRequest &left, const BuildRunRequest &right) {
+    return left.target_id == right.target_id &&
+           left.generated_directory == right.generated_directory &&
+           left.libporpoise_directory == right.libporpoise_directory &&
+           left.title_host_directory == right.title_host_directory &&
+           left.meson_executable == right.meson_executable &&
+           left.c_compiler == right.c_compiler &&
+           left.cpp_compiler == right.cpp_compiler &&
+           left.build_type == right.build_type &&
+           left.generated_plan_digest == right.generated_plan_digest;
 }
 
 void FreePath(PorpoiseRecoveryPath &path) {
@@ -118,6 +171,7 @@ void FreeTarget(PorpoiseRecoveryTarget &target) {
         FreeAnnotation(target.annotations[index]);
     std::free(target.annotations);
     FreeCache(target.cache);
+    porpoise_recovery_title_host_profile_free(&target.title_host);
     target = {};
 }
 
@@ -727,6 +781,59 @@ void ReleasePathRebindings(
 
 }  // namespace
 
+bool RemoveTargetBuildCache(const std::string &project_file,
+                            const std::string &target_id,
+                            std::string *error_out) {
+    auto fail = [&](const std::string &message) {
+        if (error_out != nullptr) *error_out = message;
+        return false;
+    };
+    if (error_out != nullptr) error_out->clear();
+    if (project_file.empty() ||
+        !porpoise_recovery_target_id_is_valid(target_id.c_str())) {
+        return fail("the project path or target id is invalid for cache cleanup");
+    }
+
+    char cache_key[PORPOISE_RECOVERY_TARGET_CACHE_KEY_SIZE];
+    if (!porpoise_recovery_target_cache_key(target_id.c_str(), cache_key))
+        return fail("the target cache key could not be derived safely");
+
+    std::error_code error;
+    const auto project = std::filesystem::absolute(project_file, error)
+                             .lexically_normal();
+    if (error || !project.has_parent_path()) {
+        return fail("the project path could not be resolved safely");
+    }
+    const auto cache_parent =
+        (project.parent_path() / ".porpoise-build").lexically_normal();
+    const auto root = (cache_parent / cache_key).lexically_normal();
+    if (root.parent_path() != cache_parent) {
+        return fail("the resolved cache path failed the project-boundary check");
+    }
+
+    bool parent_is_link = false;
+    if (!IsFilesystemLink(cache_parent, &parent_is_link)) {
+        return fail("the build-cache parent could not be inspected safely");
+    }
+    if (parent_is_link) {
+        return fail("the build-cache parent is a filesystem link or reparse point");
+    }
+
+    PorpoiseDiagnostics diagnostics;
+    porpoise_diagnostics_init(&diagnostics);
+    const bool removed =
+        porpoise_remove_tree(root.string().c_str(), &diagnostics);
+    if (!removed) {
+        std::string message = "the target build cache could not be removed";
+        if (diagnostics.count != 0U && diagnostics.items[0].message != nullptr)
+            message = diagnostics.items[0].message;
+        porpoise_diagnostics_free(&diagnostics);
+        return fail(message);
+    }
+    porpoise_diagnostics_free(&diagnostics);
+    return true;
+}
+
 bool FunctionFilterMatches(
     const std::string &filter,
     const std::vector<std::string> &searchable_fields) {
@@ -762,12 +869,15 @@ WorkbenchModel::WorkbenchModel() {
     porpoise_recovery_project_init(&worker_project_);
     porpoise_recovery_run_result_init(&run_result_);
     porpoise_diagnostics_init(&diagnostics_);
+    porpoise_build_result_init(&build_result_);
+    porpoise_recovery_title_host_profile_init(&inferred_title_host_);
 }
 
 WorkbenchModel::~WorkbenchModel() {
     Cancel();
     Wait();
     porpoise_recovery_run_result_free(&run_result_);
+    porpoise_recovery_title_host_profile_free(&inferred_title_host_);
     porpoise_diagnostics_free(&diagnostics_);
     porpoise_recovery_project_free(&worker_project_);
     porpoise_recovery_project_free(&project_);
@@ -778,6 +888,112 @@ void WorkbenchModel::ClearRunResult() {
         worker_state_.load() == WorkerState::Cancelling) return;
     porpoise_recovery_run_result_free(&run_result_);
     porpoise_recovery_run_result_init(&run_result_);
+    ClearInferredTitleHostProfile();
+    ClearBuildResult();
+    ClearRuntimePreflight();
+}
+
+void WorkbenchModel::ClearInferredTitleHostProfile() {
+    porpoise_recovery_title_host_profile_free(&inferred_title_host_);
+    porpoise_recovery_title_host_profile_init(&inferred_title_host_);
+    inferred_title_host_target_.clear();
+    title_host_inference_issue_.clear();
+    inferred_title_host_ready_ = false;
+}
+
+void WorkbenchModel::ClearBuildResult() {
+    if (worker_state_.load() == WorkerState::Running ||
+        worker_state_.load() == WorkerState::Cancelling) return;
+    porpoise_build_result_init(&build_result_);
+    build_result_ready_ = false;
+}
+
+void WorkbenchModel::ClearRuntimePreflight() {
+    if (worker_state_.load() == WorkerState::Running ||
+        worker_state_.load() == WorkerState::Cancelling) return;
+    runtime_preflight_ = {};
+    runtime_preflight_request_ = {};
+    runtime_preflight_attempted_ = false;
+    runtime_preflight_ready_ = false;
+}
+
+bool WorkbenchModel::InferTitleHostProfile(const std::string &target_id) {
+    if (target_id.empty() || State() == WorkerState::Running ||
+        State() == WorkerState::Cancelling) return false;
+    const auto *target = porpoise_recovery_project_find_target(
+        &project_, target_id.c_str());
+    const auto *run_target = FindRunTarget(target_id);
+    if (target == nullptr || run_target == nullptr ||
+        run_target->plan == nullptr) {
+        ClearInferredTitleHostProfile();
+        return false;
+    }
+
+    PorpoiseRecoveryTitleHostProfile candidate;
+    porpoise_recovery_title_host_profile_init(&candidate);
+    PorpoiseDiagnostics inference_diagnostics;
+    porpoise_diagnostics_init(&inference_diagnostics);
+    const int result = porpoise_recovery_title_host_infer(
+        target, run_target->plan, &candidate, &inference_diagnostics);
+    std::string issue;
+    if (result != PORPOISE_EXIT_OK) {
+        for (std::size_t index = 0; index < inference_diagnostics.count;
+             ++index) {
+            const auto *message = inference_diagnostics.items[index].message;
+            if (message != nullptr && message[0] != '\0') issue = message;
+        }
+    }
+    porpoise_diagnostics_free(&inference_diagnostics);
+    if (result != PORPOISE_EXIT_OK) {
+        porpoise_recovery_title_host_profile_free(&candidate);
+        ClearInferredTitleHostProfile();
+        title_host_inference_issue_ = issue.empty()
+            ? "The current evidence is insufficient to infer a title host."
+            : issue;
+        return false;
+    }
+
+    ClearInferredTitleHostProfile();
+    inferred_title_host_ = candidate;
+    inferred_title_host_target_ = target_id;
+    inferred_title_host_ready_ = true;
+    return true;
+}
+
+const PorpoiseRecoveryTitleHostProfile *
+WorkbenchModel::InferredTitleHostProfile(
+    const std::string &target_id) const {
+    if (!inferred_title_host_ready_ || inferred_title_host_target_ != target_id)
+        return nullptr;
+    return &inferred_title_host_;
+}
+
+bool WorkbenchModel::AcceptInferredTitleHostProfile(
+    const std::string &target_id, bool initialize_dvd) {
+    if (State() == WorkerState::Running || State() == WorkerState::Cancelling ||
+        !inferred_title_host_ready_ || inferred_title_host_target_ != target_id)
+        return false;
+    auto *target = porpoise_recovery_project_find_target_mutable(
+        &project_, target_id.c_str());
+    if (target == nullptr) return false;
+    inferred_title_host_.initialize_dvd = initialize_dvd;
+    porpoise_recovery_title_host_profile_free(&target->title_host);
+    target->title_host = inferred_title_host_;
+    porpoise_recovery_title_host_profile_init(&inferred_title_host_);
+    target->has_title_host = true;
+    inferred_title_host_target_.clear();
+    title_host_inference_issue_.clear();
+    inferred_title_host_ready_ = false;
+    dirty_ = true;
+    ClearBuildResult();
+    ClearRuntimePreflight();
+    return true;
+}
+
+void WorkbenchModel::DiscardInferredTitleHostProfile() {
+    if (State() == WorkerState::Running || State() == WorkerState::Cancelling)
+        return;
+    ClearInferredTitleHostProfile();
 }
 
 void WorkbenchModel::ResetDiagnostics() {
@@ -816,6 +1032,7 @@ bool WorkbenchModel::NewProject() {
     document_path_.clear();
     dirty_ = false;
     worker_state_ = WorkerState::Idle;
+    worker_operation_ = WorkerOperation::None;
     return error.value() == 0;
 }
 
@@ -831,6 +1048,7 @@ bool WorkbenchModel::LoadProject(const std::string &path) {
     document_path_ = GenericPath(std::filesystem::absolute(path));
     dirty_ = false;
     worker_state_ = WorkerState::Idle;
+    worker_operation_ = WorkerOperation::None;
     return true;
 }
 
@@ -1058,6 +1276,7 @@ bool WorkbenchModel::AddTarget(const std::string &preferred_id) {
     if (State() == WorkerState::Running || State() == WorkerState::Cancelling)
         return false;
     std::string id = preferred_id.empty() ? "target" : preferred_id;
+    if (!porpoise_recovery_target_id_is_valid(id.c_str())) return false;
     auto exists = [&](const std::string &candidate) {
         return porpoise_recovery_project_find_target(&project_,
                                                      candidate.c_str()) != nullptr;
@@ -1067,6 +1286,11 @@ bool WorkbenchModel::AddTarget(const std::string &preferred_id) {
         for (unsigned int suffix = 2; exists(id); ++suffix)
             id = base + "-" + std::to_string(suffix);
     }
+    char encoded_output_leaf[PORPOISE_RECOVERY_TARGET_CACHE_KEY_SIZE];
+    if (!porpoise_recovery_target_cache_key(
+            id.c_str(), encoded_output_leaf))
+        return false;
+    const std::string output_leaf(encoded_output_leaf);
     auto *targets = static_cast<PorpoiseRecoveryTarget *>(std::realloc(
         project_.targets,
         (project_.target_count + 1) * sizeof(*project_.targets)));
@@ -1080,7 +1304,7 @@ bool WorkbenchModel::AddTarget(const std::string &preferred_id) {
     target.strict = false;
     target.sdk_policy = PORPOISE_SDK_POLICY_KEEP;
     if (target.id == nullptr || !SetPath(target.input, "input") ||
-        !SetPath(target.output, "porpoise-output/" + id)) {
+        !SetPath(target.output, "porpoise-output/" + output_leaf)) {
         FreeTarget(target);
         return false;
     }
@@ -1109,7 +1333,8 @@ bool WorkbenchModel::RemoveTarget(std::size_t target_index) {
 
 bool WorkbenchModel::SetTargetId(std::size_t target_index,
                                  const std::string &id) {
-    if (target_index >= project_.target_count || id.empty() ||
+    if (target_index >= project_.target_count ||
+        !porpoise_recovery_target_id_is_valid(id.c_str()) ||
         State() == WorkerState::Running || State() == WorkerState::Cancelling)
         return false;
     for (std::size_t index = 0; index < project_.target_count; ++index) {
@@ -1313,6 +1538,24 @@ void WorkbenchModel::ProgressThunk(void *user_data,
         phase, completed, total, detail);
 }
 
+void WorkbenchModel::BuildProgressThunk(
+    void *user_data, PorpoiseBuildPhase phase, std::size_t completed,
+    std::size_t total, const char *detail) {
+    static_cast<WorkbenchModel *>(user_data)->OnBuildProgress(
+        phase, completed, total, detail);
+}
+
+void WorkbenchModel::BuildLogThunk(
+    void *user_data, PorpoiseBuildPhase phase, bool standard_error,
+    const char *text, std::size_t length) {
+    static_cast<WorkbenchModel *>(user_data)->OnBuildLog(
+        phase, standard_error, text, length);
+}
+
+bool WorkbenchModel::BuildCancelThunk(void *user_data) {
+    return CancelThunk(user_data);
+}
+
 bool WorkbenchModel::CancelThunk(void *user_data) {
     return static_cast<WorkbenchModel *>(user_data)
         ->cancel_requested_.load();
@@ -1333,7 +1576,44 @@ void WorkbenchModel::OnProgress(PorpoiseOperationPhase phase,
     if (total != 0) line << '/' << total;
     if (detail != nullptr && detail[0] != '\0') line << ": " << detail;
     std::lock_guard<std::mutex> lock(log_mutex_);
-    if (logs_.empty() || logs_.back() != line.str()) logs_.push_back(line.str());
+    if (logs_.empty() || logs_.back() != line.str())
+        AppendBoundedLog(&logs_, line.str());
+}
+
+void WorkbenchModel::OnBuildProgress(
+    PorpoiseBuildPhase phase, std::size_t completed, std::size_t total,
+    const char *detail) {
+    {
+        std::lock_guard<std::mutex> lock(progress_mutex_);
+        build_progress_.phase = phase;
+        build_progress_.completed = completed;
+        build_progress_.total = total;
+        build_progress_.detail = detail == nullptr ? "" : detail;
+    }
+    std::ostringstream line;
+    line << porpoise_build_phase_name(phase) << ' ' << completed;
+    if (total != 0) line << '/' << total;
+    if (detail != nullptr && detail[0] != '\0') line << ": " << detail;
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    if (logs_.empty() || logs_.back() != line.str())
+        AppendBoundedLog(&logs_, line.str());
+}
+
+void WorkbenchModel::OnBuildLog(
+    PorpoiseBuildPhase phase, bool standard_error, const char *text,
+    std::size_t length) {
+    if (text == nullptr || length == 0) return;
+    std::istringstream input(std::string(text, length));
+    std::string payload;
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    while (std::getline(input, payload)) {
+        if (!payload.empty() && payload.back() == '\r') payload.pop_back();
+        if (payload.empty()) continue;
+        AppendBoundedLog(
+            &logs_,
+            std::string(standard_error ? "stderr" : "stdout") + " [" +
+            porpoise_build_phase_name(phase) + "]: " + payload);
+    }
 }
 
 bool WorkbenchModel::Start(const RunRequest &request) {
@@ -1347,6 +1627,7 @@ bool WorkbenchModel::Start(const RunRequest &request) {
     porpoise_recovery_project_init(&worker_project_);
     worker_project_ready_ = false;
     replan_worker_ = false;
+    worker_operation_ = WorkerOperation::Recovery;
     const auto document = std::filesystem::path(document_path_);
     const auto snapshot_path = document.parent_path() /
         (".porpoise-run-" +
@@ -1390,6 +1671,116 @@ bool WorkbenchModel::Start(const RunRequest &request) {
     return true;
 }
 
+bool WorkbenchModel::StartRuntimePreflight(
+    const BuildRunRequest &requested) {
+    PollWorker();
+    if (worker_.joinable() || document_path_.empty() ||
+        requested.target_id.empty() ||
+        State() == WorkerState::Running || State() == WorkerState::Cancelling)
+        return false;
+
+    BuildRunRequest request = requested;
+    auto *target = porpoise_recovery_project_find_target_mutable(
+        &project_, request.target_id.c_str());
+    auto *run_target = FindRunTarget(request.target_id);
+    if (request.generated_directory.empty() && target != nullptr &&
+        target->output.resolved != nullptr) {
+        request.generated_directory = target->output.resolved;
+    }
+    const bool reviewed_profile_ready =
+        target != nullptr && run_target != nullptr &&
+        run_target->plan != nullptr && run_target->generated &&
+        run_target->published;
+    if (!reviewed_profile_ready && request.title_host_directory.empty()) {
+        ResetDiagnostics();
+        AddLocalDiagnostic(
+            PORPOISE_SEVERITY_ERROR,
+            "generate the selected target successfully before validating "
+            "its runtime configuration");
+        ClearRuntimePreflight();
+        runtime_preflight_request_ = request;
+        runtime_preflight_attempted_ = true;
+        worker_state_ = WorkerState::Failed;
+        worker_operation_ = WorkerOperation::RuntimePreflight;
+        last_exit_code_ = PORPOISE_EXIT_USAGE;
+        return false;
+    }
+
+    ClearRuntimePreflight();
+    runtime_preflight_request_ = request;
+    runtime_preflight_attempted_ = true;
+    ResetDiagnostics();
+    {
+        std::lock_guard<std::mutex> lock(progress_mutex_);
+        progress_ = {};
+        build_progress_ = {};
+    }
+    {
+        std::lock_guard<std::mutex> lock(log_mutex_);
+        logs_.clear();
+    }
+    cancel_requested_ = false;
+    worker_finished_ = false;
+    last_exit_code_ = PORPOISE_EXIT_OK;
+    worker_project_ready_ = false;
+    replan_worker_ = false;
+    worker_operation_ = WorkerOperation::RuntimePreflight;
+    worker_state_ = WorkerState::Running;
+    worker_ = std::thread(
+        &WorkbenchModel::RuntimePreflightWorkerMain, this,
+        std::move(request));
+    return true;
+}
+
+bool WorkbenchModel::StartBuild(const BuildRunRequest &requested) {
+    PollWorker();
+    if (worker_.joinable() || document_path_.empty() ||
+        requested.target_id.empty() ||
+        State() == WorkerState::Running || State() == WorkerState::Cancelling)
+        return false;
+
+    auto *run_target = FindRunTarget(requested.target_id);
+    auto *target = porpoise_recovery_project_find_target_mutable(
+        &project_, requested.target_id.c_str());
+    if (run_target == nullptr || run_target->plan == nullptr ||
+        target == nullptr || !run_target->generated || !run_target->published) {
+        ResetDiagnostics();
+        AddLocalDiagnostic(
+            PORPOISE_SEVERITY_ERROR,
+            "generate the selected target successfully before building it");
+        worker_state_ = WorkerState::Failed;
+        worker_operation_ = requested.run
+            ? WorkerOperation::Run : WorkerOperation::Build;
+        last_exit_code_ = PORPOISE_EXIT_USAGE;
+        return false;
+    }
+
+    BuildRunRequest request = requested;
+    if (request.generated_directory.empty() && target->output.resolved != nullptr)
+        request.generated_directory = target->output.resolved;
+    ResetDiagnostics();
+    {
+        std::lock_guard<std::mutex> lock(progress_mutex_);
+        progress_ = {};
+        build_progress_ = {};
+    }
+    {
+        std::lock_guard<std::mutex> lock(log_mutex_);
+        logs_.clear();
+    }
+    cancel_requested_ = false;
+    worker_finished_ = false;
+    last_exit_code_ = PORPOISE_EXIT_OK;
+    worker_project_ready_ = false;
+    replan_worker_ = false;
+    worker_operation_ = request.run
+        ? WorkerOperation::Run : WorkerOperation::Build;
+    worker_state_ = WorkerState::Running;
+    worker_ = std::thread(
+        &WorkbenchModel::BuildWorkerMain, this, std::move(request));
+    return true;
+}
+
 bool WorkbenchModel::StartReplan(
     const std::vector<std::string> &target_ids) {
     PollWorker();
@@ -1398,6 +1789,9 @@ bool WorkbenchModel::StartReplan(
         State() == WorkerState::Cancelling) {
         return false;
     }
+    ClearBuildResult();
+    ClearRuntimePreflight();
+    ClearInferredTitleHostProfile();
     ResetDiagnostics();
     {
         std::lock_guard<std::mutex> lock(progress_mutex_);
@@ -1411,6 +1805,7 @@ bool WorkbenchModel::StartReplan(
     worker_finished_ = false;
     last_exit_code_ = PORPOISE_EXIT_OK;
     replan_worker_ = true;
+    worker_operation_ = WorkerOperation::Replan;
     worker_state_ = WorkerState::Running;
     worker_ = std::thread(
         &WorkbenchModel::ReplanWorkerMain, this, target_ids);
@@ -1444,6 +1839,127 @@ void WorkbenchModel::WorkerMain(RunRequest request) {
         &worker_project_, &options, &run_result_, &diagnostics_);
     last_exit_code_ = result;
     /* PollWorker/Wait publishes the terminal state after joining. */
+    worker_finished_ = true;
+}
+
+void WorkbenchModel::RuntimePreflightWorkerMain(BuildRunRequest request) {
+    PorpoiseBuildRequest build_request;
+    porpoise_build_request_init(&build_request);
+    build_request.project_file = document_path_.c_str();
+    build_request.target_id = request.target_id.c_str();
+    build_request.generated_directory = request.generated_directory.c_str();
+    build_request.libporpoise_directory =
+        request.libporpoise_directory.c_str();
+    const auto *run_target = FindRunTarget(request.target_id);
+    if (request.title_host_directory.empty()) {
+        build_request.recovery_target =
+            porpoise_recovery_project_find_target(
+                &project_, request.target_id.c_str());
+        build_request.plan = run_target == nullptr ? nullptr : run_target->plan;
+    } else {
+        build_request.title_host_directory =
+            request.title_host_directory.c_str();
+    }
+    build_request.meson_executable = request.meson_executable.empty()
+        ? nullptr : request.meson_executable.c_str();
+    build_request.c_compiler = request.c_compiler.empty()
+        ? nullptr : request.c_compiler.c_str();
+    build_request.cpp_compiler = request.cpp_compiler.empty()
+        ? nullptr : request.cpp_compiler.c_str();
+    build_request.build_type = request.build_type.empty()
+        ? nullptr : request.build_type.c_str();
+    build_request.generated_plan_digest = request.generated_plan_digest.empty()
+        ? nullptr : request.generated_plan_digest.c_str();
+    build_request.callbacks.progress = &WorkbenchModel::BuildProgressThunk;
+    build_request.callbacks.log = &WorkbenchModel::BuildLogThunk;
+    build_request.callbacks.cancelled = &WorkbenchModel::BuildCancelThunk;
+    build_request.callbacks.user_data = this;
+
+    PorpoiseBuildPreflight candidate{};
+    const int result = porpoise_build_preflight(
+        &build_request, &candidate, &diagnostics_);
+    if (result == PORPOISE_EXIT_OK) {
+        runtime_preflight_ = candidate;
+        runtime_preflight_ready_ = true;
+    } else {
+        runtime_preflight_ = {};
+        runtime_preflight_ready_ = false;
+    }
+    last_exit_code_ = result;
+    worker_finished_ = true;
+}
+
+void WorkbenchModel::BuildWorkerMain(BuildRunRequest request) {
+    PorpoiseBuildRequest build_request;
+    porpoise_build_request_init(&build_request);
+    build_request.project_file = document_path_.c_str();
+    build_request.target_id = request.target_id.c_str();
+    build_request.generated_directory = request.generated_directory.c_str();
+    build_request.libporpoise_directory =
+        request.libporpoise_directory.c_str();
+    const auto *run_target = FindRunTarget(request.target_id);
+    if (request.title_host_directory.empty()) {
+        build_request.recovery_target =
+            porpoise_recovery_project_find_target(
+                &project_, request.target_id.c_str());
+        build_request.plan = run_target == nullptr ? nullptr : run_target->plan;
+    } else {
+        build_request.title_host_directory =
+            request.title_host_directory.c_str();
+    }
+    build_request.meson_executable = request.meson_executable.empty()
+        ? nullptr : request.meson_executable.c_str();
+    build_request.c_compiler = request.c_compiler.empty()
+        ? nullptr : request.c_compiler.c_str();
+    build_request.cpp_compiler = request.cpp_compiler.empty()
+        ? nullptr : request.cpp_compiler.c_str();
+    build_request.objdump_executable = request.objdump_executable.empty()
+        ? nullptr : request.objdump_executable.c_str();
+    build_request.build_type = request.build_type.empty()
+        ? nullptr : request.build_type.c_str();
+    build_request.generated_plan_digest = request.generated_plan_digest.empty()
+        ? nullptr : request.generated_plan_digest.c_str();
+    build_request.run_working_directory = request.run_working_directory.empty()
+        ? nullptr : request.run_working_directory.c_str();
+    build_request.dvd_root = request.dvd_root.empty()
+        ? nullptr : request.dvd_root.c_str();
+    build_request.trace_file = request.trace_file.empty()
+        ? nullptr : request.trace_file.c_str();
+    build_request.frame_limit = request.frame_limit;
+
+    std::vector<const char *> runtime_directories;
+    runtime_directories.reserve(request.runtime_search_directories.size());
+    for (const auto &directory : request.runtime_search_directories)
+        runtime_directories.push_back(directory.c_str());
+    std::vector<const char *> run_arguments;
+    run_arguments.reserve(request.run_arguments.size());
+    for (const auto &argument : request.run_arguments)
+        run_arguments.push_back(argument.c_str());
+    build_request.runtime_search_directories = runtime_directories.empty()
+        ? nullptr : runtime_directories.data();
+    build_request.runtime_search_directory_count = runtime_directories.size();
+    build_request.run_arguments = run_arguments.empty()
+        ? nullptr : run_arguments.data();
+    build_request.run_argument_count = run_arguments.size();
+    build_request.allow_copy_fallback = request.allow_copy_fallback;
+    build_request.force_reconfigure = request.force_reconfigure;
+    build_request.callbacks.progress = &WorkbenchModel::BuildProgressThunk;
+    build_request.callbacks.log = &WorkbenchModel::BuildLogThunk;
+    build_request.callbacks.cancelled = &WorkbenchModel::BuildCancelThunk;
+    build_request.callbacks.user_data = this;
+
+    PorpoiseBuildResult candidate;
+    porpoise_build_result_init(&candidate);
+    int result = porpoise_project_build(
+        &build_request, &candidate, &diagnostics_);
+    if (result == PORPOISE_EXIT_OK && request.run)
+        result = porpoise_project_run(
+            &build_request, &candidate, &diagnostics_);
+    if (result == PORPOISE_EXIT_OK || candidate.executable_available) {
+        build_result_ = candidate;
+        build_result_ready_ = candidate.executable_available;
+    }
+    last_exit_code_ = result;
     worker_finished_ = true;
 }
 
@@ -1493,6 +2009,17 @@ void WorkbenchModel::Wait() {
 }
 
 void WorkbenchModel::AdoptWorkerProject() {
+    if (worker_operation_ == WorkerOperation::RuntimePreflight ||
+        worker_operation_ == WorkerOperation::Build ||
+        worker_operation_ == WorkerOperation::Run) {
+        const int result = last_exit_code_.load();
+        if (result == PORPOISE_EXIT_OK) worker_state_ = WorkerState::Succeeded;
+        else if (result == PORPOISE_EXIT_CANCELLED ||
+                 cancel_requested_.load()) {
+            worker_state_ = WorkerState::Cancelled;
+        } else worker_state_ = WorkerState::Failed;
+        return;
+    }
     if (replan_worker_) {
         replan_worker_ = false;
         const int result = last_exit_code_.load();
@@ -1524,6 +2051,31 @@ void WorkbenchModel::AdoptWorkerProject() {
 ProgressSnapshot WorkbenchModel::Progress() const {
     std::lock_guard<std::mutex> lock(progress_mutex_);
     return progress_;
+}
+
+BuildProgressSnapshot WorkbenchModel::BuildProgress() const {
+    std::lock_guard<std::mutex> lock(progress_mutex_);
+    return build_progress_;
+}
+
+const PorpoiseBuildResult *WorkbenchModel::BuildResult() const {
+    if (State() == WorkerState::Running ||
+        State() == WorkerState::Cancelling || worker_.joinable() ||
+        !build_result_ready_) return nullptr;
+    return &build_result_;
+}
+
+const PorpoiseBuildPreflight *WorkbenchModel::RuntimePreflightResult() const {
+    if (State() == WorkerState::Running ||
+        State() == WorkerState::Cancelling || worker_.joinable() ||
+        !runtime_preflight_ready_) return nullptr;
+    return &runtime_preflight_;
+}
+
+bool WorkbenchModel::RuntimePreflightRequestMatches(
+    const BuildRunRequest &request) const {
+    return runtime_preflight_attempted_ &&
+           SameRuntimePreflightRequest(runtime_preflight_request_, request);
 }
 
 std::vector<std::string> WorkbenchModel::Logs() const {
@@ -1829,6 +2381,8 @@ int WorkbenchModel::ReplanLoadedTarget(
     if (result != PORPOISE_EXIT_OK) return result;
     porpoise_plan_free(run_target->plan);
     run_target->plan = candidate;
+    run_target->generated = false;
+    run_target->published = false;
     result = porpoise_plan_validate(candidate, &diagnostics_);
     if (result == PORPOISE_EXIT_OK) {
         result = porpoise_recovery_annotations_validate(
@@ -2205,6 +2759,18 @@ const char *WorkerStateName(WorkerState state) {
     case WorkerState::Succeeded: return "succeeded";
     case WorkerState::Failed: return "failed";
     case WorkerState::Cancelled: return "cancelled";
+    }
+    return "unknown";
+}
+
+const char *WorkerOperationName(WorkerOperation operation) {
+    switch (operation) {
+    case WorkerOperation::None: return "idle";
+    case WorkerOperation::Recovery: return "recovery";
+    case WorkerOperation::Replan: return "replan";
+    case WorkerOperation::RuntimePreflight: return "runtime preflight";
+    case WorkerOperation::Build: return "build";
+    case WorkerOperation::Run: return "run";
     }
     return "unknown";
 }

@@ -630,6 +630,218 @@ static void test_policies(
     porpoise_diagnostics_free(&diagnostics);
 }
 
+static void test_interior_entry_policy_fallback(
+    const char *source_root,
+    const char *catalog,
+    const char *contract_catalog,
+    const char *audited_vtx_desc_catalog,
+    const char *audited_vtx_fmt_catalog,
+    const char *abi) {
+    char input[PORPOISE_PATH_CAPACITY];
+    PorpoiseSession *session = NULL;
+    PorpoiseTranslationPlan *plan = NULL;
+    PorpoisePlanOptions options;
+    PorpoiseFunctionOverride override;
+    PorpoiseFunctionSignature signature;
+    PorpoiseDiagnostics diagnostics;
+    const PorpoiseProgram *program;
+    const PorpoiseFunction *function;
+    const PorpoiseFunctionPlanView *view;
+    uint32_t function_address = 0U;
+    uint32_t function_size = 0U;
+
+    CHECK(path_join(
+        input, sizeof(input), source_root,
+        "tests/fixtures/inputs/address_taken_jump_table"));
+    porpoise_diagnostics_init(&diagnostics);
+    CHECK(open_session(input, NULL, NULL, &session, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    program = porpoise_session_program(session);
+    function = find_function(program, "jump_dispatch");
+    CHECK(function != NULL && function->address_taken_entry_count == 2U);
+    CHECK(porpoise_signature_compute(program, function, &signature));
+    CHECK(porpoise_signature_is_automatic_match_eligible(&signature));
+    if (function != NULL) {
+        function_address = function->start_address;
+        function_size = function->size;
+    }
+    porpoise_session_close(session);
+    session = NULL;
+
+    CHECK(create_direct_contract_catalog(
+        catalog, "gx.a/jump_dispatch.c/jump_dispatch", NULL, &signature));
+    CHECK(create_direct_contract_catalog(
+        contract_catalog, "gx.a/jump_dispatch.c/jump_dispatch",
+        "gx_direct_contract", &signature));
+    CHECK(create_direct_contract_catalog(
+        audited_vtx_desc_catalog,
+        "gx.a/GXAttr.c/GXSetVtxDesc", NULL, &signature));
+    CHECK(create_direct_contract_catalog(
+        audited_vtx_fmt_catalog,
+        "gx.a/GXAttr.c/GXSetVtxAttrFmt", NULL, &signature));
+
+    CHECK(open_session(input, catalog, NULL, &session, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    porpoise_plan_options_init(&options);
+    options.entry_symbol = "safe_anchor";
+    options.target_id = "sample";
+    options.module = "main";
+    options.sdk_policy = PORPOISE_SDK_POLICY_OMIT;
+    CHECK(porpoise_plan_build(
+              session, &options, &plan, &diagnostics) == PORPOISE_EXIT_OK);
+    view = porpoise_plan_find_function(plan, "jump_dispatch");
+    CHECK(view != NULL &&
+          view->requested_action == PORPOISE_PLAN_ACTION_OMIT);
+    CHECK(view != NULL && view->action == PORPOISE_PLAN_ACTION_LIFT);
+    CHECK(view != NULL && view->origin == PORPOISE_PLAN_ORIGIN_SDK_POLICY);
+    CHECK(view != NULL && !view->blocked && view->binding == NULL);
+    CHECK(porpoise_plan_validate(plan, &diagnostics) == PORPOISE_EXIT_OK);
+    porpoise_plan_free(plan);
+    plan = NULL;
+
+    memset(&override, 0, sizeof(override));
+    override.module = "main";
+    override.address = function_address;
+    override.size = function_size;
+    override.normalized_fingerprint = signature.digest_hex;
+    override.action = PORPOISE_OVERRIDE_OMIT;
+    options.sdk_policy = PORPOISE_SDK_POLICY_KEEP;
+    options.overrides = &override;
+    options.override_count = 1U;
+    CHECK(porpoise_plan_build(
+              session, &options, &plan, &diagnostics) == PORPOISE_EXIT_OK);
+    view = porpoise_plan_find_function(plan, "jump_dispatch");
+    CHECK(view != NULL && view->action == PORPOISE_PLAN_ACTION_OMIT);
+    CHECK(view != NULL && view->blocked);
+    CHECK(porpoise_plan_validate(plan, &diagnostics) ==
+          PORPOISE_EXIT_TRANSLATION);
+    porpoise_plan_free(plan);
+    porpoise_session_close(session);
+    plan = NULL;
+    session = NULL;
+    porpoise_diagnostics_free(&diagnostics);
+    porpoise_diagnostics_init(&diagnostics);
+
+    CHECK(open_session_with_abi(
+              input, contract_catalog, abi, &session, &diagnostics) ==
+          PORPOISE_EXIT_OK);
+    porpoise_plan_options_init(&options);
+    options.entry_symbol = "safe_anchor";
+    options.target_id = "sample";
+    options.module = "main";
+    options.sdk_policy = PORPOISE_SDK_POLICY_IMPORTED;
+    CHECK(porpoise_plan_build(
+              session, &options, &plan, &diagnostics) == PORPOISE_EXIT_OK);
+    view = porpoise_plan_find_function(plan, "jump_dispatch");
+    CHECK(view != NULL &&
+          view->requested_action == PORPOISE_PLAN_ACTION_IMPORT);
+    CHECK(view != NULL && view->action == PORPOISE_PLAN_ACTION_LIFT);
+    CHECK(view != NULL && view->origin == PORPOISE_PLAN_ORIGIN_SDK_POLICY);
+    CHECK(view != NULL && !view->blocked && view->binding == NULL);
+    CHECK(porpoise_plan_validate(plan, &diagnostics) == PORPOISE_EXIT_OK);
+    porpoise_plan_free(plan);
+    porpoise_session_close(session);
+    porpoise_diagnostics_free(&diagnostics);
+
+    {
+        static const struct {
+            const char *adapter;
+        } audited[] = {
+            {
+                "porpoise_libporpoise_gx_set_vtx_desc_adapter"
+            },
+            {
+                "porpoise_libporpoise_gx_set_vtx_attr_fmt_adapter"
+            }
+        };
+        size_t index;
+
+        /* Assign at runtime because the test paths are caller-owned. */
+        for (index = 0U; index < sizeof(audited) / sizeof(audited[0]); index++) {
+            const char *selected_catalog = index == 0U
+                ? audited_vtx_desc_catalog
+                : audited_vtx_fmt_catalog;
+
+            session = NULL;
+            plan = NULL;
+            porpoise_diagnostics_init(&diagnostics);
+            CHECK(open_session(
+                      input,
+                      selected_catalog,
+                      NULL,
+                      &session,
+                      &diagnostics) == PORPOISE_EXIT_OK);
+            porpoise_plan_options_init(&options);
+            options.entry_symbol = "safe_anchor";
+            options.target_id = "sample";
+            options.module = "main";
+            options.sdk_policy = PORPOISE_SDK_POLICY_IMPORTED;
+            CHECK(porpoise_plan_build(
+                      session, &options, &plan, &diagnostics) ==
+                  PORPOISE_EXIT_OK);
+            view = porpoise_plan_find_function(plan, "jump_dispatch");
+            CHECK(view != NULL &&
+                  view->requested_action == PORPOISE_PLAN_ACTION_IMPORT);
+            CHECK(view != NULL && view->action == PORPOISE_PLAN_ACTION_IMPORT);
+            CHECK(view != NULL && !view->blocked && view->binding != NULL);
+            CHECK(view != NULL && view->binding != NULL &&
+                  view->binding->adapter != NULL &&
+                  strcmp(view->binding->adapter, audited[index].adapter) == 0);
+            CHECK(porpoise_plan_validate(plan, &diagnostics) ==
+                  PORPOISE_EXIT_OK);
+
+            if (index == 0U) {
+                const char *output =
+                    ".porpoise-sdk-policy-audited-interior-output";
+                char runtime[PORPOISE_PATH_CAPACITY];
+                char registry[PORPOISE_PATH_CAPACITY];
+                PorpoiseProjectOptions project_options;
+                PorpoiseReport report;
+                char *registry_text;
+
+                CHECK(path_join(runtime, sizeof(runtime), source_root,
+                                "runtime"));
+                CHECK(path_join(
+                    registry,
+                    sizeof(registry),
+                    output,
+                    "src/porpoise_function_registry_8000.c"));
+                CHECK(porpoise_remove_tree(output, &diagnostics));
+                porpoise_project_options_init(&project_options);
+                project_options.output_path = output;
+                project_options.runtime_directory = runtime;
+                project_options.entry_symbol = "safe_anchor";
+                project_options.force = true;
+                porpoise_report_init(&report);
+                CHECK(porpoise_project_generate_plan(
+                          plan,
+                          &project_options,
+                          &report,
+                          &diagnostics) == PORPOISE_EXIT_OK);
+                registry_text = read_file(registry);
+                CHECK(registry_text != NULL &&
+                      strstr(registry_text,
+                             "porpoise_import_jump_dispatch") != NULL);
+                CHECK(registry_text != NULL &&
+                      strstr(registry_text, "0x80008000") != NULL);
+                /* The private switch targets remain inert data only. No
+                 * callable interior registry entry survives codegen. */
+                CHECK(registry_text != NULL &&
+                      strstr(registry_text, "0x80008014") == NULL);
+                CHECK(registry_text != NULL &&
+                      strstr(registry_text, "0x8000801C") == NULL);
+                free(registry_text);
+                porpoise_report_free(&report);
+                CHECK(porpoise_remove_tree(output, &diagnostics));
+            }
+
+            porpoise_plan_free(plan);
+            porpoise_session_close(session);
+            porpoise_diagnostics_free(&diagnostics);
+        }
+    }
+}
+
 static void test_conflicts_and_overrides(
     const char *input,
     const char *catalog,
@@ -872,6 +1084,14 @@ int main(int argc, char **argv) {
         ".porpoise-sdk-policy-structural-catalog.json";
     const char *ambiguous_catalog =
         ".porpoise-sdk-policy-ambiguous-catalog.json";
+    const char *interior_catalog =
+        ".porpoise-sdk-policy-interior-catalog.json";
+    const char *interior_contract_catalog =
+        ".porpoise-sdk-policy-interior-contract-catalog.json";
+    const char *audited_vtx_desc_catalog =
+        ".porpoise-sdk-policy-audited-vtx-desc-catalog.json";
+    const char *audited_vtx_fmt_catalog =
+        ".porpoise-sdk-policy-audited-vtx-fmt-catalog.json";
     char input[PORPOISE_PATH_CAPACITY];
     char matching_map[PORPOISE_PATH_CAPACITY];
     char conflicting_map[PORPOISE_PATH_CAPACITY];
@@ -904,6 +1124,9 @@ int main(int argc, char **argv) {
         &structurally_changed_gx));
     CHECK(create_ambiguous_catalog(ambiguous_catalog, &gx));
     test_policies(argv[1], input, catalog, matching_map);
+    test_interior_entry_policy_fallback(
+        argv[1], interior_catalog, interior_contract_catalog,
+        audited_vtx_desc_catalog, audited_vtx_fmt_catalog, direct_abi);
     test_conflicts_and_overrides(input, catalog, conflicting_map, &gx);
     test_direct_contract_resolution(
         input, direct_catalog, direct_abi, &gx);
@@ -920,6 +1143,10 @@ int main(int argc, char **argv) {
     CHECK(remove(section_symbols) == 0);
     CHECK(remove(structural_catalog) == 0);
     CHECK(remove(ambiguous_catalog) == 0);
+    CHECK(remove(interior_catalog) == 0);
+    CHECK(remove(interior_contract_catalog) == 0);
+    CHECK(remove(audited_vtx_desc_catalog) == 0);
+    CHECK(remove(audited_vtx_fmt_catalog) == 0);
     if (failures != 0U) {
         fprintf(stderr, "%u SDK policy test(s) failed\n", failures);
         return 1;

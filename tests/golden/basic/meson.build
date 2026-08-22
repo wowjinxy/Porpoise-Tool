@@ -35,6 +35,7 @@ generated_private_inc = include_directories('src')
 
 lifted_sources = files(
   'src/porpoise_lifted.c',
+  'src/porpoise_ppc_fp.c',
   'src/porpoise_libporpoise_adapter.c',
   'src/porpoise_libporpoise_ai.c',
   'src/porpoise_libporpoise_ar.c',

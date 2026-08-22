@@ -140,7 +140,13 @@ Direct and conditional branch targets may resolve to:
 
 An unresolved or ambiguous named target is an error. Unlinked branches to local labels use direct C labels; linked branches to a local label remain unsupported because they require a guest LR continuation within the same lifted C function. Function starts, address aliases, and labeled instruction entry points use the generated 32-bit address registry. Unique cross-function labels enter the owning lifted function at the bound instruction through that same registry. Indirect `bctr`/`bctrl` dispatches and modeled interrupt return fault at runtime when the address is unknown.
 
-The current `blr` lowering returns through the host C call stack. It cannot reproduce a guest function that rewrites LR and then returns to an arbitrary guest address, so every accepted `blr` is reported as `approximate` and is rejected by `--strict`.
+Generated dispatch keeps the expected guest LR for every active translated C
+frame. `blr` and conditional LR returns use that provenance to return through
+the host C stack only when LR still names the verified caller continuation; a
+rewritten LR is dispatched as an indirect tail branch instead. These returns
+are therefore exact lowerings and are accepted by `--strict`. A lifted
+function invoked directly by an embedding (outside generated dispatch) treats
+its C caller as the continuation.
 
 ## Directives and data
 

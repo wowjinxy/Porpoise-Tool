@@ -4,6 +4,7 @@
  */
 
 #include "porpoise/options.h"
+#include "porpoise/util.h"
 
 #include "jsmn.h"
 
@@ -20,8 +21,18 @@ typedef struct CliValues {
     PorpoiseOptions values;
     bool project_seen;
     bool dtk_seen;
+    bool libporpoise_seen;
+    bool meson_seen;
+    bool cc_seen;
+    bool cxx_seen;
+    bool dvd_root_seen;
+    bool trace_seen;
+    bool build_type_seen;
+    bool frame_limit_seen;
     bool target_seen;
     bool analyze_only_seen;
+    bool build_seen;
+    bool run_seen;
     bool report_seen;
     bool input_seen;
     bool output_seen;
@@ -118,6 +129,12 @@ void porpoise_options_init(PorpoiseOptions *options) {
     memset(options, 0, sizeof(*options));
     options->verbosity = PORPOISE_VERBOSITY_NORMAL;
     options->sdk_policy = PORPOISE_SDK_POLICY_KEEP;
+    (void)copy_checked(
+        options->build_type,
+        sizeof(options->build_type),
+        "debugoptimized",
+        "default build type",
+        NULL);
 }
 
 static bool parse_sdk_policy(
@@ -158,10 +175,20 @@ void porpoise_options_print_help(FILE *stream, const char *program_name) {
             "  --output DIR          Destination directory (must be empty)\n"
             "\n"
             "Options:\n"
-            "  --project FILE        Load a schema-version 1 .porpoise.json project\n"
+            "  --project FILE        Load a .porpoise.json project (schema 1 or 2)\n"
             "  --dtk FILE            DTK executable for managed ELF imports\n"
             "  --target ID           Select a project target (repeatable, max %u)\n"
             "  --analyze-only        Build and validate plans without generation\n"
+            "  --build               Generate and build selected project targets\n"
+            "  --run                 Build and run exactly one selected target\n"
+            "  --libporpoise DIR     Machine-local libPorpoise checkout\n"
+            "  --meson FILE          Meson executable used by Build/Run\n"
+            "  --cc FILE             x64 C compiler used by Build/Run\n"
+            "  --cxx FILE            matching x64 C++ compiler used by Build/Run\n"
+            "  --dvd-root DIR        Native DVD root supplied while running\n"
+            "  --build-type TYPE     debugoptimized (default), debug, or release\n"
+            "  --trace FILE          Write optional JSONL boot evidence while running\n"
+            "  --frame-limit N       Stop a test run after N presented frames\n"
             "  --report FILE         Write the project-mode aggregate report\n"
             "  --config FILE         Load an explicit schema-version 1 JSON config\n"
             "  --abi FILE            ABI manifest for typed external calls\n"
@@ -240,6 +267,65 @@ static PorpoiseExitCode parse_cli(CliValues *cli,
             target_capacity = sizeof(cli->values.dtk_path);
             description = "DTK executable path";
             seen = &cli->dtk_seen;
+        } else if (!positional_only && strcmp(argument, "--libporpoise") == 0) {
+            target = cli->values.libporpoise_path;
+            target_capacity = sizeof(cli->values.libporpoise_path);
+            description = "libPorpoise directory";
+            seen = &cli->libporpoise_seen;
+        } else if (!positional_only && strcmp(argument, "--meson") == 0) {
+            target = cli->values.meson_path;
+            target_capacity = sizeof(cli->values.meson_path);
+            description = "Meson executable path";
+            seen = &cli->meson_seen;
+        } else if (!positional_only && strcmp(argument, "--cc") == 0) {
+            target = cli->values.cc_path;
+            target_capacity = sizeof(cli->values.cc_path);
+            description = "C compiler path";
+            seen = &cli->cc_seen;
+        } else if (!positional_only && strcmp(argument, "--cxx") == 0) {
+            target = cli->values.cxx_path;
+            target_capacity = sizeof(cli->values.cxx_path);
+            description = "C++ compiler path";
+            seen = &cli->cxx_seen;
+        } else if (!positional_only && strcmp(argument, "--dvd-root") == 0) {
+            target = cli->values.dvd_root_path;
+            target_capacity = sizeof(cli->values.dvd_root_path);
+            description = "DVD root directory";
+            seen = &cli->dvd_root_seen;
+        } else if (!positional_only && strcmp(argument, "--trace") == 0) {
+            target = cli->values.trace_path;
+            target_capacity = sizeof(cli->values.trace_path);
+            description = "trace output path";
+            seen = &cli->trace_seen;
+        } else if (!positional_only && strcmp(argument, "--build-type") == 0) {
+            target = cli->values.build_type;
+            target_capacity = sizeof(cli->values.build_type);
+            description = "build type";
+            seen = &cli->build_type_seen;
+        } else if (!positional_only && strcmp(argument, "--frame-limit") == 0) {
+            char *end = NULL;
+            unsigned long value;
+            if (cli->frame_limit_seen) {
+                return option_error(
+                    error_stream,
+                    "option --frame-limit was specified more than once");
+            }
+            if (index + 1 >= argc) {
+                return option_error(
+                    error_stream, "option --frame-limit requires a value");
+            }
+            errno = 0;
+            value = strtoul(argv[++index], &end, 10);
+            if (errno != 0 || end == argv[index] || *end != '\0' ||
+                value == 0UL || value > (unsigned long)UINT32_MAX) {
+                return option_error(
+                    error_stream,
+                    "--frame-limit must be an integer from 1 to %lu",
+                    (unsigned long)UINT32_MAX);
+            }
+            cli->frame_limit_seen = true;
+            cli->values.frame_limit = (size_t)value;
+            continue;
         } else if (!positional_only && strcmp(argument, "--target") == 0) {
             size_t selector_index;
             if (index + 1 >= argc) {
@@ -284,6 +370,23 @@ static PorpoiseExitCode parse_cli(CliValues *cli,
             }
             cli->analyze_only_seen = true;
             cli->values.analyze_only = true;
+            continue;
+        } else if (!positional_only && strcmp(argument, "--build") == 0) {
+            if (cli->build_seen) {
+                return option_error(
+                    error_stream, "option --build was specified more than once");
+            }
+            cli->build_seen = true;
+            cli->values.build = true;
+            continue;
+        } else if (!positional_only && strcmp(argument, "--run") == 0) {
+            if (cli->run_seen) {
+                return option_error(
+                    error_stream, "option --run was specified more than once");
+            }
+            cli->run_seen = true;
+            cli->values.run = true;
+            cli->values.build = true;
             continue;
         } else if (!positional_only && strcmp(argument, "--report") == 0) {
             target = cli->values.report_path;
@@ -483,6 +586,23 @@ static PorpoiseExitCode parse_cli(CliValues *cli,
                 error_stream,
                 "--project is mutually exclusive with --strict");
         }
+        if (cli->analyze_only_seen && (cli->build_seen || cli->run_seen)) {
+            return option_error(
+                error_stream,
+                "--analyze-only is mutually exclusive with --build and --run");
+        }
+        if (cli->run_seen && cli->values.target_id_count > 1U) {
+            return option_error(
+                error_stream, "--run accepts at most one --target selector");
+        }
+        if (cli->build_type_seen &&
+            strcmp(cli->values.build_type, "debugoptimized") != 0 &&
+            strcmp(cli->values.build_type, "debug") != 0 &&
+            strcmp(cli->values.build_type, "release") != 0) {
+            return option_error(
+                error_stream,
+                "--build-type must be 'debugoptimized', 'debug', or 'release'");
+        }
         return PORPOISE_EXIT_SUCCESS;
     }
     if (cli->target_seen) {
@@ -490,6 +610,13 @@ static PorpoiseExitCode parse_cli(CliValues *cli,
     }
     if (cli->dtk_seen) {
         return option_error(error_stream, "--dtk requires --project FILE");
+    }
+    if (cli->build_seen || cli->run_seen || cli->libporpoise_seen ||
+        cli->meson_seen || cli->cc_seen || cli->cxx_seen ||
+        cli->dvd_root_seen || cli->trace_seen || cli->build_type_seen ||
+        cli->frame_limit_seen) {
+        return option_error(
+            error_stream, "Build/Run options require --project FILE");
     }
     if (cli->analyze_only_seen) {
         return option_error(
@@ -1268,6 +1395,21 @@ PorpoiseExitCode porpoise_options_parse(PorpoiseOptions *options,
         return PORPOISE_EXIT_SUCCESS;
     }
     if (cli.project_seen) {
+        if (cli.trace_seen) {
+            char normalized_trace[PORPOISE_PATH_CAPACITY];
+            if (!porpoise_path_normalize_lexical(
+                    normalized_trace,
+                    sizeof(normalized_trace),
+                    cli.values.trace_path) ||
+                !porpoise_copy_string(
+                    cli.values.trace_path,
+                    sizeof(cli.values.trace_path),
+                    normalized_trace)) {
+                return option_error(
+                    error_stream,
+                    "cannot normalize --trace path against the current working directory");
+            }
+        }
         *options = cli.values;
         return PORPOISE_EXIT_SUCCESS;
     }

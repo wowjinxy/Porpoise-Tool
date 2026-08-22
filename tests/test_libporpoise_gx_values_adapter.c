@@ -131,6 +131,117 @@ static void test_active_gate(
     check_fault(state, PORPOISE_FAULT_INVALID_STATE, TEST_PC);
     CHECK(PorpoiseStubGXValueCallCount(
               PORPOISE_STUB_GX_SET_TEV_INDIRECT) == 0U);
+
+    PorpoiseStubGXFifoReset();
+    PorpoiseStubGXValueSetBeginPreamble(UINT32_C(0x18), 0);
+    prepare_call(state, host);
+    state->gpr[3] = UINT32_C(0x90);
+    state->gpr[4] = 0U;
+    state->gpr[5] = 4U;
+    porpoise_libporpoise_gx_begin_adapter(state);
+    check_fault(state, PORPOISE_FAULT_INVALID_STATE, TEST_PC);
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_DIRTY_STATE) == 0U);
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SEND_FLUSH_PRIM) == 0U);
+    CHECK(PorpoiseStubGXFifoCallCount() == 0U);
+}
+
+static void test_gx_begin_bridge(
+    PorpoisePpcState *state,
+    PorpoiseHostAdapter *host)
+{
+    unsigned int dirty_count;
+    unsigned int flush_count;
+    unsigned int fifo_count;
+
+    PorpoiseStubGXFifoReset();
+    PorpoiseStubGXValueSetBeginPreamble(UINT32_C(0x18), 0);
+    prepare_call(state, host);
+    state->gpr[3] = UINT32_C(0x90);
+    state->gpr[4] = 7U;
+    state->gpr[5] = UINT32_C(0x1234);
+    porpoise_libporpoise_gx_begin_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_DIRTY_STATE) == 1U);
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SEND_FLUSH_PRIM) == 1U);
+    CHECK(PorpoiseStubGXFifoCallCount() == 1U);
+    CHECK(PorpoiseStubGXFifoQueuedCallCount() == 1U);
+    CHECK(PorpoiseStubGXFifoSynchronousCallCount() == 0U);
+    CHECK(PorpoiseStubGXFifoCallSize(0U) == 3U);
+    CHECK(PorpoiseStubGXFifoByteCount() == 3U);
+    CHECK(PorpoiseStubGXFifoByte(0U) == UINT8_C(0x97));
+    CHECK(PorpoiseStubGXFifoByte(1U) == UINT8_C(0x12));
+    CHECK(PorpoiseStubGXFifoByte(2U) == UINT8_C(0x34));
+
+    PorpoiseStubGXValueSetBeginPreamble(0U, 1);
+    prepare_call(state, host);
+    state->gpr[3] = UINT32_C(0x80);
+    state->gpr[4] = 0U;
+    state->gpr[5] = 4U;
+    porpoise_libporpoise_gx_begin_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_DIRTY_STATE) == 1U);
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SEND_FLUSH_PRIM) == 1U);
+    CHECK(PorpoiseStubGXFifoCallCount() == 2U);
+    CHECK(PorpoiseStubGXFifoCallSize(1U) == 3U);
+    CHECK(PorpoiseStubGXFifoByteCount() == 6U);
+    CHECK(PorpoiseStubGXFifoByte(3U) == UINT8_C(0x80));
+    CHECK(PorpoiseStubGXFifoByte(4U) == UINT8_C(0x00));
+    CHECK(PorpoiseStubGXFifoByte(5U) == UINT8_C(0x04));
+
+    dirty_count = PorpoiseStubGXValueCallCount(
+        PORPOISE_STUB_GX_SET_DIRTY_STATE);
+    flush_count = PorpoiseStubGXValueCallCount(
+        PORPOISE_STUB_GX_SEND_FLUSH_PRIM);
+    fifo_count = PorpoiseStubGXFifoCallCount();
+
+    prepare_call(state, host);
+    state->gpr[3] = UINT32_C(0x91);
+    state->gpr[4] = 0U;
+    state->gpr[5] = 4U;
+    porpoise_libporpoise_gx_begin_adapter(state);
+    check_fault(state, PORPOISE_FAULT_INVALID_ARGUMENT, UINT32_C(0x91));
+
+    prepare_call(state, host);
+    state->gpr[3] = UINT32_C(0x90);
+    state->gpr[4] = 8U;
+    state->gpr[5] = 4U;
+    porpoise_libporpoise_gx_begin_adapter(state);
+    check_fault(state, PORPOISE_FAULT_INVALID_ARGUMENT, 8U);
+
+    prepare_call(state, host);
+    state->gpr[3] = UINT32_C(0x90);
+    state->gpr[4] = 0U;
+    state->gpr[5] = UINT32_C(0x10000);
+    porpoise_libporpoise_gx_begin_adapter(state);
+    check_fault(
+        state,
+        PORPOISE_FAULT_INVALID_ARGUMENT,
+        UINT32_C(0x10000));
+
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_DIRTY_STATE) == dirty_count);
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SEND_FLUSH_PRIM) == flush_count);
+    CHECK(PorpoiseStubGXFifoCallCount() == fifo_count);
+
+    PorpoiseStubGXFifoSetAccept(0);
+    prepare_call(state, host);
+    state->gpr[3] = UINT32_C(0xB8);
+    state->gpr[4] = 3U;
+    state->gpr[5] = 1U;
+    porpoise_libporpoise_gx_begin_adapter(state);
+    check_fault(state, PORPOISE_FAULT_HOST_IO, TEST_PC);
+    CHECK(strcmp(
+              porpoise_state_fault_message(state),
+              "libPorpoise rejected the canonical GXBegin command") == 0);
+    CHECK(PorpoiseStubGXFifoCallCount() == fifo_count);
+    PorpoiseStubGXFifoSetAccept(1);
 }
 
 static void test_display_list(
@@ -549,6 +660,242 @@ static void test_tev_indirect_stack_arguments(
               PORPOISE_STUB_GX_SET_TEV_INDIRECT) == before);
 }
 
+static void test_scalar_vertex_and_channel_state(
+    PorpoisePpcState *state,
+    PorpoiseHostAdapter *host)
+{
+    prepare_call(state, host);
+    porpoise_libporpoise_gx_clear_vtx_desc_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_CLEAR_VTX_DESC) == 1U);
+
+    prepare_call(state, host);
+    state->gpr[3] = 9U;
+    state->gpr[4] = 2U;
+    porpoise_libporpoise_gx_set_vtx_desc_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_VTX_DESC) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 9U);
+    CHECK(PorpoiseStubGXValueLastU32(1U) == 2U);
+
+    prepare_call(state, host);
+    state->gpr[3] = 3U;
+    state->gpr[4] = 10U;
+    state->gpr[5] = 1U;
+    state->gpr[6] = 4U;
+    state->gpr[7] = UINT32_C(0x105);
+    porpoise_libporpoise_gx_set_vtx_attr_fmt_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_VTX_ATTR_FMT) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 3U);
+    CHECK(PorpoiseStubGXValueLastU32(1U) == 10U);
+    CHECK(PorpoiseStubGXValueLastU32(2U) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(3U) == 4U);
+    CHECK(PorpoiseStubGXValueLastU32(4U) == 5U);
+
+    prepare_call(state, host);
+    porpoise_libporpoise_gx_invalidate_vtx_cache_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_INVALIDATE_VTX_CACHE) == 1U);
+
+    prepare_call(state, host);
+    state->gpr[3] = UINT32_C(0x102);
+    porpoise_libporpoise_gx_set_num_tex_gens_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_NUM_TEX_GENS) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 2U);
+
+    prepare_call(state, host);
+    state->gpr[3] = UINT32_C(0x101);
+    porpoise_libporpoise_gx_set_num_chans_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_NUM_CHANS) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 1U);
+
+    prepare_call(state, host);
+    porpoise_libporpoise_gx_invalidate_tex_all_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_INVALIDATE_TEX_ALL) == 1U);
+}
+
+static void test_scalar_tev_and_pixel_state(
+    PorpoisePpcState *state,
+    PorpoiseHostAdapter *host)
+{
+    unsigned int before;
+
+    prepare_call(state, host);
+    state->gpr[3] = 2U;
+    state->gpr[4] = 3U;
+    porpoise_libporpoise_gx_set_tev_op_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_TEV_OP) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 2U);
+    CHECK(PorpoiseStubGXValueLastU32(1U) == 3U);
+
+    prepare_call(state, host);
+    state->gpr[3] = 4U;
+    state->gpr[4] = 5U;
+    state->gpr[5] = 6U;
+    state->gpr[6] = 7U;
+    porpoise_libporpoise_gx_set_tev_order_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_TEV_ORDER) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 4U);
+    CHECK(PorpoiseStubGXValueLastU32(1U) == 5U);
+    CHECK(PorpoiseStubGXValueLastU32(2U) == 6U);
+    CHECK(PorpoiseStubGXValueLastU32(3U) == 7U);
+
+    prepare_call(state, host);
+    state->gpr[3] = UINT32_C(0x110);
+    porpoise_libporpoise_gx_set_num_tev_stages_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_NUM_TEV_STAGES) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 16U);
+
+    prepare_call(state, host);
+    state->gpr[3] = 1U;
+    porpoise_libporpoise_gx_set_color_update_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_COLOR_UPDATE) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 1U);
+
+    before = PorpoiseStubGXValueCallCount(
+        PORPOISE_STUB_GX_SET_COLOR_UPDATE);
+    prepare_call(state, host);
+    state->gpr[3] = 2U;
+    porpoise_libporpoise_gx_set_color_update_adapter(state);
+    check_fault(state, PORPOISE_FAULT_INVALID_ARGUMENT, 2U);
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_COLOR_UPDATE) == before);
+
+    prepare_call(state, host);
+    state->gpr[3] = 1U;
+    state->gpr[4] = 3U;
+    state->gpr[5] = 0U;
+    porpoise_libporpoise_gx_set_z_mode_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_Z_MODE) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(1U) == 3U);
+    CHECK(PorpoiseStubGXValueLastU32(2U) == 0U);
+
+    before = PorpoiseStubGXValueCallCount(PORPOISE_STUB_GX_SET_Z_MODE);
+    prepare_call(state, host);
+    state->gpr[3] = 1U;
+    state->gpr[4] = 3U;
+    state->gpr[5] = 2U;
+    porpoise_libporpoise_gx_set_z_mode_adapter(state);
+    check_fault(state, PORPOISE_FAULT_INVALID_ARGUMENT, 2U);
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_Z_MODE) == before);
+
+    prepare_call(state, host);
+    state->gpr[3] = 4U;
+    state->gpr[4] = 5U;
+    porpoise_libporpoise_gx_set_pixel_fmt_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_PIXEL_FMT) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 4U);
+    CHECK(PorpoiseStubGXValueLastU32(1U) == 5U);
+}
+
+static void test_scalar_frame_state(
+    PorpoisePpcState *state,
+    PorpoiseHostAdapter *host)
+{
+    static const float viewport[6] = {
+        1.25f, -2.5f, 640.0f, 480.0f, 0.125f, 0.875f
+    };
+    size_t index;
+
+    prepare_call(state, host);
+    for (index = 0U; index < 6U; index++) {
+        porpoise_fpr_set_f64(
+            state, (unsigned int)index + 1U, 0U, viewport[index]);
+    }
+    porpoise_libporpoise_gx_set_viewport_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_VIEWPORT) == 1U);
+    for (index = 0U; index < 6U; index++) {
+        CHECK(float_bits(PorpoiseStubGXValueLastFloat((unsigned int)index)) ==
+              float_bits(viewport[index]));
+    }
+
+    prepare_call(state, host);
+    state->gpr[3] = 11U;
+    state->gpr[4] = 22U;
+    state->gpr[5] = 333U;
+    state->gpr[6] = 444U;
+    porpoise_libporpoise_gx_set_scissor_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_SCISSOR) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 11U);
+    CHECK(PorpoiseStubGXValueLastU32(1U) == 22U);
+    CHECK(PorpoiseStubGXValueLastU32(2U) == 333U);
+    CHECK(PorpoiseStubGXValueLastU32(3U) == 444U);
+
+    prepare_call(state, host);
+    state->gpr[3] = UINT32_C(0x10001);
+    state->gpr[4] = UINT32_C(0x10002);
+    state->gpr[5] = UINT32_C(0x10280);
+    state->gpr[6] = UINT32_C(0x101E0);
+    porpoise_libporpoise_gx_set_disp_copy_src_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_DISP_COPY_SRC) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(1U) == 2U);
+    CHECK(PorpoiseStubGXValueLastU32(2U) == 640U);
+    CHECK(PorpoiseStubGXValueLastU32(3U) == 480U);
+
+    PorpoiseStubGXValueSetYScaleFactorOutput(1.5f);
+    prepare_call(state, host);
+    state->gpr[3] = 480U;
+    state->gpr[4] = 576U;
+    porpoise_libporpoise_gx_get_y_scale_factor_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_GET_Y_SCALE_FACTOR) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 480U);
+    CHECK(PorpoiseStubGXValueLastU32(1U) == 576U);
+    CHECK(float_bits((float)porpoise_fpr_get_f64(state, 1U, 0U)) ==
+          float_bits(1.5f));
+
+    PorpoiseStubGXValueSetDispCopyYScaleOutput(UINT32_C(0x12345678));
+    prepare_call(state, host);
+    porpoise_fpr_set_f64(state, 1U, 0U, 1.25);
+    porpoise_libporpoise_gx_set_disp_copy_y_scale_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_DISP_COPY_Y_SCALE) == 1U);
+    CHECK(PorpoiseStubGXValueLastFloat(0U) == 1.25f);
+    CHECK(state->gpr[3] == UINT32_C(0x12345678));
+
+    prepare_call(state, host);
+    state->gpr[3] = 2U;
+    porpoise_libporpoise_gx_set_disp_copy_gamma_adapter(state);
+    CHECK(!porpoise_state_has_fault(state));
+    CHECK(PorpoiseStubGXValueCallCount(
+              PORPOISE_STUB_GX_SET_DISP_COPY_GAMMA) == 1U);
+    CHECK(PorpoiseStubGXValueLastU32(0U) == 2U);
+}
+
 int main(void)
 {
     PorpoiseHostAdapter host;
@@ -561,12 +908,16 @@ int main(void)
 
     test_active_gate(&state, &host);
     initialize_gx(&state, &host);
+    test_gx_begin_bridge(&state, &host);
     test_display_list(&state, &host);
     test_projection(&state, &host);
     test_matrices(&state, &host);
     test_viewport_and_indirect_matrix(&state, &host);
     test_colors_and_fog(&state, &host);
     test_tev_indirect_stack_arguments(&state, &host);
+    test_scalar_vertex_and_channel_state(&state, &host);
+    test_scalar_tev_and_pixel_state(&state, &host);
+    test_scalar_frame_state(&state, &host);
 
     porpoise_libporpoise_adapter_shutdown(&host);
     return 0;

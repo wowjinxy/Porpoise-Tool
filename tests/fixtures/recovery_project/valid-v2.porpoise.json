@@ -1,0 +1,44 @@
+{
+  "schema_version": 2,
+  "sdk_catalogs": [],
+  "abi_contracts": [],
+  "targets": [
+    {
+      "id": "main",
+      "enabled": true,
+      "source_kind": "assembly",
+      "input": "../session_plan/input",
+      "output": "../../../generated/main",
+      "entry": "lift_me",
+      "strict": false,
+      "sdk_policy": "imported",
+      "symbol_sources": [],
+      "skip_list": null,
+      "overrides": [],
+      "annotations": [],
+      "title_host": {
+        "entry_address": 2147487744,
+        "gpr": [0, 2147500032, 2147504128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2147508224, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "arena_lo": 2147512320,
+        "arena_hi": 2171600896,
+        "startup_functions": [
+          {"module": "", "address": 2147487744, "size": 4, "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "flags": 0}
+        ],
+        "initial_words": [
+          {"address": 2147500024, "value": 4294967295}
+        ],
+        "initialize_dvd": true,
+        "input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "symbol_sources_sha256": null,
+        "sdk_catalogs_sha256": null
+      },
+      "cache": {
+        "input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "settings_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "dtk_version": null,
+        "dependencies": [],
+        "matches": []
+      }
+    }
+  ]
+}

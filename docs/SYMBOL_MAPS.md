@@ -17,7 +17,10 @@ loader reads linked virtual addresses and sizes from section layouts. When a
 call-tree record is present, it augments the layout record with function versus
 object kind and local/global/weak scope. `UNUSED` records are retained as
 unused evidence without a linked address. Archive and object columns are kept
-separately.
+separately. The trailing `Linker generated symbols:` table is also loaded as
+global, sectionless labels. This retains bootstrap evidence such as
+`_stack_addr`, `_SDA_BASE_`, `_SDA2_BASE_`, `__ArenaLo`, and `__ArenaHi`
+without guessing a section from the address.
 
 A source's `module` string distinguishes the main DOL from REL or other module
 address spaces. The empty string denotes the main/unnamed module. Do not merge

@@ -30,7 +30,11 @@ bool porpoise_lower_emit_branch(
                                       spec->operation == OP_BL, diagnostics, source, item);
         case OP_BLR:
             if (operands.count != 0U) return false;
-            return file_printf(output, "    return;\n");
+            return file_printf(output,
+                "    if (!porpoise_guest_lr_returns_to_caller(state)) { "
+                "uint32_t target = state->lr; "
+                "(void)porpoise_branch_address(state, target); }\n"
+                "    return;\n");
         case OP_BLRL:
             if (operands.count != 0U) return false;
             return file_printf(output,
@@ -42,7 +46,10 @@ bool porpoise_lower_emit_branch(
             if (operands.count != 0U) return false;
             if (spec->operation == OP_BCTRL && !file_printf(output, "    state->lr = UINT32_C(0x%08lX);\n",
                                                             (unsigned long)(item->address + 4U))) return false;
-            if (!file_printf(output, "    if (!porpoise_call_address(state, state->ctr)) return;\n")) return false;
+            if (!file_printf(output, "    if (!%s(state, state->ctr)) return;\n",
+                             spec->operation == OP_BCTRL
+                                 ? "porpoise_call_address"
+                                 : "porpoise_branch_address")) return false;
             if (!file_printf(output, "    if (porpoise_state_should_stop(state)) return;\n")) return false;
             return spec->operation == OP_BCTRL || file_printf(output, "    return;\n");
         case OP_CONDITIONAL_BRANCH: {
@@ -75,8 +82,14 @@ bool porpoise_lower_emit_branch(
                 field = (unsigned int)unsigned_value;
             } else if (operands.count != 0U) return false;
             bit = (unsigned int)(spec->detail < 0 ? -spec->detail : (spec->detail & 0xff));
-            return file_printf(output, "    if (%sporpoise_cr_get_bit(state, %uU)) return;\n",
-                               negate ? "!" : "", field * 4U + bit);
+            return file_printf(output,
+                "    if (%sporpoise_cr_get_bit(state, %uU)) {\n"
+                "        if (!porpoise_guest_lr_returns_to_caller(state)) { "
+                "uint32_t target = state->lr; "
+                "(void)porpoise_branch_address(state, target); }\n"
+                "        return;\n"
+                "    }\n",
+                negate ? "!" : "", field * 4U + bit);
         }
         case OP_BDNZ:
         case OP_BDZ:

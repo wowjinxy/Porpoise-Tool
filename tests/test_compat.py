@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -42,12 +43,15 @@ def fixture_digest() -> str:
     return digest.hexdigest()
 
 
-def run_checker(*extra: str) -> subprocess.CompletedProcess[str]:
+def run_checker(
+    *extra: str,
+    checkout: Path = fixture,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             sys.executable,
             str(checker),
-            str(fixture),
+            str(checkout),
             "--source-root",
             str(root),
             "--target",
@@ -217,6 +221,77 @@ required_passes = (
 for expected in required_passes:
     if expected not in good.stdout:
         raise AssertionError(f"missing {expected!r} in checker output:\n{good.stdout}")
+
+with tempfile.TemporaryDirectory(
+    prefix="porpoise-no-carrier-checkout-"
+) as temporary:
+    no_carrier_fixture = Path(temporary) / "libporpoise"
+    shutil.copytree(fixture, no_carrier_fixture)
+    (
+        no_carrier_fixture
+        / "include"
+        / "porpoise"
+        / "host_thread_carrier.h"
+    ).unlink()
+    no_carrier = run_checker(checkout=no_carrier_fixture)
+if no_carrier.returncode != 0:
+    raise AssertionError(
+        "checkout without the optional carrier failed compatibility:\n"
+        + no_carrier.stdout
+    )
+assert_compile_only_scope(no_carrier)
+for expected in (
+    "LIMITED host-thread-carrier-v1: header absent; "
+    "single-thread compatibility only",
+    "PASS generated-runtime-header-consumer:",
+    "result: COMPILE-COMPATIBLE "
+    "(9 of 9 gates passed; single-thread compatibility only)",
+):
+    if expected not in no_carrier.stdout:
+        raise AssertionError(
+            f"missing {expected!r} in no-carrier output:\n"
+            + no_carrier.stdout
+        )
+
+with tempfile.TemporaryDirectory(
+    prefix="porpoise-wrong-carrier-checkout-"
+) as temporary:
+    wrong_carrier_fixture = Path(temporary) / "libporpoise"
+    shutil.copytree(fixture, wrong_carrier_fixture)
+    wrong_carrier_header = (
+        wrong_carrier_fixture
+        / "include"
+        / "porpoise"
+        / "host_thread_carrier.h"
+    )
+    wrong_carrier_header.write_text(
+        wrong_carrier_header.read_text(encoding="utf-8").replace(
+            "LIBPORPOISE_HOST_THREAD_CARRIER_API_VERSION 1U",
+            "LIBPORPOISE_HOST_THREAD_CARRIER_API_VERSION 2U",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    forced_wrong_carrier = run_checker(
+        "--c-arg=-DPORPOISE_HAVE_LIBPORPOISE_HOST_THREAD_CARRIER_V1=1",
+        checkout=wrong_carrier_fixture,
+    )
+if forced_wrong_carrier.returncode != 1:
+    raise AssertionError(
+        "explicitly forced wrong carrier API was accepted:\n"
+        + forced_wrong_carrier.stdout
+    )
+for expected in (
+    "FAIL generated-runtime-header-consumer:",
+    "requires API version 1",
+    "FAIL host-thread-carrier-v1:",
+    "result: COMPILE-INCOMPATIBLE",
+):
+    if expected not in forced_wrong_carrier.stdout:
+        raise AssertionError(
+            f"missing {expected!r} in forced-wrong-carrier output:\n"
+            + forced_wrong_carrier.stdout
+        )
 
 missing_copy_contract = run_checker(
     "--c-arg=-DPORPOISE_STUB_DISABLE_GX_COPY_DISP_GUEST_ADDRESS_CONTRACT",

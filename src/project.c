@@ -4,6 +4,7 @@
 #include "porpoise/lower.h"
 #include "porpoise/util.h"
 #include "project_internal.h"
+#include "sdk_guest_layout_internal.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -30,6 +31,7 @@ typedef struct PorpoiseRegistryEntry {
     uint32_t address;
     const PorpoiseFunction *function;
     const PorpoiseAbiFunction *import;
+    const char *name;
     bool trap;
 } PorpoiseRegistryEntry;
 
@@ -138,6 +140,57 @@ static const PorpoiseAbiFunction *function_import_binding(
         }
     }
     return NULL;
+}
+
+static bool project_uses_presentation_bridge(
+    const ProjectContext *context) {
+    static const char required_adapter[] =
+        "porpoise_libporpoise_vi_wait_for_retrace_adapter";
+    size_t index;
+
+    if (context->plan != NULL) {
+        for (index = 0U;
+             index < porpoise_plan_function_count(context->plan);
+             index++) {
+            const PorpoiseFunctionPlanView *view =
+                porpoise_plan_function_at(context->plan, index);
+            if (view != NULL &&
+                view->action == PORPOISE_PLAN_ACTION_IMPORT &&
+                view->binding != NULL &&
+                view->binding->adapter != NULL &&
+                strcmp(view->binding->adapter, required_adapter) == 0) {
+                return true;
+            }
+        }
+    }
+    if (context->analysis != NULL) {
+        for (index = 0U;
+             index < context->analysis->import_binding_count;
+             index++) {
+            const PorpoiseImportBinding *binding =
+                &context->analysis->import_bindings[index];
+            if (binding->owner != NULL &&
+                binding->import != NULL &&
+                binding->import->adapter != NULL &&
+                function_action(context, binding->owner) ==
+                    PORPOISE_PLAN_ACTION_IMPORT &&
+                strcmp(binding->import->adapter, required_adapter) == 0) {
+                return true;
+            }
+        }
+    }
+    if (context->abi != NULL) {
+        for (index = 0U; index < context->abi->function_count; index++) {
+            const PorpoiseAbiFunction *function =
+                &context->abi->functions[index];
+            if (function->kind == PORPOISE_ABI_IMPORT &&
+                function->adapter != NULL &&
+                strcmp(function->adapter, required_adapter) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 static size_t translated_function_count(const ProjectContext *context) {
@@ -301,10 +354,12 @@ static bool write_dispatch_declaration(ProjectContext *context) {
         "struct porpoise_dispatch_target {\n"
         "    PorpoiseLiftedFunction function;\n"
         "    enum porpoise_dispatch_kind kind;\n"
+        "    const char *name;\n"
         "};\n\n",
         output);
     fputs("int porpoise_dispatch_available(uint32_t address);\n", output);
-    fputs("int porpoise_call_address(PorpoisePpcState *state, uint32_t address);\n\n#endif\n", output);
+    fputs("int porpoise_call_address(PorpoisePpcState *state, uint32_t address);\n", output);
+    fputs("int porpoise_branch_address(PorpoisePpcState *state, uint32_t address);\n\n#endif\n", output);
     return checked_close(output, full, context->diagnostics);
 }
 
@@ -330,7 +385,29 @@ static bool write_generated_facade(ProjectContext *context) {
 
 static bool write_generated_facade_source(ProjectContext *context) {
     char full[PORPOISE_PATH_CAPACITY];
-    FILE *output = open_generated_file(
+    PorpoiseSdkGuestOsLayout os_layout;
+    const PorpoiseSourceFile *os_init_source = NULL;
+    const char *problem_symbol = NULL;
+    PorpoiseSdkGuestLayoutResolution layout_result =
+        porpoise_sdk_guest_os_layout_for_plan(
+            context->plan,
+            &os_layout,
+            &os_init_source,
+            &problem_symbol);
+    FILE *output;
+    if (layout_result != PORPOISE_SDK_GUEST_LAYOUT_NOT_REQUIRED &&
+        layout_result != PORPOISE_SDK_GUEST_LAYOUT_RESOLVED) {
+        porpoise_diagnostics_add(
+            context->diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            os_init_source != NULL ? os_init_source->path : NULL,
+            0U,
+            0U,
+            "cannot generate exact SDK OSInit guest-state binding for %s",
+            problem_symbol != NULL ? problem_symbol : "the OS state layout");
+        return false;
+    }
+    output = open_generated_file(
         context,
         "src/porpoise_generated.c",
         full);
@@ -338,12 +415,45 @@ static bool write_generated_facade_source(ProjectContext *context) {
     fputs(
         "#include \"porpoise_generated.h\"\n"
         "#include \"porpoise_dispatch_private.h\"\n"
-        "#include \"porpoise_exports.h\"\n\n"
+        "#include \"porpoise_exports.h\"\n"
+        "#include \"porpoise_libporpoise_builtins_private.h\"\n\n",
+        output);
+    if (layout_result == PORPOISE_SDK_GUEST_LAYOUT_RESOLVED) {
+        fprintf(
+            output,
+            "static const PorpoiseLibporpoiseGuestSdkLayoutV1 "
+            "porpoise_guest_sdk_layout = {\n"
+            "    UINT32_C(0x%08lX),\n"
+            "    UINT32_C(0x%08lX),\n"
+            "    UINT32_C(0x%08lX),\n"
+            "    UINT32_C(0x%08lX),\n"
+            "    UINT32_C(0x%08lX),\n"
+            "    UINT32_C(0x%08lX)\n"
+            "};\n\n",
+            (unsigned long)os_layout.arena_lo,
+            (unsigned long)os_layout.arena_hi,
+            (unsigned long)os_layout.initialized,
+            (unsigned long)os_layout.boot_info,
+            (unsigned long)os_layout.bi2_debug_flag,
+            (unsigned long)os_layout.dvd_long_file_name_flag);
+    }
+    fputs(
         "PorpoiseHostResult porpoise_generated_bind(\n"
         "    PorpoiseHostAdapter *host)\n"
         "{\n"
-        "    return porpoise_libporpoise_bind_guest_runtime(\n"
+        "    PorpoiseHostResult result;\n",
+        output);
+    if (layout_result == PORPOISE_SDK_GUEST_LAYOUT_RESOLVED) {
+        fputs(
+            "    result = porpoise_libporpoise_bind_guest_sdk_layout_v1(\n"
+            "        host, &porpoise_guest_sdk_layout);\n"
+            "    if (result != PORPOISE_HOST_OK) return result;\n",
+            output);
+    }
+    fputs(
+        "    result = porpoise_libporpoise_bind_guest_runtime(\n"
         "        host, porpoise_call_address, porpoise_bind_export_state);\n"
+        "    return result;\n"
         "}\n",
         output);
     return checked_close(output, full, context->diagnostics);
@@ -373,6 +483,23 @@ static bool instruction_has_preceding_label(
            function->items[item_index - 1U].kind == PORPOISE_ASM_LABEL;
 }
 
+static bool instruction_is_address_taken(
+    const PorpoiseFunction *function,
+    size_t item_index)
+{
+    size_t entry_index;
+
+    for (entry_index = 0U;
+         entry_index < function->address_taken_entry_count;
+         entry_index++) {
+        if (function->address_taken_entries[
+                entry_index].instruction_item_index == item_index) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool append_registry_entry(
     PorpoiseRegistryEntry **entries,
     size_t *entry_count,
@@ -380,6 +507,7 @@ static bool append_registry_entry(
     uint32_t address,
     const PorpoiseFunction *function,
     const PorpoiseAbiFunction *import,
+    const char *name,
     bool trap)
 {
     PorpoiseRegistryEntry *entry;
@@ -396,6 +524,7 @@ static bool append_registry_entry(
     entry->address = address;
     entry->function = function;
     entry->import = import;
+    entry->name = name;
     entry->trap = trap;
     return true;
 }
@@ -430,6 +559,7 @@ static bool collect_registry_entries(
                     function->start_address,
                     function,
                     NULL,
+                    function->name,
                     false)) {
                 return false;
             }
@@ -457,6 +587,7 @@ static bool collect_registry_entries(
                         alias->address,
                         function,
                         NULL,
+                        function->name,
                         false)) {
                     return false;
                 }
@@ -467,7 +598,8 @@ static bool collect_registry_entries(
                 const PorpoiseAsmItem *item = &function->items[item_index];
 
                 if (item->kind != PORPOISE_ASM_INSTRUCTION ||
-                    !instruction_has_preceding_label(function, item_index) ||
+                    (!instruction_has_preceding_label(function, item_index) &&
+                     !instruction_is_address_taken(function, item_index)) ||
                     item->address == function->start_address ||
                     function_has_alias_address(function, item->address)) {
                     continue;
@@ -479,6 +611,7 @@ static bool collect_registry_entries(
                         item->address,
                         function,
                         NULL,
+                        function->name,
                         false)) {
                     return false;
                 }
@@ -518,6 +651,7 @@ static bool collect_import_registry_entries(
                     view->binding_address,
                     NULL,
                     view->binding,
+                    view->function != NULL ? view->function->name : NULL,
                     trap)) {
                 return false;
             }
@@ -543,11 +677,38 @@ static bool collect_import_registry_entries(
                 binding->guest_address,
                 NULL,
                 binding->import,
+                binding->owner != NULL ? binding->owner->name : NULL,
                 false)) {
             return false;
         }
     }
     return true;
+}
+
+static void write_c_string_literal(FILE *output, const char *value)
+{
+    const unsigned char *cursor =
+        (const unsigned char *)(value != NULL ? value : "");
+
+    fputc('"', output);
+    while (*cursor != '\0') {
+        if (*cursor == '"' || *cursor == '\\') {
+            fputc('\\', output);
+            fputc((int)*cursor, output);
+        } else if (*cursor == '\n') {
+            fputs("\\n", output);
+        } else if (*cursor == '\r') {
+            fputs("\\r", output);
+        } else if (*cursor == '\t') {
+            fputs("\\t", output);
+        } else if (*cursor >= 0x20U && *cursor < 0x7FU) {
+            fputc((int)*cursor, output);
+        } else {
+            fprintf(output, "\\%03o", (unsigned int)*cursor);
+        }
+        cursor++;
+    }
+    fputc('"', output);
 }
 
 static bool write_function_registry_shard(
@@ -609,16 +770,20 @@ static bool write_function_registry_shard(
                 output,
                 "    case UINT32_C(0x%08lX): return "
                 "(struct porpoise_dispatch_target){porpoise_lifted_%s, "
-                "PORPOISE_DISPATCH_LIFTED};\n",
+                "PORPOISE_DISPATCH_LIFTED, ",
                 (unsigned long)entry->address,
                 entry->function->c_name);
+            write_c_string_literal(output, entry->name);
+            fputs("};\n", output);
         } else if (entry->trap) {
             fprintf(
                 output,
                 "    case UINT32_C(0x%08lX): return "
                 "(struct porpoise_dispatch_target){porpoise_omitted_sdk_trap, "
-                "PORPOISE_DISPATCH_TRAP};\n",
+                "PORPOISE_DISPATCH_TRAP, ",
                 (unsigned long)entry->address);
+            write_c_string_literal(output, entry->name);
+            fputs("};\n", output);
         } else {
             char c_name[PORPOISE_NAME_CAPACITY];
 
@@ -630,14 +795,17 @@ static bool write_function_registry_shard(
                 output,
                 "    case UINT32_C(0x%08lX): return "
                 "(struct porpoise_dispatch_target){porpoise_import_%s, "
-                "PORPOISE_DISPATCH_IMPORT};\n",
+                "PORPOISE_DISPATCH_IMPORT, ",
                 (unsigned long)entry->address,
                 c_name);
+            write_c_string_literal(output, entry->name);
+            fputs("};\n", output);
         }
     }
     fputs(
         "    default: return (struct porpoise_dispatch_target){"
-        "(PorpoiseLiftedFunction)0, PORPOISE_DISPATCH_NONE};\n"
+        "(PorpoiseLiftedFunction)0, PORPOISE_DISPATCH_NONE, "
+        "(const char *)0};\n"
         "    }\n"
         "}\n",
         output);
@@ -767,7 +935,8 @@ static bool write_function_registry(ProjectContext *context) {
     }
     fputs(
         "    default: return (struct porpoise_dispatch_target){"
-        "(PorpoiseLiftedFunction)0, PORPOISE_DISPATCH_NONE};\n"
+        "(PorpoiseLiftedFunction)0, PORPOISE_DISPATCH_NONE, "
+        "(const char *)0};\n"
         "    }\n"
         "}\n\n"
         "int porpoise_dispatch_available(uint32_t address)\n"
@@ -776,9 +945,10 @@ static bool write_function_registry(ProjectContext *context) {
         "    return target.function != (PorpoiseLiftedFunction)0 &&\n"
         "           target.kind != PORPOISE_DISPATCH_NONE;\n"
         "}\n\n"
-        "int porpoise_call_address(PorpoisePpcState *state, uint32_t address)\n"
+        "static int porpoise_dispatch_address(PorpoisePpcState *state, uint32_t address, int tail_branch)\n"
         "{\n"
         "    struct porpoise_dispatch_target target;\n"
+        "    const char *dispatch_kind;\n"
         "    if (porpoise_state_should_stop(state)) return 0;\n"
         "    target = porpoise_resolve_address(address);\n"
         "    if (target.function == (PorpoiseLiftedFunction)0 ||\n"
@@ -792,25 +962,44 @@ static bool write_function_registry(ProjectContext *context) {
         "        porpoise_state_set_fault(state, PORPOISE_FAULT_INVALID_STATE, address, \"invalid generated dispatch kind\");\n"
         "        return 0;\n"
         "    }\n"
+        "    dispatch_kind = target.kind == PORPOISE_DISPATCH_LIFTED\n"
+        "        ? \"lifted\" : (target.kind == PORPOISE_DISPATCH_IMPORT\n"
+        "            ? \"imported\" : \"trap\");\n"
         "    state->pc = address;\n"
         "    if (target.kind == PORPOISE_DISPATCH_IMPORT ||\n"
         "        target.kind == PORPOISE_DISPATCH_TRAP) {\n"
+        "        porpoise_trace_call_enter(state, address, dispatch_kind, target.name);\n"
         "        target.function(state);\n"
+        "        porpoise_trace_call_exit(state, address, dispatch_kind, target.name);\n"
         "        return !porpoise_state_should_stop(state);\n"
         "    }\n"
-        "    if (state->lifted_call_depth == UINT32_MAX) {\n"
+        "    if (state->lifted_call_depth >= PORPOISE_LIFTED_CALL_STACK_CAPACITY) {\n"
         "        porpoise_state_set_fault(state, PORPOISE_FAULT_INVALID_STATE, address, \"lifted call depth overflow\");\n"
         "        return 0;\n"
         "    }\n"
+        "    porpoise_trace_call_enter(state, address, dispatch_kind, target.name);\n"
+        "    state->lifted_return_stack[state->lifted_call_depth] =\n"
+        "        tail_branch && state->lifted_call_depth != 0U\n"
+        "            ? state->lifted_return_stack[state->lifted_call_depth - 1U]\n"
+        "            : state->lr;\n"
         "    state->lifted_call_depth++;\n"
         "    target.function(state);\n"
         "    state->lifted_call_depth--;\n"
+        "    porpoise_trace_call_exit(state, address, dispatch_kind, target.name);\n"
         "    if (porpoise_state_should_stop(state)) return 0;\n"
         "    if ((state->msr & PORPOISE_MSR_EE) != 0U &&\n"
         "        !porpoise_poll_host_events(state, address)) {\n"
         "        return 0;\n"
         "    }\n"
         "    return !porpoise_state_should_stop(state);\n"
+        "}\n\n"
+        "int porpoise_call_address(PorpoisePpcState *state, uint32_t address)\n"
+        "{\n"
+        "    return porpoise_dispatch_address(state, address, 0);\n"
+        "}\n\n"
+        "int porpoise_branch_address(PorpoisePpcState *state, uint32_t address)\n"
+        "{\n"
+        "    return porpoise_dispatch_address(state, address, 1);\n"
         "}\n",
         output);
     if (!checked_close(output, full, context->diagnostics)) {
@@ -1358,6 +1547,9 @@ static bool write_imports(ProjectContext *context) {
             fprintf(source, "extern void %s(PorpoisePpcState *state);\n", function->adapter);
         fprintf(source, "void porpoise_import_%s(PorpoisePpcState *state)\n{\n", c_name);
         fputs("    if (porpoise_state_should_stop(state)) return;\n", source);
+        fputs(
+            "    if (!porpoise_libporpoise_gx_flush_pending(state)) return;\n",
+            source);
         if (function->adapter != NULL) {
             fprintf(source, "    %s(state);\n", function->adapter);
         } else {
@@ -1487,9 +1679,11 @@ static bool write_exports(ProjectContext *context) {
 static bool copy_runtime(ProjectContext *context) {
     static const char *sources[] = {
         "include/porpoise_lifted.h",
+        "include/porpoise_ppc_fp.h",
         "include/porpoise_libporpoise_adapter.h",
         "include/porpoise_title_host.h",
         "src/porpoise_lifted.c",
+        "src/porpoise_ppc_fp.c",
         "src/porpoise_libporpoise_adapter.c",
         "src/porpoise_libporpoise_ai.c",
         "src/porpoise_libporpoise_ar.c",
@@ -1502,6 +1696,8 @@ static bool copy_runtime(ProjectContext *context) {
         "src/porpoise_libporpoise_guest_os.c",
         "src/porpoise_libporpoise_message_queue.c",
         "src/porpoise_libporpoise_os_report.c",
+        "src/porpoise_libporpoise_presentation.cpp",
+        "src/porpoise_libporpoise_presentation_private.h",
         "src/porpoise_libporpoise_builtins_private.h",
         "src/porpoise_libporpoise_private.h"
     };
@@ -1525,20 +1721,53 @@ static bool write_entry(ProjectContext *context) {
     if (context->entry == NULL) return true;
     output = open_generated_file(context, "src/porpoise_entry.c", full);
     if (output == NULL) return false;
-    fputs("#include <stdio.h>\n#include <string.h>\n#include \"porpoise_data_private.h\"\n#include \"porpoise_exports.h\"\n#include \"porpoise_generated.h\"\n#include \"porpoise_libporpoise_adapter.h\"\n#include \"porpoise_title_host.h\"\n\n", output);
-    fputs("void DolphinMain(void)\n{\n    PorpoiseHostAdapter host;\n    PorpoisePpcState state;\n    PorpoiseTitleRuntimeConfigV1 runtime_config;\n    PorpoiseTitleEntryStateV3 title_state;\n    PorpoiseHostResult result;\n    uint32_t initial_word_index;\n    uint32_t startup_function_index;\n    int title_host_result;\n    int export_state_bound = 0;\n\n", output);
+    fputs("#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include \"porpoise_data_private.h\"\n#include \"porpoise_exports.h\"\n#include \"porpoise_generated.h\"\n#include \"porpoise_libporpoise_adapter.h\"\n#include \"porpoise_title_host.h\"\n\n", output);
+    fputs(
+        "static void porpoise_write_run_status(\n"
+        "    const char *kind, uint32_t pc, const char *message)\n"
+        "{\n"
+        "    const char *path = getenv(\"PORPOISE_STATUS_FILE\");\n"
+        "    const unsigned char *cursor;\n"
+        "    FILE *status_file;\n\n"
+        "    if (path == NULL || path[0] == '\\0') return;\n"
+        "    status_file = fopen(path, \"wb\");\n"
+        "    if (status_file == NULL) {\n"
+        "        fprintf(stderr, \"Porpoise could not write run status file: %s\\n\", path);\n"
+        "        return;\n"
+        "    }\n"
+        "    fprintf(status_file, \"PORPOISE_STATUS_V1\\t%s\\t%08lX\\t\",\n"
+        "            kind, (unsigned long)pc);\n"
+        "    cursor = (const unsigned char *)(message != NULL ? message : \"\");\n"
+        "    while (*cursor != '\\0') {\n"
+        "        unsigned char value = *cursor++;\n"
+        "        if (value == '\\t' || value == '\\r' || value == '\\n') value = ' ';\n"
+        "        fputc((int)value, status_file);\n"
+        "    }\n"
+        "    fputc('\\n', status_file);\n"
+        "    if (fclose(status_file) != 0) {\n"
+        "        fprintf(stderr, \"Porpoise could not finish run status file: %s\\n\", path);\n"
+        "    }\n"
+        "}\n\n",
+        output);
+    fputs("void DolphinMain(void)\n{\n    PorpoiseHostAdapter host;\n    PorpoisePpcState state;\n    PorpoiseTitleRuntimeConfigV1 runtime_config;\n    PorpoiseTitleEntryStateV3 title_state;\n    PorpoiseHostResult result;\n    uint32_t initial_word_index;\n    uint32_t startup_function_index;\n    int title_host_result;\n    int export_state_bound = 0;\n    int run_status_written = 0;\n", output);
+    fprintf(
+        output,
+        "    const uint32_t porpoise_entry_pc = UINT32_C(0x%08lX);\n\n",
+        (unsigned long)context->entry->start_address);
     fprintf(output,
             "    memset(&runtime_config, 0, sizeof(runtime_config));\n"
             "    title_host_result = PorpoiseHostPrepareRuntimeV1(\n"
             "        UINT32_C(0x%08lX), &runtime_config);\n"
             "    if (title_host_result != PORPOISE_TITLE_HOST_OK) {\n"
             "        fprintf(stderr, \"Porpoise title host failed to prepare runtime (%%d)\\n\", title_host_result);\n"
+            "        porpoise_write_run_status(\"FAULT\", porpoise_entry_pc, \"title host failed to prepare runtime\");\n"
             "        return;\n"
             "    }\n"
             "    if ((runtime_config.flags & ~PORPOISE_TITLE_RUNTIME_KNOWN_FLAGS) != 0U ||\n"
             "        (runtime_config.dvd_root_directory != NULL &&\n"
             "         (runtime_config.flags & PORPOISE_TITLE_RUNTIME_INITIALIZE_DVD) == 0U)) {\n"
             "        fprintf(stderr, \"Porpoise title host returned invalid runtime configuration\\n\");\n"
+            "        porpoise_write_run_status(\"FAULT\", porpoise_entry_pc, \"title host returned invalid runtime configuration\");\n"
             "        return;\n"
             "    }\n"
             "    result = porpoise_libporpoise_adapter_init_for_title(\n"
@@ -1547,17 +1776,28 @@ static bool write_entry(ProjectContext *context) {
             "        (runtime_config.flags & PORPOISE_TITLE_RUNTIME_INITIALIZE_DVD) != 0U);\n"
             "    if (result != PORPOISE_HOST_OK) {\n"
             "        fprintf(stderr, \"Porpoise host initialization failed: %%s\\n\", porpoise_host_result_string(result));\n"
+            "        porpoise_write_run_status(\"FAULT\", porpoise_entry_pc, porpoise_host_result_string(result));\n"
             "        return;\n"
+            "    }\n"
+            "    if (!porpoise_libporpoise_has_host_thread_carrier_v1()) {\n"
+            "        fprintf(stderr, \"Porpoise runtime capability: single-thread compatibility only; guest sleep, wake, suspend, resume, and exit operations will fault if reached\\n\");\n"
             "    }\n"
             "    result = porpoise_generated_bind(&host);\n"
             "    if (result != PORPOISE_HOST_OK) {\n"
             "        fprintf(stderr, \"Porpoise guest dispatcher binding failed: %%s\\n\", porpoise_host_result_string(result));\n"
+            "        porpoise_write_run_status(\"FAULT\", porpoise_entry_pc, porpoise_host_result_string(result));\n"
             "        porpoise_libporpoise_adapter_shutdown(&host);\n"
             "        return;\n"
             "    }\n",
             (unsigned long)context->entry->start_address);
     fprintf(output,
             "    porpoise_state_init(&state, &host);\n"
+            "    if (!porpoise_trace_configure_from_environment(&state)) {\n"
+            "        fprintf(stderr, \"Porpoise trace configuration is invalid or could not be opened\\n\");\n"
+            "        porpoise_write_run_status(\"FAULT\", porpoise_entry_pc, \"trace configuration is invalid or could not be opened\");\n"
+            "        run_status_written = 1;\n"
+            "        goto shutdown;\n"
+            "    }\n"
             "    state.pc = UINT32_C(0x%08lX);\n"
             "    porpoise_initialize_data(&state);\n"
             "    if (porpoise_state_has_fault(&state)) {\n"
@@ -1569,27 +1809,40 @@ static bool write_entry(ProjectContext *context) {
             "        UINT32_C(0x%08lX), &title_state);\n"
             "    if (title_host_result != PORPOISE_TITLE_HOST_OK) {\n"
             "        fprintf(stderr, \"Porpoise title host failed to prepare entry state (%%d)\\n\", title_host_result);\n"
+            "        porpoise_write_run_status(\"FAULT\", state.pc, \"title host failed to prepare entry state\");\n"
+            "        run_status_written = 1;\n"
             "        goto shutdown;\n"
             "    }\n"
             "    if (title_state.initial_word_count > PORPOISE_TITLE_HOST_INITIAL_WORD_CAPACITY) {\n"
             "        fprintf(stderr, \"Porpoise title host returned too many initial memory words\\n\");\n"
+            "        porpoise_write_run_status(\"FAULT\", state.pc, \"title host returned too many initial memory words\");\n"
+            "        run_status_written = 1;\n"
             "        goto shutdown;\n"
             "    }\n"
             "    if (title_state.startup_function_count >\n"
             "        PORPOISE_TITLE_HOST_STARTUP_FUNCTION_CAPACITY) {\n"
             "        fprintf(stderr, \"Porpoise title host returned too many startup functions\\n\");\n"
+            "        porpoise_write_run_status(\"FAULT\", state.pc, \"title host returned too many startup functions\");\n"
+            "        run_status_written = 1;\n"
             "        goto shutdown;\n"
-            "    }\n"
+            "    }\n",
+            (unsigned long)context->entry->start_address,
+            (unsigned long)context->entry->start_address);
+    fprintf(output,
             "    for (startup_function_index = 0U;\n"
             "         startup_function_index < title_state.startup_function_count;\n"
             "         startup_function_index++) {\n"
             "        if (title_state.startup_functions[startup_function_index].guest_address == 0U) {\n"
             "            fprintf(stderr, \"Porpoise title host returned a null startup function\\n\");\n"
+            "            porpoise_write_run_status(\"FAULT\", state.pc, \"title host returned a null startup function\");\n"
+            "            run_status_written = 1;\n"
             "            goto shutdown;\n"
             "        }\n"
             "        if ((title_state.startup_functions[startup_function_index].flags &\n"
             "             ~PORPOISE_TITLE_STARTUP_KNOWN_FLAGS) != 0U) {\n"
             "            fprintf(stderr, \"Porpoise title host returned unknown startup-function flags\\n\");\n"
+            "            porpoise_write_run_status(\"FAULT\", state.pc, \"title host returned unknown startup-function flags\");\n"
+            "            run_status_written = 1;\n"
             "            goto shutdown;\n"
             "        }\n"
             "    }\n"
@@ -1597,6 +1850,8 @@ static bool write_entry(ProjectContext *context) {
             "        &host, title_state.arena_lo, title_state.arena_hi);\n"
             "    if (result != PORPOISE_HOST_OK) {\n"
             "        fprintf(stderr, \"Porpoise title arena initialization failed: %%s\\n\", porpoise_host_result_string(result));\n"
+            "        porpoise_write_run_status(\"FAULT\", state.pc, porpoise_host_result_string(result));\n"
+            "        run_status_written = 1;\n"
             "        goto shutdown;\n"
             "    }\n"
             "    memcpy(state.gpr, title_state.gpr, sizeof(state.gpr));\n"
@@ -1628,20 +1883,20 @@ static bool write_entry(ProjectContext *context) {
             "            result = porpoise_libporpoise_bind_guest_main_thread(&state);\n"
             "            if (result != PORPOISE_HOST_OK) {\n"
             "                fprintf(stderr, \"Porpoise guest main-thread binding failed: %%s\\n\", porpoise_host_result_string(result));\n"
+            "                porpoise_write_run_status(\"FAULT\", state.pc, porpoise_host_result_string(result));\n"
+            "                run_status_written = 1;\n"
             "                goto shutdown;\n"
             "            }\n"
             "        }\n"
             "        memcpy(state.gpr, title_state.gpr, sizeof(state.gpr));\n"
             "    }\n"
             "    state.pc = UINT32_C(0x%08lX);\n",
-            (unsigned long)context->entry->start_address,
-            (unsigned long)context->entry->start_address,
             (unsigned long)context->entry->start_address);
     fprintf(output,
             "    (void)porpoise_libporpoise_run_guest(&state, UINT32_C(0x%08lX));\n",
             (unsigned long)context->entry->start_address);
     fputs("    if (!porpoise_state_has_fault(&state)) state.status = PORPOISE_EXECUTION_RETURNED;\n", output);
-    fputs("shutdown:\n    if (export_state_bound) porpoise_bind_export_state(NULL);\n    if (porpoise_state_has_fault(&state)) {\n        fprintf(stderr, \"Porpoise execution fault at PC 0x%08lX, guest address 0x%08lX: %s\\n\", (unsigned long)state.pc, (unsigned long)state.fault_address, porpoise_state_fault_message(&state));\n    }\n    porpoise_libporpoise_adapter_shutdown(&host);\n}\n", output);
+    fputs("shutdown:\n    if (export_state_bound) porpoise_bind_export_state(NULL);\n    if (porpoise_state_has_fault(&state)) {\n        fprintf(stderr, \"Porpoise execution fault at PC 0x%08lX, guest address 0x%08lX: %s\\n\", (unsigned long)state.pc, (unsigned long)state.fault_address, porpoise_state_fault_message(&state));\n        if (!run_status_written) {\n            porpoise_write_run_status(\"FAULT\", state.pc, porpoise_state_fault_message(&state));\n            run_status_written = 1;\n        }\n    } else if (!run_status_written) {\n        porpoise_write_run_status(\"OK\", state.pc, \"completed without a guest fault\");\n        run_status_written = 1;\n    }\n    porpoise_trace_close(&state);\n    porpoise_libporpoise_adapter_shutdown(&host);\n    (void)run_status_written;\n}\n", output);
     return checked_close(output, full, context->diagnostics);
 }
 
@@ -1660,9 +1915,15 @@ static bool write_meson(ProjectContext *context) {
     char full[PORPOISE_PATH_CAPACITY];
     FILE *output = open_generated_file(context, "meson.build", full);
     size_t file_index;
+    bool uses_presentation_bridge =
+        project_uses_presentation_bridge(context);
     if (output == NULL) return false;
     fputs("project(", output); meson_write_string(output, context->project_name);
-    fputs(", 'c', version: '1.0.0', default_options: ['c_std=c99', 'warning_level=3', 'werror=true'])\n\n", output);
+    if (uses_presentation_bridge) {
+        fputs(", 'c', 'cpp', version: '1.0.0', default_options: ['c_std=c99', 'cpp_std=c++17', 'warning_level=3', 'werror=true'])\n\n", output);
+    } else {
+        fputs(", 'c', version: '1.0.0', default_options: ['c_std=c99', 'warning_level=3', 'werror=true'])\n\n", output);
+    }
     fputs("libporpoise_raw_dep = dependency('libPorpoise', fallback: ['libPorpoise','libporpoise_dep'])\n", output);
     fputs("libporpoise_dep = libporpoise_raw_dep.partial_dependency(\n", output);
     fputs("  compile_args: false,\n", output);
@@ -1687,10 +1948,17 @@ static bool write_meson(ProjectContext *context) {
     fputs("endif\n", output);
     fputs("porpoise_consumer_c_args += [\n", output);
     fputs("  '-DPORPOISE_AUTODETECT_LIBPORPOISE_HOST_THREAD_CARRIER_V1=1',\n", output);
+    if (uses_presentation_bridge) {
+        fputs("  '-DPORPOISE_HAVE_LIBPORPOISE_PRESENTATION_STATS_BRIDGE=1',\n", output);
+    }
     fputs("]\n\n", output);
     fputs("cc = meson.get_compiler('c')\nmath_dep = cc.find_library('m', required: false)\n\n", output);
     fputs("generated_inc = include_directories('include')\ngenerated_private_inc = include_directories('src')\n\nlifted_sources = files(\n", output);
-    fputs("  'src/porpoise_lifted.c',\n  'src/porpoise_libporpoise_adapter.c',\n  'src/porpoise_libporpoise_ai.c',\n  'src/porpoise_libporpoise_ar.c',\n  'src/porpoise_libporpoise_arena.c',\n  'src/porpoise_libporpoise_card.c',\n  'src/porpoise_libporpoise_gx.c',\n  'src/porpoise_libporpoise_gx_objects.c',\n  'src/porpoise_libporpoise_gx_values.c',\n  'src/porpoise_libporpoise_guest_os.c',\n  'src/porpoise_libporpoise_message_queue.c',\n  'src/porpoise_libporpoise_os_report.c',\n  'src/porpoise_function_registry.c'", output);
+    fputs("  'src/porpoise_lifted.c',\n  'src/porpoise_ppc_fp.c',\n  'src/porpoise_libporpoise_adapter.c',\n  'src/porpoise_libporpoise_ai.c',\n  'src/porpoise_libporpoise_ar.c',\n  'src/porpoise_libporpoise_arena.c',\n  'src/porpoise_libporpoise_card.c',\n  'src/porpoise_libporpoise_gx.c',\n  'src/porpoise_libporpoise_gx_objects.c',\n  'src/porpoise_libporpoise_gx_values.c',\n  'src/porpoise_libporpoise_guest_os.c',\n  'src/porpoise_libporpoise_message_queue.c',\n  'src/porpoise_libporpoise_os_report.c'", output);
+    if (uses_presentation_bridge) {
+        fputs(",\n  'src/porpoise_libporpoise_presentation.cpp'", output);
+    }
+    fputs(",\n  'src/porpoise_function_registry.c'", output);
     for (file_index = 0U;
          file_index < context->registry_shard_count;
          file_index++) {
@@ -1727,7 +1995,11 @@ static bool write_meson(ProjectContext *context) {
         }
     }
     fputs("\n)\n\n", output);
-    fputs("porpoise_lifted_library = static_library(\n  'porpoise_lifted',\n  lifted_sources,\n  include_directories: [generated_inc, generated_private_inc],\n  dependencies: [libporpoise_dep, math_dep],\n  c_args: porpoise_consumer_c_args,\n  install: false,\n)\n\n", output);
+    fputs("porpoise_lifted_library = static_library(\n  'porpoise_lifted',\n  lifted_sources,\n  include_directories: [generated_inc, generated_private_inc],\n  dependencies: [libporpoise_dep, math_dep],\n  c_args: porpoise_consumer_c_args,\n", output);
+    if (uses_presentation_bridge) {
+        fputs("  cpp_args: porpoise_consumer_c_args,\n", output);
+    }
+    fputs("  install: false,\n)\n\n", output);
     fputs("porpoise_lifted_dep = declare_dependency(\n  link_with: porpoise_lifted_library,\n  include_directories: generated_inc,\n  dependencies: [libporpoise_dep, math_dep],\n)\nmeson.override_dependency('porpoise-generated', porpoise_lifted_dep)\n", output);
     if (context->entry != NULL) {
         fputs("\nporpoise_title_contract_dep = declare_dependency(include_directories: generated_inc)\nmeson.override_dependency('porpoise-title-contract', porpoise_title_contract_dep)\n", output);

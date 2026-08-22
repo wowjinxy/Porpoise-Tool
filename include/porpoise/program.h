@@ -30,6 +30,17 @@ typedef struct PorpoiseAddressAlias {
     size_t instruction_item_index;
 } PorpoiseAddressAlias;
 
+/*
+ * A real instruction whose address is retained by a finalized absolute data
+ * relocation such as a compiler-emitted switch table entry.  These entries
+ * are deliberately separate from source labels and aliases: DTK output does
+ * not necessarily name every address-taken basic block.
+ */
+typedef struct PorpoiseAddressTakenEntry {
+    uint32_t address;
+    size_t instruction_item_index;
+} PorpoiseAddressTakenEntry;
+
 typedef struct PorpoiseFunction {
     char *name;
     char *c_name;
@@ -46,6 +57,9 @@ typedef struct PorpoiseFunction {
     PorpoiseAddressAlias *aliases;
     size_t alias_count;
     size_t alias_capacity;
+    PorpoiseAddressTakenEntry *address_taken_entries;
+    size_t address_taken_entry_count;
+    size_t address_taken_entry_capacity;
 } PorpoiseFunction;
 
 typedef struct PorpoiseDataWord {

@@ -2126,6 +2126,140 @@ static void store_be32(uint8_t *bytes, uint32_t value) {
     bytes[3] = (uint8_t)value;
 }
 
+static PorpoiseFunction *mutable_program_function(
+    PorpoiseProgram *program,
+    const PorpoiseFunction *target) {
+    size_t file_index;
+
+    for (file_index = 0U; file_index < program->file_count; file_index++) {
+        PorpoiseSourceFile *file = &program->files[file_index];
+        size_t function_index;
+
+        for (function_index = 0U;
+             function_index < file->function_count;
+             function_index++) {
+            if (&file->functions[function_index] == target) {
+                return &file->functions[function_index];
+            }
+        }
+    }
+    return NULL;
+}
+
+static bool append_address_taken_entry(
+    PorpoiseFunction *function,
+    uint32_t address,
+    size_t instruction_item_index) {
+    size_t index;
+
+    for (index = 0U;
+         index < function->address_taken_entry_count;
+         index++) {
+        const PorpoiseAddressTakenEntry *entry =
+            &function->address_taken_entries[index];
+        if (entry->address == address) {
+            return entry->instruction_item_index == instruction_item_index;
+        }
+    }
+    if (function->address_taken_entry_count == SIZE_MAX ||
+        !porpoise_grow_array(
+            (void **)&function->address_taken_entries,
+            &function->address_taken_entry_capacity,
+            sizeof(*function->address_taken_entries),
+            function->address_taken_entry_count + 1U)) {
+        return false;
+    }
+    function->address_taken_entries[function->address_taken_entry_count].address =
+        address;
+    function->address_taken_entries[
+        function->address_taken_entry_count].instruction_item_index =
+            instruction_item_index;
+    function->address_taken_entry_count++;
+    return true;
+}
+
+static bool promote_absolute_function_fixup(
+    PorpoiseProgram *program,
+    PorpoiseSourceFile *file,
+    const PorpoiseDataObject *object,
+    const PorpoiseDataFixup *fixup,
+    uint32_t resolved_base,
+    uint32_t value,
+    PorpoiseDiagnostics *diagnostics) {
+    const PorpoiseFunction *declared_function = NULL;
+    const PorpoiseAddressAlias *declared_alias = NULL;
+    PorpoiseFunction *function;
+    uint32_t declared_address = 0U;
+    uint64_t function_end;
+    size_t item_index;
+
+    if (fixup->kind != PORPOISE_DATA_FIXUP_ABSOLUTE_32 ||
+        fixup->target_symbol == NULL || fixup->target_addend == 0) {
+        return true;
+    }
+    if (!porpoise_program_resolve_declared_function(
+            program,
+            fixup->target_symbol,
+            &declared_function,
+            &declared_alias,
+            &declared_address) ||
+        declared_function == NULL || declared_address != resolved_base) {
+        /* Ordinary data-symbol arithmetic is not a code-entry declaration. */
+        return true;
+    }
+    (void)declared_alias;
+    function = mutable_program_function(program, declared_function);
+    if (function == NULL) return false;
+    if ((value & UINT32_C(3)) != 0U) {
+        porpoise_diagnostics_add(
+            diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            file->path,
+            fixup->source_line,
+            object->address,
+            "absolute function relocation %s%+lld resolves to misaligned code address 0x%08lX",
+            fixup->target_symbol,
+            (long long)fixup->target_addend,
+            (unsigned long)value);
+        return false;
+    }
+    function_end =
+        (uint64_t)function->start_address + (uint64_t)function->size;
+    if ((uint64_t)value < function->start_address ||
+        (uint64_t)value >= function_end) {
+        porpoise_diagnostics_add(
+            diagnostics,
+            PORPOISE_SEVERITY_ERROR,
+            file->path,
+            fixup->source_line,
+            object->address,
+            "absolute function relocation %s%+lld resolves outside its owning function at 0x%08lX",
+            fixup->target_symbol,
+            (long long)fixup->target_addend,
+            (unsigned long)value);
+        return false;
+    }
+    for (item_index = 0U; item_index < function->item_count; item_index++) {
+        const PorpoiseAsmItem *item = &function->items[item_index];
+        if (item->kind == PORPOISE_ASM_INSTRUCTION &&
+            item->address == value) {
+            if (value == function->start_address) return true;
+            return append_address_taken_entry(function, value, item_index);
+        }
+    }
+    porpoise_diagnostics_add(
+        diagnostics,
+        PORPOISE_SEVERITY_ERROR,
+        file->path,
+        fixup->source_line,
+        object->address,
+        "absolute function relocation %s%+lld does not resolve to a real instruction at 0x%08lX",
+        fixup->target_symbol,
+        (long long)fixup->target_addend,
+        (unsigned long)value);
+    return false;
+}
+
 static bool resolve_object_fixups(
     PorpoiseProgram *program,
     PorpoiseSourceFile *file,
@@ -2159,6 +2293,17 @@ static bool resolve_object_fixups(
                     fixup->source_line, object->address,
                     "unresolved, ambiguous, or overflowing data expression %s",
                     fixup->target_symbol);
+                ok = false;
+                continue;
+            }
+            if (!promote_absolute_function_fixup(
+                    program,
+                    file,
+                    object,
+                    fixup,
+                    address,
+                    value,
+                    diagnostics)) {
                 ok = false;
                 continue;
             }

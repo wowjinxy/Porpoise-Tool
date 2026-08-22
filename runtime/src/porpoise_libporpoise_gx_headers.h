@@ -23,6 +23,7 @@
 #include <dolphin/gx/GXDispList.h>
 #include <dolphin/gx/GXFifo.h>
 #include <dolphin/gx/GXFrameBuffer.h>
+#include <dolphin/gx/GXAttr.h>
 #include <dolphin/gx/GXHostArray.h>
 #include <dolphin/gx/GXLighting.h>
 #include <dolphin/gx/GXPixel.h>
@@ -49,6 +50,7 @@ void GXPokeBlendMode(
     GXBlendFactor destination_factor,
     GXLogicOp operation);
 GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback callback);
+void GXDrawDone(void);
 void GXSetDrawDone(void);
 void GXWaitDrawDone(void);
 #ifdef __cplusplus

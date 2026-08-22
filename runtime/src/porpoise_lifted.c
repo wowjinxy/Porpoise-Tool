@@ -1,10 +1,23 @@
 #include "porpoise_lifted.h"
+#include "porpoise_ppc_fp.h"
 
+#include <errno.h>
 #include <fenv.h>
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* These helpers inspect and temporarily change the host floating-point
+ * environment.  Optimized builds must preserve that observable state: in
+ * particular, the exact-domain checks depend on FE_INEXACT rather than merely
+ * on the rounded host result. */
+#if defined(__clang__)
+#pragma STDC FENV_ACCESS ON
+#elif defined(__GNUC__)
+#pragma GCC optimize ("rounding-math")
+#endif
 
 static int porpoise_finish_host_event(
     PorpoisePpcState *state,
@@ -20,6 +33,307 @@ static int porpoise_finish_host_event(
 
 typedef char PorpoiseFloatMustBe32Bits[sizeof(float) == 4U ? 1 : -1];
 typedef char PorpoiseDoubleMustBe64Bits[sizeof(double) == 8U ? 1 : -1];
+
+static FILE *porpoise_trace_output(PorpoisePpcState *state)
+{
+    return state != NULL ? (FILE *)state->trace_file : NULL;
+}
+
+static void porpoise_trace_json_string(FILE *output, const char *value)
+{
+    const unsigned char *cursor =
+        (const unsigned char *)(value != NULL ? value : "");
+
+    fputc('"', output);
+    while (*cursor != '\0') {
+        switch (*cursor) {
+            case '"': fputs("\\\"", output); break;
+            case '\\': fputs("\\\\", output); break;
+            case '\b': fputs("\\b", output); break;
+            case '\f': fputs("\\f", output); break;
+            case '\n': fputs("\\n", output); break;
+            case '\r': fputs("\\r", output); break;
+            case '\t': fputs("\\t", output); break;
+            default:
+                if (*cursor < 0x20U) {
+                    fprintf(output, "\\u%04X", (unsigned int)*cursor);
+                } else {
+                    fputc((int)*cursor, output);
+                }
+                break;
+        }
+        cursor++;
+    }
+    fputc('"', output);
+}
+
+static void porpoise_trace_write_stack(
+    FILE *output,
+    const PorpoisePpcState *state)
+{
+    uint32_t index;
+
+    fputs(",\"stack\":[", output);
+    for (index = 0U; index < state->trace_call_depth; index++) {
+        if (index != 0U) fputc(',', output);
+        fprintf(
+            output,
+            "\"0x%08lX\"",
+            (unsigned long)state->trace_call_stack[index]);
+    }
+    fputc(']', output);
+    if (state->trace_call_overflow != 0U) {
+        fprintf(
+            output,
+            ",\"stack_overflow\":%lu",
+            (unsigned long)state->trace_call_overflow);
+    }
+}
+
+static FILE *porpoise_trace_begin_event(
+    PorpoisePpcState *state,
+    const char *event)
+{
+    FILE *output = porpoise_trace_output(state);
+    const char *function_name = "";
+    uint32_t function_address = 0U;
+
+    if (output == NULL) return NULL;
+    if (state->trace_call_depth != 0U) {
+        uint32_t current = state->trace_call_depth - 1U;
+        function_address = state->trace_call_stack[current];
+        function_name = state->trace_function_stack[current];
+    }
+    state->trace_sequence++;
+    fprintf(
+        output,
+        "{\"sequence\":%llu,\"event\":",
+        (unsigned long long)state->trace_sequence);
+    porpoise_trace_json_string(output, event);
+    fprintf(output, ",\"pc\":\"0x%08lX\"", (unsigned long)state->pc);
+    fputs(",\"function\":", output);
+    porpoise_trace_json_string(output, function_name);
+    fprintf(
+        output,
+        ",\"function_address\":\"0x%08lX\"",
+        (unsigned long)function_address);
+    return output;
+}
+
+static void porpoise_trace_finish_event(
+    FILE *output,
+    const PorpoisePpcState *state)
+{
+    porpoise_trace_write_stack(output, state);
+    fputs("}\n", output);
+    fflush(output);
+}
+
+int porpoise_trace_configure_from_environment(PorpoisePpcState *state)
+{
+    const char *trace_path;
+    const char *frame_limit;
+    const char *reject_approximations;
+    char *end = NULL;
+    unsigned long parsed_limit;
+
+    if (state == NULL || state->trace_file != NULL) return 0;
+    trace_path = getenv("PORPOISE_TRACE");
+    frame_limit = getenv("PORPOISE_FRAME_LIMIT");
+    reject_approximations = getenv("PORPOISE_REJECT_APPROXIMATIONS");
+    if (trace_path != NULL && trace_path[0] != '\0') {
+        FILE *output = fopen(trace_path, "wb");
+        if (output == NULL) return 0;
+        state->trace_file = output;
+    }
+    if (frame_limit != NULL && frame_limit[0] != '\0') {
+        errno = 0;
+        parsed_limit = strtoul(frame_limit, &end, 10);
+        if (errno != 0 || end == frame_limit || *end != '\0' ||
+            parsed_limit == 0UL || parsed_limit > (unsigned long)UINT32_MAX) {
+            porpoise_trace_close(state);
+            return 0;
+        }
+        state->trace_frame_limit = (uint32_t)parsed_limit;
+    }
+    if (reject_approximations != NULL &&
+        reject_approximations[0] != '\0') {
+        if (strcmp(reject_approximations, "1") == 0) {
+            state->reject_approximations = 1;
+        } else if (strcmp(reject_approximations, "0") != 0) {
+            porpoise_trace_close(state);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void porpoise_trace_close(PorpoisePpcState *state)
+{
+    FILE *output;
+
+    if (state == NULL) return;
+    output = porpoise_trace_output(state);
+    if (output != NULL) fclose(output);
+    state->trace_file = NULL;
+    state->trace_call_depth = 0U;
+    state->trace_call_overflow = 0U;
+    memset(
+        state->trace_function_stack,
+        0,
+        sizeof(state->trace_function_stack));
+}
+
+void porpoise_trace_call_enter(
+    PorpoisePpcState *state,
+    uint32_t guest_address,
+    const char *dispatch_kind,
+    const char *function_name)
+{
+    FILE *output;
+
+    if (porpoise_trace_output(state) == NULL) return;
+    if (state->trace_call_depth < PORPOISE_TRACE_STACK_CAPACITY) {
+        state->trace_call_stack[state->trace_call_depth] = guest_address;
+        state->trace_function_stack[state->trace_call_depth] = function_name;
+        state->trace_call_depth++;
+    } else if (state->trace_call_overflow != UINT32_MAX) {
+        state->trace_call_overflow++;
+    }
+    output = porpoise_trace_begin_event(state, "call");
+    if (output == NULL) return;
+    fputs(",\"phase\":\"enter\",\"address\":", output);
+    fprintf(output, "\"0x%08lX\",\"kind\":", (unsigned long)guest_address);
+    porpoise_trace_json_string(output, dispatch_kind);
+    porpoise_trace_finish_event(output, state);
+}
+
+void porpoise_trace_call_exit(
+    PorpoisePpcState *state,
+    uint32_t guest_address,
+    const char *dispatch_kind,
+    const char *function_name)
+{
+    FILE *output = porpoise_trace_begin_event(state, "call");
+    (void)function_name;
+
+    if (output == NULL) return;
+    fputs(",\"phase\":\"exit\",\"address\":", output);
+    fprintf(output, "\"0x%08lX\",\"kind\":", (unsigned long)guest_address);
+    porpoise_trace_json_string(output, dispatch_kind);
+    porpoise_trace_finish_event(output, state);
+    if (state->trace_call_overflow != 0U) {
+        state->trace_call_overflow--;
+    } else if (state->trace_call_depth != 0U) {
+        state->trace_call_depth--;
+        state->trace_function_stack[state->trace_call_depth] = NULL;
+    }
+}
+
+void porpoise_trace_approximate(
+    PorpoisePpcState *state,
+    uint32_t instruction_address,
+    const char *mnemonic)
+{
+    FILE *output;
+
+    if (state == NULL) return;
+    if (state->approximation_count == 0U) {
+        state->first_approximation_address = instruction_address;
+        (void)snprintf(
+            state->first_approximation_mnemonic,
+            sizeof(state->first_approximation_mnemonic),
+            "%s",
+            mnemonic != NULL ? mnemonic : "");
+    }
+    if (state->approximation_count != UINT64_MAX) {
+        state->approximation_count++;
+    }
+
+    output = porpoise_trace_begin_event(state, "approximate");
+    if (output != NULL) {
+        fprintf(
+            output,
+            ",\"address\":\"0x%08lX\",\"mnemonic\":",
+            (unsigned long)instruction_address);
+        porpoise_trace_json_string(output, mnemonic);
+        porpoise_trace_finish_event(output, state);
+    }
+
+    if (state->reject_approximations != 0 &&
+        state->fault == PORPOISE_FAULT_NONE) {
+        char message[PORPOISE_FAULT_MESSAGE_CAPACITY];
+
+        (void)snprintf(
+            message,
+            sizeof(message),
+            "unreviewed approximate instruction reached: %s",
+            mnemonic != NULL && mnemonic[0] != '\0' ? mnemonic : "unknown");
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_UNSUPPORTED_OPERATION,
+            instruction_address,
+            message);
+    }
+}
+
+static void porpoise_trace_frame_internal(
+    PorpoisePpcState *state,
+    uint32_t guest_frame_buffer,
+    int content_observed,
+    uint64_t content_hash,
+    int content_varied)
+{
+    FILE *output;
+
+    /* A retrace with no selected guest XFB is not a presented frame.  In
+     * particular it must never satisfy the test-only frame limit. */
+    if (state == NULL || porpoise_state_should_stop(state) ||
+        guest_frame_buffer == 0U) return;
+    if (state->trace_frame_count != UINT32_MAX) state->trace_frame_count++;
+    output = porpoise_trace_begin_event(state, "frame");
+    if (output != NULL) {
+        fprintf(
+            output,
+            ",\"frame\":%lu,\"frame_buffer\":\"0x%08lX\"",
+            (unsigned long)state->trace_frame_count,
+            (unsigned long)guest_frame_buffer);
+        if (content_observed != 0) {
+            fprintf(
+                output,
+                ",\"content_hash\":\"0x%016llX\",\"content_varied\":%s",
+                (unsigned long long)content_hash,
+                content_varied != 0 ? "true" : "false");
+        }
+        porpoise_trace_finish_event(output, state);
+    }
+    if (state->trace_frame_limit != 0U &&
+        state->trace_frame_count >= state->trace_frame_limit) {
+        state->status = PORPOISE_EXECUTION_RETURNED;
+    }
+}
+
+void porpoise_trace_frame(
+    PorpoisePpcState *state,
+    uint32_t guest_frame_buffer)
+{
+    porpoise_trace_frame_internal(
+        state, guest_frame_buffer, 0, UINT64_C(0), 0);
+}
+
+void porpoise_trace_frame_observed(
+    PorpoisePpcState *state,
+    uint32_t guest_frame_buffer,
+    uint64_t content_hash,
+    int content_varied)
+{
+    porpoise_trace_frame_internal(
+        state,
+        guest_frame_buffer,
+        1,
+        content_hash,
+        content_varied != 0);
+}
 
 static PorpoiseFault porpoise_fault_from_host_result(
     PorpoiseHostResult result)
@@ -174,6 +488,20 @@ void porpoise_state_set_fault(
         sizeof(state->fault_message),
         "%s",
         fault_message);
+    if (!state->trace_fault_emitted) {
+        FILE *output = porpoise_trace_begin_event(state, "fault");
+        state->trace_fault_emitted = 1;
+        if (output != NULL) {
+            fprintf(
+                output,
+                ",\"fault_address\":\"0x%08lX\",\"fault\":",
+                (unsigned long)guest_address);
+            porpoise_trace_json_string(output, porpoise_fault_string(fault));
+            fputs(",\"message\":", output);
+            porpoise_trace_json_string(output, fault_message);
+            porpoise_trace_finish_event(output, state);
+        }
+    }
 }
 
 static int porpoise_execution_status_is_valid(
@@ -196,6 +524,17 @@ int porpoise_state_should_stop(const PorpoisePpcState *state)
 {
     return porpoise_state_has_fault(state) ||
            state->status == PORPOISE_EXECUTION_RETURNED;
+}
+
+int porpoise_guest_lr_returns_to_caller(const PorpoisePpcState *state)
+{
+    if (state == NULL) return 0;
+    /* A directly embedded lifted function has no generated dispatcher frame;
+     * its C caller is the only available continuation. Generated execution
+     * always has a provenance entry and therefore takes the checked path. */
+    if (state->lifted_call_depth == 0U) return 1;
+    return state->lifted_call_depth <= PORPOISE_LIFTED_CALL_STACK_CAPACITY &&
+           state->lr == state->lifted_return_stack[state->lifted_call_depth - 1U];
 }
 
 const char *porpoise_state_fault_message(const PorpoisePpcState *state)
@@ -1246,6 +1585,165 @@ static int porpoise_scalar_fp_invalid_fault(
     return 0;
 }
 
+typedef struct PorpoiseRsqrtEstimateSegment {
+    uint32_t intercept;
+    int32_t slope;
+} PorpoiseRsqrtEstimateSegment;
+
+/*
+ * Gekko's reciprocal-square-root estimate is a piecewise-linear bit
+ * transform. These coefficients are hardware-test reference data for its 32
+ * segments. Keeping the implementation integer-only makes the result
+ * independent of the host floating-point environment.
+ */
+static const PorpoiseRsqrtEstimateSegment PORPOISE_RSQRT_SEGMENTS[32] = {
+    {UINT32_C(0x1A7E800), -INT32_C(0x568)},
+    {UINT32_C(0x17CB800), -INT32_C(0x4F3)},
+    {UINT32_C(0x1552800), -INT32_C(0x48D)},
+    {UINT32_C(0x130C000), -INT32_C(0x435)},
+    {UINT32_C(0x10F2000), -INT32_C(0x3E7)},
+    {UINT32_C(0x0EFF000), -INT32_C(0x3A2)},
+    {UINT32_C(0x0D2E000), -INT32_C(0x365)},
+    {UINT32_C(0x0B7C000), -INT32_C(0x32E)},
+    {UINT32_C(0x09E5000), -INT32_C(0x2FC)},
+    {UINT32_C(0x0867000), -INT32_C(0x2D0)},
+    {UINT32_C(0x06FF000), -INT32_C(0x2A8)},
+    {UINT32_C(0x05AB800), -INT32_C(0x283)},
+    {UINT32_C(0x046A000), -INT32_C(0x261)},
+    {UINT32_C(0x0339800), -INT32_C(0x243)},
+    {UINT32_C(0x0218800), -INT32_C(0x226)},
+    {UINT32_C(0x0105800), -INT32_C(0x20B)},
+    {UINT32_C(0x3FFA000), -INT32_C(0x7A4)},
+    {UINT32_C(0x3C29000), -INT32_C(0x700)},
+    {UINT32_C(0x38AA000), -INT32_C(0x670)},
+    {UINT32_C(0x3572000), -INT32_C(0x5F2)},
+    {UINT32_C(0x3279000), -INT32_C(0x584)},
+    {UINT32_C(0x2FB7000), -INT32_C(0x524)},
+    {UINT32_C(0x2D26000), -INT32_C(0x4CC)},
+    {UINT32_C(0x2AC0000), -INT32_C(0x47E)},
+    {UINT32_C(0x2881000), -INT32_C(0x43A)},
+    {UINT32_C(0x2665000), -INT32_C(0x3FA)},
+    {UINT32_C(0x2468000), -INT32_C(0x3C2)},
+    {UINT32_C(0x2287000), -INT32_C(0x38E)},
+    {UINT32_C(0x20C1000), -INT32_C(0x35E)},
+    {UINT32_C(0x1F12000), -INT32_C(0x332)},
+    {UINT32_C(0x1D79000), -INT32_C(0x30A)},
+    {UINT32_C(0x1BF4000), -INT32_C(0x2E6)},
+};
+
+static uint64_t porpoise_gecko_frsqrte_finite_bits(uint64_t source_bits)
+{
+    uint64_t fraction = source_bits & PORPOISE_F64_FRACTION_MASK;
+    int64_t exponent = (int64_t)(source_bits & PORPOISE_F64_EXPONENT_MASK);
+    uint64_t exponent_parity;
+    int64_t mapped_exponent;
+    uint32_t lookup;
+    uint32_t segment_index;
+    uint32_t segment_offset;
+    const PorpoiseRsqrtEstimateSegment *segment;
+    int64_t estimate;
+
+    if (exponent == 0) {
+        do {
+            exponent -= INT64_C(0x0010000000000000);
+            fraction <<= 1U;
+        } while ((fraction & UINT64_C(0x0010000000000000)) == 0U);
+        fraction &= PORPOISE_F64_FRACTION_MASK;
+        exponent += INT64_C(0x0010000000000000);
+    }
+
+    exponent_parity =
+        (uint64_t)exponent & UINT64_C(0x0010000000000000);
+    mapped_exponent =
+        INT64_C(0x3FF0000000000000) -
+        ((exponent - INT64_C(0x3FE0000000000000)) / INT64_C(2));
+    lookup = (uint32_t)((exponent_parity | fraction) >> 37U);
+    segment_index = lookup >> 11U;
+    segment_offset = lookup & UINT32_C(0x7FF);
+    segment = &PORPOISE_RSQRT_SEGMENTS[segment_index];
+    estimate = (int64_t)segment->intercept +
+               (int64_t)segment->slope * (int64_t)segment_offset;
+
+    return ((uint64_t)mapped_exponent & PORPOISE_F64_EXPONENT_MASK) |
+           ((uint64_t)estimate << 26U);
+}
+
+int porpoise_frsqrte(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int source_register,
+    int record)
+{
+    uint64_t source_bits;
+    uint64_t result_bits;
+    uint64_t magnitude;
+    uint64_t exponent;
+    uint64_t fraction;
+
+    if (state == NULL || state->fault != PORPOISE_FAULT_NONE) {
+        return 0;
+    }
+    if (!porpoise_validate_fpr_lane(state, destination_register, 0U) ||
+        !porpoise_validate_fpr_lane(state, source_register, 0U)) {
+        return 0;
+    }
+
+    source_bits = state->fpr[source_register].lane_bits[0];
+    magnitude = source_bits & ~PORPOISE_F64_SIGN_MASK;
+    exponent = source_bits & PORPOISE_F64_EXPONENT_MASK;
+    fraction = source_bits & PORPOISE_F64_FRACTION_MASK;
+
+    if (magnitude == 0U) {
+        porpoise_fpscr_clear_rounding(state);
+        porpoise_fpscr_raise_exceptions(state, PORPOISE_FPSCR_ZX);
+        if ((state->fpscr & PORPOISE_FPSCR_ZE) != 0U) {
+            return porpoise_scalar_fp_invalid_fault(
+                state,
+                record,
+                "enabled zero-divide exception during frsqrte");
+        }
+        result_bits = (source_bits & PORPOISE_F64_SIGN_MASK) |
+                      PORPOISE_F64_EXPONENT_MASK;
+    } else if (exponent == PORPOISE_F64_EXPONENT_MASK && fraction != 0U) {
+        int signaling = porpoise_f64_is_signaling_nan(source_bits);
+
+        porpoise_fpscr_clear_rounding(state);
+        if (signaling) {
+            porpoise_fpscr_raise_exceptions(
+                state,
+                PORPOISE_FPSCR_VXSNAN);
+            if ((state->fpscr & PORPOISE_FPSCR_VE) != 0U) {
+                return porpoise_scalar_fp_invalid_fault(
+                    state,
+                    record,
+                    "enabled invalid operation during frsqrte");
+            }
+        }
+        result_bits = porpoise_f64_quiet_nan(source_bits);
+    } else if ((source_bits & PORPOISE_F64_SIGN_MASK) != 0U) {
+        porpoise_fpscr_clear_rounding(state);
+        porpoise_fpscr_raise_exceptions(state, PORPOISE_FPSCR_VXSQRT);
+        if ((state->fpscr & PORPOISE_FPSCR_VE) != 0U) {
+            return porpoise_scalar_fp_invalid_fault(
+                state,
+                record,
+                "enabled invalid square-root operation during frsqrte");
+        }
+        result_bits = UINT64_C(0x7FF8000000000000);
+    } else if (exponent == PORPOISE_F64_EXPONENT_MASK) {
+        porpoise_fpscr_clear_rounding(state);
+        result_bits = 0U;
+    } else {
+        result_bits = porpoise_gecko_frsqrte_finite_bits(source_bits);
+    }
+
+    state->fpr[destination_register].lane_bits[0] = result_bits;
+    porpoise_fpscr_set_fprf(
+        state,
+        porpoise_fprf_from_binary64(result_bits));
+    return porpoise_scalar_fp_finish(state, record);
+}
+
 int porpoise_frsp(
     PorpoisePpcState *state,
     unsigned int destination_register,
@@ -2103,6 +2601,21 @@ int porpoise_write_msr(
     return 1;
 }
 
+int porpoise_msr_transition_is_exact(
+    const PorpoisePpcState *state,
+    uint32_t value)
+{
+    const uint32_t modeled_mask =
+        PORPOISE_MSR_EE | PORPOISE_MSR_PR | PORPOISE_MSR_FP |
+        PORPOISE_MSR_RI;
+
+    if (state == NULL || state->fault != PORPOISE_FAULT_NONE ||
+        (state->msr & PORPOISE_MSR_PR) != 0U) {
+        return 0;
+    }
+    return ((state->msr ^ value) & ~modeled_mask) == 0U;
+}
+
 int porpoise_poll_host_events(
     PorpoisePpcState *state,
     uint32_t instruction_address)
@@ -2675,6 +3188,946 @@ static int porpoise_psq_store_scale(unsigned int raw_scale)
                : (int)raw_scale - 64;
 }
 
+static int porpoise_fpr_lane_is_widened_binary32(uint64_t bits)
+{
+    uint32_t narrowed = porpoise_binary64_to_binary32_bits(bits);
+
+    return porpoise_binary32_to_binary64_bits(narrowed) == bits;
+}
+
+typedef struct PorpoiseExactBinary32Result {
+    uint64_t widened_bits;
+    uint32_t binary32_bits;
+    int inexact;
+    int incremented;
+    int overflow;
+    int underflow;
+} PorpoiseExactBinary32Result;
+
+static int porpoise_fp_exact_controls_are_active(
+    const PorpoisePpcState *state,
+    int paired)
+{
+    const uint32_t unsupported_controls =
+        PORPOISE_FPSCR_VE | PORPOISE_FPSCR_OE |
+        PORPOISE_FPSCR_UE | PORPOISE_FPSCR_ZE |
+        PORPOISE_FPSCR_XE | PORPOISE_FPSCR_NI |
+        PORPOISE_FPSCR_RN_MASK;
+
+    return state != NULL && state->fault == PORPOISE_FAULT_NONE &&
+           (state->msr & PORPOISE_MSR_FP) != 0U &&
+           (!paired || (state->hid2 & PORPOISE_HID2_PSE) != 0U) &&
+           (state->fpscr & unsupported_controls) == 0U;
+}
+
+static int porpoise_fpr_lane_is_ordinary_binary32(uint64_t bits)
+{
+    uint32_t narrowed;
+    uint32_t exponent;
+
+    if (!porpoise_fpr_lane_is_widened_binary32(bits)) {
+        return 0;
+    }
+    narrowed = porpoise_binary64_to_binary32_bits(bits);
+    exponent = narrowed & PORPOISE_F32_EXPONENT_MASK;
+    if (exponent == PORPOISE_F32_EXPONENT_MASK) {
+        return 0;
+    }
+    return exponent != 0U ||
+           (narrowed & PORPOISE_F32_FRACTION_MASK) == 0U;
+}
+
+static int porpoise_fpr_lane_is_finite_normal_or_zero(uint64_t bits)
+{
+    uint64_t exponent = bits & PORPOISE_F64_EXPONENT_MASK;
+
+    return exponent != PORPOISE_F64_EXPONENT_MASK &&
+           (exponent != 0U ||
+            (bits & PORPOISE_F64_FRACTION_MASK) == 0U);
+}
+
+static int porpoise_host_binary64_operation_is_exact(
+    uint64_t left_bits,
+    uint64_t right_bits,
+    PorpoiseFpBinaryOperation operation,
+    uint64_t *result_bits_out)
+{
+    fenv_t saved_environment;
+    volatile double left = porpoise_double_from_bits(left_bits);
+    volatile double right = porpoise_double_from_bits(right_bits);
+    volatile double result;
+    int exceptions;
+
+    if (result_bits_out == NULL ||
+        operation < PORPOISE_FP_BINARY_ADD ||
+        operation > PORPOISE_FP_BINARY_DIVIDE ||
+        feholdexcept(&saved_environment) != 0) {
+        return 0;
+    }
+    if (fesetround(FE_TONEAREST) != 0) {
+        (void)fesetenv(&saved_environment);
+        return 0;
+    }
+
+    switch (operation) {
+        case PORPOISE_FP_BINARY_ADD:
+            result = left + right;
+            break;
+        case PORPOISE_FP_BINARY_SUBTRACT:
+            result = left - right;
+            break;
+        case PORPOISE_FP_BINARY_MULTIPLY:
+            result = left * right;
+            break;
+        case PORPOISE_FP_BINARY_DIVIDE:
+            result = left / right;
+            break;
+        default:
+            (void)fesetenv(&saved_environment);
+            return 0;
+    }
+
+    exceptions = fetestexcept(
+        FE_INEXACT | FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW | FE_UNDERFLOW);
+    *result_bits_out = porpoise_double_to_bits((double)result);
+    (void)fesetenv(&saved_environment);
+    return exceptions == 0;
+}
+
+static int porpoise_exact_binary32_result(
+    uint64_t result_bits,
+    PorpoiseExactBinary32Result *result_out)
+{
+    PorpoiseSingleRoundResult rounded;
+    if (result_out == NULL || porpoise_f64_is_nan(result_bits) ||
+        porpoise_f64_is_infinity(result_bits)) {
+        return 0;
+    }
+    memset(result_out, 0, sizeof(*result_out));
+    if (porpoise_f64_is_zero(result_bits)) {
+        result_out->binary32_bits =
+            (result_bits & PORPOISE_F64_SIGN_MASK) != 0U
+                ? PORPOISE_F32_SIGN_MASK
+                : 0U;
+        result_out->widened_bits = porpoise_binary32_to_binary64_bits(
+            result_out->binary32_bits);
+        return 1;
+    }
+
+    rounded = porpoise_round_finite_to_binary32(result_bits, 0U);
+    result_out->binary32_bits = rounded.bits;
+    result_out->widened_bits = porpoise_binary32_to_binary64_bits(
+        rounded.bits);
+    result_out->inexact = rounded.inexact;
+    result_out->incremented = rounded.incremented;
+    result_out->overflow = rounded.overflow;
+    result_out->underflow = rounded.underflow;
+    return 1;
+}
+
+static int porpoise_evaluate_exact_binary32_operation(
+    uint64_t left_bits,
+    uint64_t right_bits,
+    PorpoiseFpBinaryOperation operation,
+    PorpoiseExactBinary32Result *result_out)
+{
+    uint64_t intermediate_bits;
+
+    if (!porpoise_fpr_lane_is_ordinary_binary32(left_bits) ||
+        !porpoise_fpr_lane_is_ordinary_binary32(right_bits) ||
+        !porpoise_host_binary64_operation_is_exact(
+            left_bits,
+            right_bits,
+            operation,
+            &intermediate_bits)) {
+        return 0;
+    }
+    return porpoise_exact_binary32_result(intermediate_bits, result_out);
+}
+
+/* Divide two widened, ordinary binary32 values and round the exact rational
+ * quotient directly to binary32.  This avoids using a rounded binary64
+ * quotient as an intermediate (which is not sufficient evidence for fdivs).
+ *
+ * The currently claimed domain intentionally excludes exceptional and
+ * subnormal results.  Those paths retain the existing approximation/fault
+ * behavior until their Gekko-specific exception semantics are modeled. */
+static int porpoise_evaluate_exact_binary32_division(
+    uint64_t numerator_bits,
+    uint64_t denominator_bits,
+    PorpoiseExactBinary32Result *result_out)
+{
+    uint32_t numerator;
+    uint32_t denominator;
+    uint32_t numerator_magnitude;
+    uint32_t denominator_magnitude;
+    uint32_t numerator_significand;
+    uint32_t denominator_significand;
+    uint32_t quotient;
+    uint32_t remainder;
+    uint32_t sign;
+    uint64_t scaled_numerator;
+    int result_exponent;
+    int incremented;
+
+    if (result_out == NULL ||
+        !porpoise_fpr_lane_is_ordinary_binary32(numerator_bits) ||
+        !porpoise_fpr_lane_is_ordinary_binary32(denominator_bits)) {
+        return 0;
+    }
+    numerator = porpoise_binary64_to_binary32_bits(numerator_bits);
+    denominator = porpoise_binary64_to_binary32_bits(denominator_bits);
+    numerator_magnitude = numerator & ~PORPOISE_F32_SIGN_MASK;
+    denominator_magnitude = denominator & ~PORPOISE_F32_SIGN_MASK;
+    if (denominator_magnitude == 0U) {
+        return 0;
+    }
+
+    memset(result_out, 0, sizeof(*result_out));
+    sign = (numerator ^ denominator) & PORPOISE_F32_SIGN_MASK;
+    if (numerator_magnitude == 0U) {
+        result_out->binary32_bits = sign;
+        result_out->widened_bits = porpoise_binary32_to_binary64_bits(sign);
+        return 1;
+    }
+
+    numerator_significand =
+        UINT32_C(0x00800000) |
+        (numerator & PORPOISE_F32_FRACTION_MASK);
+    denominator_significand =
+        UINT32_C(0x00800000) |
+        (denominator & PORPOISE_F32_FRACTION_MASK);
+    result_exponent =
+        (int)((numerator & PORPOISE_F32_EXPONENT_MASK) >> 23U) -
+        (int)((denominator & PORPOISE_F32_EXPONENT_MASK) >> 23U);
+    if (numerator_significand < denominator_significand) {
+        numerator_significand <<= 1U;
+        result_exponent--;
+    }
+
+    /* The normalized significand ratio is in [1, 2).  Its 24-bit quotient
+     * and full rounding remainder both fit comfortably in uint64_t. */
+    scaled_numerator = (uint64_t)numerator_significand << 23U;
+    quotient = (uint32_t)(scaled_numerator / denominator_significand);
+    remainder = (uint32_t)(scaled_numerator % denominator_significand);
+    incremented =
+        (uint64_t)remainder * UINT64_C(2) > denominator_significand ||
+        ((uint64_t)remainder * UINT64_C(2) == denominator_significand &&
+         (quotient & 1U) != 0U);
+    if (incremented) {
+        quotient++;
+        if (quotient == UINT32_C(0x01000000)) {
+            quotient >>= 1U;
+            result_exponent++;
+        }
+    }
+
+    /* Stay deliberately conservative at underflow and overflow boundaries. */
+    if (result_exponent < -126 || result_exponent > 127) {
+        return 0;
+    }
+    result_out->binary32_bits =
+        sign |
+        ((uint32_t)(result_exponent + 127) << 23U) |
+        (quotient & PORPOISE_F32_FRACTION_MASK);
+    result_out->widened_bits = porpoise_binary32_to_binary64_bits(
+        result_out->binary32_bits);
+    result_out->inexact = remainder != 0U;
+    result_out->incremented = incremented;
+    return 1;
+}
+
+static int porpoise_evaluate_exact_scalar_single_operation(
+    uint64_t left_bits,
+    uint64_t right_bits,
+    PorpoiseFpBinaryOperation operation,
+    PorpoiseExactBinary32Result *result_out)
+{
+    uint64_t intermediate_bits;
+
+    if (operation == PORPOISE_FP_BINARY_DIVIDE &&
+        porpoise_evaluate_exact_binary32_division(
+            left_bits,
+            right_bits,
+            result_out)) {
+        return 1;
+    }
+    if (operation == PORPOISE_FP_BINARY_MULTIPLY) {
+        uint64_t forced_multiplier =
+            porpoise_force_25_bit_multiplier(right_bits);
+
+        /* fmuls encodes its second source as frC.  Gekko applies Force25 to
+         * that operand before multiplication.  A host binary64 product is a
+         * valid exact intermediate only when fenv confirms no rounding. */
+        if (!porpoise_fpr_lane_is_finite_normal_or_zero(left_bits) ||
+            !porpoise_fpr_lane_is_finite_normal_or_zero(right_bits) ||
+            !porpoise_host_binary64_operation_is_exact(
+                left_bits,
+                forced_multiplier,
+                operation,
+                &intermediate_bits)) {
+            return 0;
+        }
+        return porpoise_exact_binary32_result(
+            intermediate_bits,
+            result_out);
+    }
+    if (!porpoise_fpr_lane_is_finite_normal_or_zero(left_bits) ||
+        !porpoise_fpr_lane_is_finite_normal_or_zero(right_bits) ||
+        !porpoise_host_binary64_operation_is_exact(
+            left_bits,
+            right_bits,
+            operation,
+            &intermediate_bits)) {
+        return 0;
+    }
+    return porpoise_exact_binary32_result(intermediate_bits, result_out);
+}
+
+static int porpoise_evaluate_exact_binary32_fma(
+    uint64_t multiplicand_bits,
+    uint64_t multiplier_bits,
+    uint64_t addend_bits,
+    PorpoiseFpFmaOperation operation,
+    PorpoiseExactBinary32Result *result_out)
+{
+    PorpoiseHostFmaResult host_result;
+    uint64_t forced_multiplier;
+    double addend;
+    int subtract;
+    int negate;
+
+    if (operation < PORPOISE_FP_FMA_MADD ||
+        operation > PORPOISE_FP_FMA_NMSUB ||
+        !porpoise_fpr_lane_is_ordinary_binary32(multiplicand_bits) ||
+        !porpoise_fpr_lane_is_ordinary_binary32(multiplier_bits) ||
+        !porpoise_fpr_lane_is_ordinary_binary32(addend_bits)) {
+        return 0;
+    }
+    forced_multiplier = porpoise_force_25_bit_multiplier(multiplier_bits);
+    if (forced_multiplier != multiplier_bits) {
+        return 0;
+    }
+
+    subtract = operation == PORPOISE_FP_FMA_MSUB ||
+               operation == PORPOISE_FP_FMA_NMSUB;
+    negate = operation == PORPOISE_FP_FMA_NMADD ||
+             operation == PORPOISE_FP_FMA_NMSUB;
+    addend = porpoise_double_from_bits(
+        subtract ? addend_bits ^ PORPOISE_F64_SIGN_MASK : addend_bits);
+    host_result = porpoise_host_fma(
+        porpoise_double_from_bits(multiplicand_bits),
+        porpoise_double_from_bits(forced_multiplier),
+        addend,
+        0U);
+    if (host_result.inexact || host_result.overflow || host_result.underflow ||
+        !porpoise_exact_binary32_result(host_result.bits, result_out)) {
+        return 0;
+    }
+    if (negate) {
+        result_out->binary32_bits ^= PORPOISE_F32_SIGN_MASK;
+        result_out->widened_bits ^= PORPOISE_F64_SIGN_MASK;
+    }
+    return 1;
+}
+
+static void porpoise_commit_exact_paired_result(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    const PorpoiseExactBinary32Result *lane_zero,
+    const PorpoiseExactBinary32Result *lane_one,
+    unsigned int fprf_lane,
+    int record)
+{
+    uint32_t causes =
+        (lane_zero->overflow || lane_one->overflow
+             ? PORPOISE_FPSCR_OX
+             : 0U) |
+        (lane_zero->underflow || lane_one->underflow
+             ? PORPOISE_FPSCR_UX
+             : 0U);
+
+    state->fpr[destination_register].lane_bits[0] = lane_zero->widened_bits;
+    state->fpr[destination_register].lane_bits[1] = lane_one->widened_bits;
+    /* Gekko exception/status bits are set by either paired computation. */
+    porpoise_fpscr_set_rounding(
+        state,
+        lane_zero->inexact || lane_one->inexact,
+        lane_zero->incremented || lane_one->incremented,
+        causes);
+    porpoise_fpscr_set_fprf(
+        state,
+        porpoise_fprf_from_binary32(
+            fprf_lane == 0U
+                ? lane_zero->binary32_bits
+                : lane_one->binary32_bits));
+    if (record) {
+        porpoise_fpscr_update_cr1(state);
+    }
+}
+
+static uint32_t porpoise_ppc_fp_invalid_to_fpscr(uint32_t causes)
+{
+    uint32_t fpscr_causes = 0U;
+
+    if ((causes & PORPOISE_PPC_FP_INVALID_SNAN) != 0U) {
+        fpscr_causes |= PORPOISE_FPSCR_VXSNAN;
+    }
+    if ((causes &
+         PORPOISE_PPC_FP_INVALID_INFINITY_MINUS_INFINITY) != 0U) {
+        fpscr_causes |= PORPOISE_FPSCR_VXISI;
+    }
+    if ((causes &
+         PORPOISE_PPC_FP_INVALID_INFINITY_TIMES_ZERO) != 0U) {
+        fpscr_causes |= PORPOISE_FPSCR_VXIMZ;
+    }
+    return fpscr_causes;
+}
+
+static void porpoise_ppc_fp_fault_enabled_exception(
+    PorpoisePpcState *state,
+    uint32_t operation_causes)
+{
+    uint32_t enabled_causes = 0U;
+
+    if ((operation_causes & PORPOISE_FPSCR_OX) != 0U &&
+        (state->fpscr & PORPOISE_FPSCR_OE) != 0U) {
+        enabled_causes |= PORPOISE_FPSCR_OX;
+    }
+    if ((operation_causes & PORPOISE_FPSCR_UX) != 0U &&
+        (state->fpscr & PORPOISE_FPSCR_UE) != 0U) {
+        enabled_causes |= PORPOISE_FPSCR_UX;
+    }
+    if ((operation_causes & PORPOISE_FPSCR_XX) != 0U &&
+        (state->fpscr & PORPOISE_FPSCR_XE) != 0U) {
+        enabled_causes |= PORPOISE_FPSCR_XX;
+    }
+    if (enabled_causes != 0U &&
+        (state->msr & (PORPOISE_MSR_FE0 | PORPOISE_MSR_FE1)) != 0U) {
+        /* Gekko treats every enabled floating-point exception as precise
+         * whenever either FE bit is set.  This runtime has no guest program-
+         * exception vector yet, so stop after committing the architected
+         * overflow/underflow-adjusted or inexact result. */
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_FLOATING_POINT_EXCEPTION,
+            state->pc,
+            "paired-single exception requires a guest program-exception vector");
+    }
+}
+
+static int porpoise_commit_exact_ppc_paired_result(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    const PorpoisePpcFp32Result results[2],
+    int record)
+{
+    uint32_t invalid_causes =
+        porpoise_ppc_fp_invalid_to_fpscr(results[0].invalid_causes) |
+        porpoise_ppc_fp_invalid_to_fpscr(results[1].invalid_causes);
+    uint32_t additional_causes = invalid_causes;
+    uint64_t result_bits[2];
+    int inexact = 0;
+    int incremented = 0;
+    unsigned int lane;
+
+    if (invalid_causes != 0U) {
+        porpoise_fpscr_clear_rounding(state);
+        porpoise_fpscr_raise_exceptions(state, invalid_causes);
+        if ((state->fpscr & PORPOISE_FPSCR_VE) != 0U) {
+            if (record) {
+                porpoise_fpscr_update_cr1(state);
+            }
+            if ((state->msr & (PORPOISE_MSR_FE0 | PORPOISE_MSR_FE1)) != 0U) {
+                /* The lifted runtime cannot dispatch the guest program-
+                 * exception vector. Stop precisely only when the guest's
+                 * floating-exception mode requests that exception. */
+                porpoise_state_set_fault(
+                    state,
+                    PORPOISE_FAULT_FLOATING_POINT_EXCEPTION,
+                    state->pc,
+                    "paired-single exception requires a guest program-exception vector");
+            }
+            return 1;
+        }
+    }
+
+    for (lane = 0U; lane < 2U; lane++) {
+        int use_adjusted_overflow =
+            results[lane].overflow &&
+            (state->fpscr & PORPOISE_FPSCR_OE) != 0U &&
+            results[lane].adjusted_result_valid;
+        int use_adjusted_underflow =
+            results[lane].tiny_before_rounding &&
+            (state->fpscr & PORPOISE_FPSCR_UE) != 0U &&
+            results[lane].adjusted_result_valid;
+        int use_adjusted =
+            use_adjusted_overflow || use_adjusted_underflow;
+
+        result_bits[lane] = use_adjusted
+                                ? results[lane].adjusted_bits
+                                : porpoise_binary32_to_binary64_bits(
+                                      results[lane].bits);
+        inexact |= use_adjusted
+                       ? results[lane].adjusted_inexact
+                       : results[lane].inexact;
+        incremented |= use_adjusted
+                           ? results[lane].adjusted_incremented
+                           : results[lane].incremented;
+        if (results[lane].overflow) {
+            additional_causes |= PORPOISE_FPSCR_OX;
+        }
+        if (results[lane].underflow ||
+            (results[lane].tiny_before_rounding &&
+             (state->fpscr & PORPOISE_FPSCR_UE) != 0U)) {
+            additional_causes |= PORPOISE_FPSCR_UX;
+        }
+    }
+
+    state->fpr[destination_register].lane_bits[0] = result_bits[0];
+    state->fpr[destination_register].lane_bits[1] = result_bits[1];
+    porpoise_fpscr_set_rounding(
+        state,
+        inexact,
+        incremented,
+        additional_causes);
+    if ((state->fpscr & PORPOISE_FPSCR_OE) != 0U &&
+        results[0].overflow && results[0].adjusted_result_valid) {
+        porpoise_fpscr_set_fprf(
+            state,
+            porpoise_fprf_from_binary64(result_bits[0]));
+    } else if ((state->fpscr & PORPOISE_FPSCR_UE) != 0U &&
+               results[0].tiny_before_rounding &&
+               results[0].adjusted_result_valid) {
+        porpoise_fpscr_set_fprf(
+            state,
+            porpoise_fprf_from_binary64(result_bits[0]));
+    } else {
+        porpoise_fpscr_set_fprf(
+            state,
+            porpoise_fprf_from_binary32(results[0].bits));
+    }
+    if (record) {
+        porpoise_fpscr_update_cr1(state);
+    }
+    porpoise_ppc_fp_fault_enabled_exception(
+        state,
+        additional_causes |
+            (inexact ? PORPOISE_FPSCR_XX : 0U));
+    return 1;
+}
+
+static int porpoise_widened_lane_to_binary32(
+    uint64_t widened_bits,
+    uint32_t *binary32_bits_out)
+{
+    if (binary32_bits_out == NULL ||
+        !porpoise_fpr_lane_is_widened_binary32(widened_bits)) {
+        return 0;
+    }
+    *binary32_bits_out = porpoise_binary64_to_binary32_bits(widened_bits);
+    return 1;
+}
+
+int porpoise_fp_binary_single_try_exact(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int left_register,
+    unsigned int right_register,
+    PorpoiseFpBinaryOperation operation,
+    int record)
+{
+    PorpoiseExactBinary32Result result;
+
+    if (!porpoise_fp_exact_controls_are_active(state, 0) ||
+        destination_register >= 32U || left_register >= 32U ||
+        right_register >= 32U ||
+        !porpoise_evaluate_exact_scalar_single_operation(
+            state->fpr[left_register].lane_bits[0],
+            state->fpr[right_register].lane_bits[0],
+            operation,
+            &result)) {
+        return 0;
+    }
+
+    state->fpr[destination_register].lane_bits[0] = result.widened_bits;
+    state->fpr[destination_register].lane_bits[1] = result.widened_bits;
+    porpoise_fpscr_set_rounding(
+        state,
+        result.inexact,
+        result.incremented,
+        (result.overflow ? PORPOISE_FPSCR_OX : 0U) |
+            (result.underflow ? PORPOISE_FPSCR_UX : 0U));
+    porpoise_fpscr_set_fprf(
+        state,
+        porpoise_fprf_from_binary32(result.binary32_bits));
+    if (record) {
+        porpoise_fpscr_update_cr1(state);
+    }
+    return 1;
+}
+
+int porpoise_fp_fma_execution_is_exact(
+    const PorpoisePpcState *state,
+    unsigned int multiplicand_register,
+    unsigned int multiplier_register,
+    unsigned int addend_register,
+    PorpoiseFpFmaOperation operation,
+    PorpoiseFpPrecision precision)
+{
+    PorpoiseExactBinary32Result result;
+
+    return precision == PORPOISE_FP_PRECISION_SINGLE &&
+           porpoise_fp_exact_controls_are_active(state, 0) &&
+           multiplicand_register < 32U && multiplier_register < 32U &&
+           addend_register < 32U &&
+           porpoise_evaluate_exact_binary32_fma(
+               state->fpr[multiplicand_register].lane_bits[0],
+               state->fpr[multiplier_register].lane_bits[0],
+               state->fpr[addend_register].lane_bits[0],
+               operation,
+               &result);
+}
+
+int porpoise_ps_binary_try_exact(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int left_register,
+    unsigned int right_register,
+    PorpoiseFpBinaryOperation operation,
+    int record)
+{
+    PorpoiseExactBinary32Result results[2];
+    uint64_t right_bits[2];
+    unsigned int lane;
+
+    if (!porpoise_fp_exact_controls_are_active(state, 1) ||
+        destination_register >= 32U || left_register >= 32U ||
+        right_register >= 32U) {
+        return 0;
+    }
+    right_bits[0] = state->fpr[right_register].lane_bits[0];
+    right_bits[1] = state->fpr[right_register].lane_bits[1];
+    if (operation == PORPOISE_FP_BINARY_MULTIPLY) {
+        right_bits[0] = porpoise_force_25_bit_multiplier(right_bits[0]);
+        right_bits[1] = porpoise_force_25_bit_multiplier(right_bits[1]);
+        if (right_bits[0] != state->fpr[right_register].lane_bits[0] ||
+            right_bits[1] != state->fpr[right_register].lane_bits[1]) {
+            return 0;
+        }
+    }
+    for (lane = 0U; lane < 2U; lane++) {
+        if (!porpoise_evaluate_exact_binary32_operation(
+                state->fpr[left_register].lane_bits[lane],
+                right_bits[lane],
+                operation,
+                &results[lane])) {
+            return 0;
+        }
+    }
+    porpoise_commit_exact_paired_result(
+        state,
+        destination_register,
+        &results[0],
+        &results[1],
+        0U,
+        record);
+    return 1;
+}
+
+int porpoise_ps_fma_try_exact(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int multiplicand_register,
+    unsigned int multiplier_register,
+    unsigned int addend_register,
+    PorpoiseFpFmaOperation operation,
+    int scalar_lane,
+    int record)
+{
+    PorpoiseExactBinary32Result results[2];
+    unsigned int lane;
+
+    if (state == NULL || state->fault != PORPOISE_FAULT_NONE ||
+        destination_register >= 32U || multiplicand_register >= 32U ||
+        multiplier_register >= 32U || addend_register >= 32U ||
+        scalar_lane < -1 || scalar_lane > 1) {
+        return 0;
+    }
+
+    if (operation == PORPOISE_FP_FMA_MADD) {
+        PorpoisePpcFp32Result ppc_results[2];
+        uint32_t multiplicands[2];
+        uint32_t multipliers[2];
+        uint32_t addends[2];
+        unsigned int rounding_mode =
+            state->fpscr & PORPOISE_FPSCR_RN_MASK;
+        int non_ieee_mode =
+            (state->fpscr & PORPOISE_FPSCR_NI) != 0U;
+
+        if (!porpoise_psq_preflight(state, 0U)) {
+            return 0;
+        }
+        for (lane = 0U; lane < 2U; lane++) {
+            unsigned int multiplier_lane = scalar_lane < 0
+                                               ? lane
+                                               : (unsigned int)scalar_lane;
+            if (!porpoise_widened_lane_to_binary32(
+                    state->fpr[multiplicand_register].lane_bits[lane],
+                    &multiplicands[lane]) ||
+                !porpoise_widened_lane_to_binary32(
+                    state->fpr[multiplier_register]
+                        .lane_bits[multiplier_lane],
+                    &multipliers[lane]) ||
+                !porpoise_widened_lane_to_binary32(
+                    state->fpr[addend_register].lane_bits[lane],
+                    &addends[lane])) {
+                return 0;
+            }
+        }
+        for (lane = 0U; lane < 2U; lane++) {
+            if (!porpoise_ppc_fp32_madd(
+                    multiplicands[lane],
+                    multipliers[lane],
+                    addends[lane],
+                    rounding_mode,
+                    non_ieee_mode,
+                    &ppc_results[lane])) {
+                return 0;
+            }
+        }
+        return porpoise_commit_exact_ppc_paired_result(
+            state,
+            destination_register,
+            ppc_results,
+            record);
+    }
+
+    if (!porpoise_fp_exact_controls_are_active(state, 1)) {
+        return 0;
+    }
+    for (lane = 0U; lane < 2U; lane++) {
+        unsigned int multiplier_lane = scalar_lane < 0
+                                           ? lane
+                                           : (unsigned int)scalar_lane;
+        if (!porpoise_evaluate_exact_binary32_fma(
+                state->fpr[multiplicand_register].lane_bits[lane],
+                state->fpr[multiplier_register].lane_bits[multiplier_lane],
+                state->fpr[addend_register].lane_bits[lane],
+                operation,
+                &results[lane])) {
+            return 0;
+        }
+    }
+    porpoise_commit_exact_paired_result(
+        state,
+        destination_register,
+        &results[0],
+        &results[1],
+        0U,
+        record);
+    return 1;
+}
+
+int porpoise_ps_scalar_multiply_try_exact(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int multiplicand_register,
+    unsigned int scalar_register,
+    unsigned int scalar_lane,
+    int record)
+{
+    PorpoisePpcFp32Result results[2];
+    uint32_t multiplicands[2];
+    uint32_t scalar_bits;
+    unsigned int rounding_mode;
+    int non_ieee_mode;
+    unsigned int lane;
+
+    if (state == NULL || state->fault != PORPOISE_FAULT_NONE ||
+        destination_register >= 32U || multiplicand_register >= 32U ||
+        scalar_register >= 32U || scalar_lane > 1U) {
+        return 0;
+    }
+    if (!porpoise_psq_preflight(state, 0U) ||
+        !porpoise_widened_lane_to_binary32(
+            state->fpr[scalar_register].lane_bits[scalar_lane],
+            &scalar_bits)) {
+        return 0;
+    }
+    for (lane = 0U; lane < 2U; lane++) {
+        if (!porpoise_widened_lane_to_binary32(
+                state->fpr[multiplicand_register].lane_bits[lane],
+                &multiplicands[lane])) {
+            return 0;
+        }
+    }
+    rounding_mode = state->fpscr & PORPOISE_FPSCR_RN_MASK;
+    non_ieee_mode = (state->fpscr & PORPOISE_FPSCR_NI) != 0U;
+    for (lane = 0U; lane < 2U; lane++) {
+        if (!porpoise_ppc_fp32_mul(
+                multiplicands[lane],
+                scalar_bits,
+                rounding_mode,
+                non_ieee_mode,
+                &results[lane])) {
+            return 0;
+        }
+    }
+    return porpoise_commit_exact_ppc_paired_result(
+        state,
+        destination_register,
+        results,
+        record);
+}
+
+static int porpoise_ps_defined_domain_failure(PorpoisePpcState *state)
+{
+    if (state != NULL && state->fault == PORPOISE_FAULT_NONE) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_UNSUPPORTED_OPERATION,
+            state->pc,
+            "paired-single arithmetic received mixed/non-binary32 FPR contents");
+    }
+    return 0;
+}
+
+int porpoise_ps_muls_scalar(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int multiplicand_register,
+    unsigned int scalar_register,
+    unsigned int scalar_lane,
+    int record)
+{
+    if (!porpoise_ps_scalar_multiply_try_exact(
+            state,
+            destination_register,
+            multiplicand_register,
+            scalar_register,
+            scalar_lane,
+            record)) {
+        return porpoise_ps_defined_domain_failure(state);
+    }
+    return state->fault == PORPOISE_FAULT_NONE;
+}
+
+int porpoise_ps_madds_scalar(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int multiplicand_register,
+    unsigned int scalar_register,
+    unsigned int addend_register,
+    unsigned int scalar_lane,
+    int record)
+{
+    if (scalar_lane > 1U) {
+        if (state != NULL && state->fault == PORPOISE_FAULT_NONE) {
+            porpoise_state_set_fault(
+                state,
+                PORPOISE_FAULT_INVALID_ARGUMENT,
+                state->pc,
+                "paired-single scalar lane is outside 0..1");
+        }
+        return 0;
+    }
+    if (!porpoise_ps_fma_try_exact(
+            state,
+            destination_register,
+            multiplicand_register,
+            scalar_register,
+            addend_register,
+            PORPOISE_FP_FMA_MADD,
+            (int)scalar_lane,
+            record)) {
+        return porpoise_ps_defined_domain_failure(state);
+    }
+    return state->fault == PORPOISE_FAULT_NONE;
+}
+
+int porpoise_ps_sum_try_exact(
+    PorpoisePpcState *state,
+    unsigned int destination_register,
+    unsigned int left_register,
+    unsigned int passthrough_register,
+    unsigned int right_register,
+    unsigned int sum_lane,
+    int record)
+{
+    PorpoiseExactBinary32Result sum;
+    PorpoiseExactBinary32Result passthrough;
+    PorpoiseExactBinary32Result results[2];
+    unsigned int passthrough_lane;
+    uint64_t passthrough_bits;
+
+    if (!porpoise_fp_exact_controls_are_active(state, 1) ||
+        destination_register >= 32U || left_register >= 32U ||
+        passthrough_register >= 32U || right_register >= 32U ||
+        sum_lane > 1U ||
+        !porpoise_evaluate_exact_binary32_operation(
+            state->fpr[left_register].lane_bits[0],
+            state->fpr[right_register].lane_bits[1],
+            PORPOISE_FP_BINARY_ADD,
+            &sum)) {
+        return 0;
+    }
+    passthrough_lane = sum_lane == 0U ? 1U : 0U;
+    passthrough_bits =
+        state->fpr[passthrough_register].lane_bits[passthrough_lane];
+    if (!porpoise_fpr_lane_is_ordinary_binary32(passthrough_bits)) {
+        return 0;
+    }
+    passthrough.binary32_bits = porpoise_binary64_to_binary32_bits(
+        passthrough_bits);
+    passthrough.widened_bits = passthrough_bits;
+    passthrough.inexact = 0;
+    passthrough.incremented = 0;
+    passthrough.overflow = 0;
+    passthrough.underflow = 0;
+    results[sum_lane] = sum;
+    results[passthrough_lane] = passthrough;
+    porpoise_commit_exact_paired_result(
+        state,
+        destination_register,
+        &results[0],
+        &results[1],
+        sum_lane,
+        record);
+    return 1;
+}
+
+int porpoise_psq_transfer_is_exact(
+    const PorpoisePpcState *state,
+    unsigned int register_index,
+    unsigned int w,
+    unsigned int gqr_index,
+    int store)
+{
+    unsigned int type;
+
+    if (state == NULL || register_index >= 32U || w > 1U ||
+        gqr_index >= 8U || (store != 0 && store != 1)) {
+        return 0;
+    }
+
+    type = store != 0
+               ? state->gqr[gqr_index] & 0x7U
+               : (state->gqr[gqr_index] >> 16U) & 0x7U;
+    if (type != PORPOISE_PSQ_TYPE_FLOAT32) {
+        return 0;
+    }
+    if (store == 0) {
+        return 1;
+    }
+    if (!porpoise_fpr_lane_is_widened_binary32(
+            state->fpr[register_index].lane_bits[0])) {
+        return 0;
+    }
+    return w != 0U || porpoise_fpr_lane_is_widened_binary32(
+                          state->fpr[register_index].lane_bits[1]);
+}
+
 static uint16_t porpoise_read_big_endian16(const uint8_t *bytes)
 {
     return (uint16_t)(((uint16_t)bytes[0] << 8U) |
@@ -3134,6 +4587,30 @@ void porpoise_store_u8(
 
     bytes[0] = value;
     (void)porpoise_write_bytes(state, guest_address, bytes, sizeof(bytes));
+}
+
+void porpoise_store_gx_fifo_u8(
+    PorpoisePpcState *state,
+    uint8_t value)
+{
+    const uint32_t guest_address = UINT32_C(0xCC008000);
+    PorpoiseHostResult result;
+
+    if (!porpoise_validate_span(state, guest_address, sizeof(value))) {
+        return;
+    }
+    if (state->host->write_gx_fifo_u8 == NULL) {
+        porpoise_store_u8(state, guest_address, value);
+        return;
+    }
+    result = state->host->write_gx_fifo_u8(state->host->context, value);
+    if (result != PORPOISE_HOST_OK) {
+        porpoise_state_set_fault(
+            state,
+            porpoise_fault_from_host_result(result),
+            guest_address,
+            porpoise_host_result_string(result));
+    }
 }
 
 void porpoise_store_u16(

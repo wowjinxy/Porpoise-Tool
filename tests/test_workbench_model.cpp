@@ -11,14 +11,18 @@ extern "C" {
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using porpoise::gui::DirectAbiDraft;
+using porpoise::gui::BuildRunRequest;
 using porpoise::gui::FunctionLocator;
 using porpoise::gui::FunctionFilterMatches;
+using porpoise::gui::RemoveTargetBuildCache;
 using porpoise::gui::OverrideEdit;
 using porpoise::gui::RunRequest;
 using porpoise::gui::WorkerState;
+using porpoise::gui::WorkerOperation;
 using porpoise::gui::WorkbenchModel;
 
 namespace {
@@ -82,10 +86,48 @@ std::string ReadText(const std::filesystem::path &path) {
                        std::istreambuf_iterator<char>());
 }
 
+int RunFakePreflightTool(int argc, char **argv) {
+    const std::string executable = argc > 0 && argv[0] != nullptr
+        ? std::filesystem::path(argv[0]).filename().string() : std::string();
+    if (executable.find("porpoise-fake-") == std::string::npos) return -1;
+    const bool meson = executable.find("meson") != std::string::npos;
+    const bool mismatch = executable.find("mismatch") != std::string::npos;
+    const bool slow = executable.find("slow") != std::string::npos;
+    if (meson) {
+        if (slow) std::this_thread::sleep_for(std::chrono::seconds(20));
+        if (argc == 2 && std::string(argv[1]) == "--version") {
+            std::cout << "1.3.0\n";
+            return 0;
+        }
+        return 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--version") {
+        std::cout << "gcc (GCC) " << (mismatch ? "14.1.0" : "13.2.0")
+                  << '\n';
+        return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "-dumpmachine") {
+        std::cout << "x86_64-porpoise-test\n";
+        return 0;
+    }
+    for (int index = 1; index + 1 < argc; ++index) {
+        if (std::string(argv[index]) != "-o") continue;
+        std::error_code error;
+        const std::filesystem::path output(argv[index + 1]);
+        std::filesystem::create_directories(output.parent_path(), error);
+        if (error) return 1;
+        std::ofstream file(output, std::ios::binary | std::ios::trunc);
+        file << "synthetic compiler output\n";
+        return file.good() ? 0 : 1;
+    }
+    return 1;
+}
+
 void Analyze(WorkbenchModel &model) {
     RunRequest request;
     request.analyze_only = true;
     CHECK(model.Start(request));
+    CHECK(model.Operation() == WorkerOperation::Recovery);
     model.Wait();
     if (model.State() != WorkerState::Succeeded) {
         for (std::size_t index = 0; index < model.Diagnostics().count; ++index)
@@ -93,6 +135,7 @@ void Analyze(WorkbenchModel &model) {
                       << model.Diagnostics().items[index].message << '\n';
     }
     CHECK(model.State() == WorkerState::Succeeded);
+    CHECK(model.Operation() == WorkerOperation::Recovery);
     CHECK(model.LastExitCode() == PORPOISE_EXIT_OK);
 }
 
@@ -171,6 +214,15 @@ void TestModel(const std::filesystem::path &source,
                   "porpoise-output/sample-2");
             CHECK(!second.strict);
         }
+        CHECK(defaults.AddTarget("legacy.overlay"));
+        CHECK(defaults.Project().target_count == 3);
+        if (defaults.Project().target_count == 3) {
+            const auto &legacy = defaults.Project().targets[2];
+            CHECK(std::string(legacy.output.value).rfind(
+                      "porpoise-output/target-", 0U) == 0U);
+        }
+        CHECK(defaults.SetTargetId(2, "legacy/overlay"));
+        CHECK(!defaults.SetTargetId(2, ""));
     }
 
     /* Saving a never-published project interprets its relative defaults beside
@@ -615,6 +667,20 @@ void TestModel(const std::filesystem::path &source,
     if (lift != nullptr && run_target != nullptr)
         lift_locator = model.MakeLocator(*run_target, *lift);
 
+    CHECK(!model.Project().targets[0].has_title_host);
+    CHECK(!model.InferTitleHostProfile("main"));
+    CHECK(!model.Project().targets[0].has_title_host);
+    CHECK(model.InferredTitleHostProfile("main") == nullptr);
+    CHECK(!model.TitleHostInferenceIssue().empty());
+
+    BuildRunRequest premature_build;
+    premature_build.target_id = "main";
+    CHECK(!model.StartBuild(premature_build));
+    CHECK(model.State() == WorkerState::Failed);
+    CHECK(model.Operation() == WorkerOperation::Build);
+    CHECK(DiagnosticsContain(model, "generate the selected target"));
+    Analyze(model);
+
     RunRequest no_overwrite;
     no_overwrite.analyze_only = false;
     no_overwrite.force = false;
@@ -707,15 +773,217 @@ void TestModel(const std::filesystem::path &source,
     std::filesystem::remove_all(resolved_temporary, error);
 }
 
+void TestRuntimePreflight(
+    const std::filesystem::path &source,
+    const std::filesystem::path &build,
+    const std::filesystem::path &self) {
+    const auto temporary = build / "workbench-runtime-preflight-test";
+    std::error_code error;
+    std::filesystem::remove_all(temporary, error);
+    error.clear();
+    std::filesystem::create_directories(temporary, error);
+    CHECK(!error);
+#if defined(_WIN32)
+    constexpr const char *executable_suffix = ".exe";
+#else
+    constexpr const char *executable_suffix = "";
+#endif
+    const auto tool_tag = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto copy_tool = [&](const std::string &name) {
+        /* Keep Windows compiler-runtime DLL discovery identical to the real
+         * model-test executable by placing its synthetic tool aliases beside
+         * it. The unique suffix keeps parallel build directories isolated. */
+        const auto path = self.parent_path() /
+            ("porpoise-fake-" + name + "-" + tool_tag + executable_suffix);
+        error.clear();
+        std::filesystem::copy_file(
+            self, path, std::filesystem::copy_options::overwrite_existing,
+            error);
+        CHECK(!error);
+        if (!error) {
+            const auto permissions = std::filesystem::status(self, error)
+                                         .permissions();
+            CHECK(!error);
+            if (!error) std::filesystem::permissions(path, permissions, error);
+            CHECK(!error);
+        }
+        return path;
+    };
+    const auto meson = copy_tool("meson");
+    const auto slow_meson = copy_tool("slow-meson");
+    const auto c_compiler = copy_tool("cc");
+    const auto cpp_compiler = copy_tool("cxx");
+    const auto mismatched_cpp = copy_tool("mismatch-cxx");
+
+    WorkbenchModel model;
+    CHECK(model.NewProject());
+    CHECK(model.AddTarget("runtime"));
+    const auto project = temporary / "runtime.porpoise.json";
+    CHECK(model.SaveAs(project.string()));
+
+    BuildRunRequest request;
+    request.target_id = "runtime";
+    request.generated_directory =
+        (source / "tests" / "fixtures" / "build_core" / "generated")
+            .string();
+    request.libporpoise_directory =
+        (source / "tests" / "fixtures" / "build_core" / "libPorpoise")
+            .string();
+    request.title_host_directory =
+        (source / "tests" / "fixtures" / "build_core" / "title-host")
+            .string();
+    request.meson_executable = meson.string();
+    request.c_compiler = c_compiler.string();
+    request.cpp_compiler = cpp_compiler.string();
+    request.generated_plan_digest = "synthetic-plan";
+    request.build_type = "debugoptimized";
+
+    CHECK(!model.RuntimePreflightRequestMatches(request));
+    CHECK(model.RuntimePreflightResult() == nullptr);
+    CHECK(model.StartRuntimePreflight(request));
+    CHECK(model.Operation() == WorkerOperation::RuntimePreflight);
+    CHECK(model.State() == WorkerState::Running);
+    model.Wait();
+    CHECK(model.State() == WorkerState::Succeeded);
+    CHECK(model.LastExitCode() == PORPOISE_EXIT_OK);
+    CHECK(model.RuntimePreflightRequestMatches(request));
+    const auto *preflight = model.RuntimePreflightResult();
+    CHECK(preflight != nullptr);
+    if (preflight != nullptr) {
+        CHECK(std::string(preflight->meson_version) == "1.3.0");
+        CHECK(std::string(preflight->compiler_family) == "gcc");
+        CHECK(std::string(preflight->compiler_version) == "13.2.0");
+        CHECK(std::string(preflight->compiler_target) ==
+              "x86_64-porpoise-test");
+    }
+
+    BuildRunRequest changed = request;
+    changed.cpp_compiler = mismatched_cpp.string();
+    CHECK(!model.RuntimePreflightRequestMatches(changed));
+    CHECK(model.StartRuntimePreflight(changed));
+    model.Wait();
+    CHECK(model.State() == WorkerState::Failed);
+    CHECK(model.RuntimePreflightRequestMatches(changed));
+    CHECK(model.RuntimePreflightResult() == nullptr);
+    CHECK(DiagnosticsContain(model, "matched toolchain"));
+
+    CHECK(model.StartRuntimePreflight(request));
+    model.Wait();
+    CHECK(model.State() == WorkerState::Succeeded);
+    CHECK(model.RuntimePreflightResult() != nullptr);
+    model.ClearRuntimePreflight();
+    CHECK(!model.RuntimePreflightRequestMatches(request));
+    CHECK(model.RuntimePreflightResult() == nullptr);
+
+    BuildRunRequest cancelled = request;
+    cancelled.meson_executable = slow_meson.string();
+    CHECK(model.StartRuntimePreflight(cancelled));
+    model.Cancel();
+    CHECK(model.State() == WorkerState::Cancelling);
+    model.Wait();
+    CHECK(model.State() == WorkerState::Cancelled);
+    CHECK(model.LastExitCode() == PORPOISE_EXIT_CANCELLED);
+    CHECK(model.RuntimePreflightResult() == nullptr);
+
+    for (const auto &tool : {meson, slow_meson, c_compiler, cpp_compiler,
+                             mismatched_cpp}) {
+        error.clear();
+        std::filesystem::remove(tool, error);
+        CHECK(!error);
+    }
+    std::filesystem::remove_all(temporary, error);
+}
+
+void TestCacheCleanup(const std::filesystem::path &build) {
+    const auto nonce = std::chrono::high_resolution_clock::now()
+                           .time_since_epoch().count();
+    const auto temporary = build /
+        ("workbench-cache-cleanup-" + std::to_string(nonce));
+    const auto project_directory = temporary / "project";
+    const auto project = project_directory / "recovery.porpoise.json";
+    const auto cache_parent = project_directory / ".porpoise-build";
+    const auto outside = temporary / "outside";
+    const auto sentinel = project_directory / "keep.txt";
+    const auto outside_sentinel = outside / "keep.txt";
+    std::error_code error;
+    std::filesystem::create_directories(cache_parent, error);
+    CHECK(!error);
+    std::filesystem::create_directories(outside, error);
+    CHECK(!error);
+    WriteText(project, "{}\n");
+    WriteText(sentinel, "keep\n");
+    WriteText(outside_sentinel, "outside\n");
+
+    std::string cleanup_error;
+    auto target_cache = [&](const std::string &id) {
+        char key[PORPOISE_RECOVERY_TARGET_CACHE_KEY_SIZE];
+        CHECK(porpoise_recovery_target_cache_key(id.c_str(), key));
+        return cache_parent / key;
+    };
+    for (const auto *legacy_id : {"..", ".", "target/escape",
+                                  "target\\escape", "target.name"}) {
+        CHECK(RemoveTargetBuildCache(
+            project.string(), legacy_id, &cleanup_error));
+        CHECK(cleanup_error.empty());
+        CHECK(std::filesystem::is_regular_file(sentinel));
+        CHECK(std::filesystem::is_regular_file(outside_sentinel));
+    }
+    CHECK(!RemoveTargetBuildCache(project.string(), "", &cleanup_error));
+    CHECK(!cleanup_error.empty());
+
+    const auto ordinary = target_cache("safe");
+    std::filesystem::create_directories(ordinary / "digest", error);
+    CHECK(!error);
+    WriteText(ordinary / "digest" / "artifact", "generated\n");
+    CHECK(RemoveTargetBuildCache(
+        project.string(), "safe", &cleanup_error));
+    CHECK(cleanup_error.empty());
+    CHECK(!std::filesystem::exists(ordinary));
+    CHECK(std::filesystem::is_regular_file(sentinel));
+
+    error.clear();
+    std::filesystem::create_directory_symlink(outside, ordinary, error);
+    if (!error) {
+        CHECK(RemoveTargetBuildCache(
+            project.string(), "safe", &cleanup_error));
+        CHECK(!std::filesystem::exists(ordinary));
+        CHECK(std::filesystem::is_regular_file(outside_sentinel));
+    }
+
+    error.clear();
+    std::filesystem::remove(cache_parent, error);
+    CHECK(!error);
+    std::filesystem::create_directory_symlink(outside, cache_parent, error);
+    if (!error) {
+        CHECK(!RemoveTargetBuildCache(
+            project.string(), "safe", &cleanup_error));
+        CHECK(cleanup_error.find("filesystem link") != std::string::npos);
+        CHECK(std::filesystem::is_regular_file(outside_sentinel));
+        std::filesystem::remove(cache_parent, error);
+        CHECK(!error);
+    }
+
+    std::filesystem::remove_all(temporary, error);
+    CHECK(!error);
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
+    const int fake_tool_result = RunFakePreflightTool(argc, argv);
+    if (fake_tool_result >= 0) return fake_tool_result;
     if (argc != 3) {
         std::cerr << "usage: test_workbench_model SOURCE_ROOT BUILD_ROOT\n";
         return 2;
     }
     TestModel(std::filesystem::absolute(argv[1]),
               std::filesystem::absolute(argv[2]));
+    TestRuntimePreflight(
+        std::filesystem::absolute(argv[1]),
+        std::filesystem::absolute(argv[2]),
+        std::filesystem::absolute(argv[0]));
+    TestCacheCleanup(std::filesystem::absolute(argv[2]));
     if (failures != 0) {
         std::cerr << failures << " workbench model test(s) failed\n";
         return 1;

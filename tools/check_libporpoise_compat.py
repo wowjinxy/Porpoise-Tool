@@ -28,6 +28,15 @@ STRICT_C_ARGS = (
     "-fsyntax-only",
 )
 
+STRICT_CXX_ARGS = (
+    "-std=c++17",
+    "-Wall",
+    "-Wextra",
+    "-Wpedantic",
+    "-Werror",
+    "-fsyntax-only",
+)
+
 EXPECTED_VERSION_GATES = {
     "LIBPORPOISE_GX_COPY_DISP_GUEST_ADDRESS_API_VERSION": 1,
     "LIBPORPOISE_GX_COPY_TEX_GUEST_ADDRESS_API_VERSION": 1,
@@ -57,8 +66,7 @@ COMMON_HEADERS = r"""
 #include "porpoise_libporpoise_gx_headers.h"
 """
 
-PROBES = (
-    (
+HOST_THREAD_CARRIER_PROBE = (
         "host-thread-carrier-v1",
         "host-thread carrier publishes the exact version 1 Tool contract",
         r"""
@@ -114,7 +122,9 @@ PORPOISE_ASSERT(
         LibPorpoiseHostThreadCarrierResultV1 (*)(
             LibPorpoiseHostThreadCarrier *)));
 """,
-    ),
+    )
+
+PROBES = (
     (
         "consumer-headers",
         "generated runtime headers compile as a strict host consumer",
@@ -326,6 +336,14 @@ def parse_arguments() -> argparse.Namespace:
         help="extra GCC-compatible argument; repeat for multiple arguments",
     )
     parser.add_argument(
+        "--cxx",
+        nargs="+",
+        help=(
+            "GCC-compatible C++ compiler command; place this before --cc "
+            "when both commands contain multiple arguments"
+        ),
+    )
+    parser.add_argument(
         "--cc",
         nargs="+",
         help="GCC-compatible compiler command; this option must be last",
@@ -340,6 +358,19 @@ def default_compiler() -> list[str] | None:
         if command:
             return command
     for candidate in ("cc", "gcc", "clang"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return [resolved]
+    return None
+
+
+def default_cxx_compiler() -> list[str] | None:
+    configured = os.environ.get("CXX")
+    if configured:
+        command = shlex.split(configured, posix=os.name != "nt")
+        if command:
+            return command
+    for candidate in ("c++", "g++", "clang++"):
         resolved = shutil.which(candidate)
         if resolved:
             return [resolved]
@@ -384,7 +415,12 @@ def discover_version_gates(source_root: Path) -> dict[str, int]:
         r"defined\s*\(\s*(?P<name>[A-Z][A-Z0-9_]*API_VERSION)\s*\)"
         r"\s*&&\s*\\?\s*(?P=name)\s*>=\s*(?P<minimum>[0-9]+)"
     )
-    for path in sorted(runtime_root.glob("porpoise_libporpoise_*.[ch]")):
+    runtime_contract_sources = sorted(
+        path
+        for path in runtime_root.glob("porpoise_libporpoise_*")
+        if path.suffix in {".c", ".h", ".cpp"}
+    )
+    for path in runtime_contract_sources:
         text = path.read_text(encoding="utf-8")
         # Do not let a newly introduced versioned runtime gate silently escape
         # this checker. Minimums are checked against the explicit reviewed
@@ -425,6 +461,7 @@ def main() -> int:
     source_root = arguments.source_root.resolve()
     checkout = arguments.libporpoise.resolve()
     include_root = checkout / "include"
+    carrier_header = include_root / "porpoise" / "host_thread_carrier.h"
     gx_header = include_root / "dolphin" / "gx.h"
     split_gx_header = include_root / "dolphin" / "gx" / "GXFrameBuffer.h"
     target = arguments.target
@@ -448,10 +485,17 @@ def main() -> int:
         return 2
 
     command = list(arguments.cc) if arguments.cc else default_compiler()
+    cxx_command = (
+        list(arguments.cxx) if arguments.cxx else default_cxx_compiler()
+    )
     if not command:
         print("error: no GCC-compatible C compiler found", file=sys.stderr)
         return 2
+    if not cxx_command:
+        print("error: no GCC-compatible C++ compiler found", file=sys.stderr)
+        return 2
     compiler_env = compiler_environment(command)
+    cxx_compiler_env = compiler_environment(cxx_command)
     try:
         compiler_check = subprocess.run(
             [*command, "--version"],
@@ -471,6 +515,25 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    try:
+        cxx_compiler_check = subprocess.run(
+            [*cxx_command, "--version"],
+            env=cxx_compiler_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    except OSError as error:
+        print(f"error: cannot execute C++ compiler: {error}", file=sys.stderr)
+        return 2
+    if cxx_compiler_check.returncode != 0:
+        print(
+            "error: C++ compiler command rejected --version: "
+            + compiler_diagnostic(cxx_compiler_check.stdout),
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         discovered = discover_version_gates(source_root)
@@ -486,7 +549,10 @@ def main() -> int:
         )
         return 2
 
-    target_args = ["-DLIBPORPOISE_PORT"]
+    target_args = [
+        "-DLIBPORPOISE_PORT",
+        "-DPORPOISE_AUTODETECT_LIBPORPOISE_HOST_THREAD_CARRIER_V1=1",
+    ]
     if target == "win64":
         target_args.append("-DLIBPORPOISE_BUILD_WIN64")
     else:
@@ -498,6 +564,7 @@ def main() -> int:
     print(f"checkout: {checkout}")
     print(f"target: {target}")
     print(f"compiler: {' '.join(command)}")
+    print(f"C++ compiler: {' '.join(cxx_command)}")
     print("mode: read-only temporary compile probes; the checkout is not configured or built")
     print(
         "scope: compile interface only; declarations, version gates, enum "
@@ -509,8 +576,19 @@ def main() -> int:
         "and exactly-once clear require libPorpoise runtime/integration tests)"
     )
 
+    if carrier_header.is_file():
+        probes = (HOST_THREAD_CARRIER_PROBE, *PROBES)
+        carrier_limitation = False
+    else:
+        probes = PROBES
+        carrier_limitation = True
+        print(
+            "LIMITED host-thread-carrier-v1: header absent; "
+            "single-thread compatibility only"
+        )
+
     failures = 0
-    gate_count = len(PROBES) + 1
+    gate_count = len(probes) + 1
     with tempfile.TemporaryDirectory(prefix="porpoise-libporpoise-compat-") as temporary:
         temporary_root = Path(temporary)
         health_probe = temporary_root / "compiler_health.c"
@@ -554,9 +632,7 @@ def main() -> int:
             "#endif\n",
             encoding="utf-8",
         )
-        base_compile_command = [
-            *command,
-            *STRICT_C_ARGS,
+        common_compile_args = [
             *target_args,
             *arguments.c_arg,
             "-I",
@@ -568,19 +644,39 @@ def main() -> int:
             "-isystem",
             str(include_root),
         ]
+        base_compile_command = [
+            *command,
+            *STRICT_C_ARGS,
+            *common_compile_args,
+        ]
+        base_cxx_compile_command = [
+            *cxx_command,
+            *STRICT_CXX_ARGS,
+            *common_compile_args,
+        ]
 
         runtime_failure = ""
         runtime_sources = sorted(
-            (source_root / "runtime" / "src").glob(
-                "porpoise_libporpoise_*.c"
+            (
+                *(
+                    source_root / "runtime" / "src"
+                ).glob("porpoise_libporpoise_*.c"),
+                *(
+                    source_root / "runtime" / "src"
+                ).glob("porpoise_libporpoise_*.cpp"),
             )
         )
         if not runtime_sources:
             print("error: no generated libPorpoise runtime sources found", file=sys.stderr)
             return 2
         for runtime_source in runtime_sources:
+            runtime_compile_command = (
+                base_cxx_compile_command
+                if runtime_source.suffix == ".cpp"
+                else base_compile_command
+            )
             result = subprocess.run(
-                [*base_compile_command, str(runtime_source)],
+                [*runtime_compile_command, str(runtime_source)],
                 cwd=temporary_root,
                 env=compiler_env,
                 text=True,
@@ -606,7 +702,7 @@ def main() -> int:
                 "sources consume these headers under strict warnings"
             )
 
-        for index, (name, description, source) in enumerate(PROBES):
+        for index, (name, description, source) in enumerate(probes):
             probe = temporary_root / f"probe_{index:02d}_{name}.c"
             probe.write_text(source, encoding="utf-8")
             compile_command = [
@@ -635,9 +731,10 @@ def main() -> int:
             f"({failures} of {gate_count} gates failed)"
         )
         return 1
+    limitation = "; single-thread compatibility only" if carrier_limitation else ""
     print(
         f"result: COMPILE-COMPATIBLE "
-        f"({gate_count} of {gate_count} gates passed)"
+        f"({gate_count} of {gate_count} gates passed{limitation})"
     )
     return 0
 

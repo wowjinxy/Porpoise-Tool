@@ -175,17 +175,23 @@ For the known local ELF/map pair, the acceptance result is:
 - 196 CRT/MSL, runtime, MetroTRK, debugger, or stub functions.
 
 The exact local catalog currently yields 533 exact matches. Under `imported`,
-25 audited host-bound functions import and 698 functions lift. Under `omit`,
-those same 25 functions import, 370 unbound SDK bodies use the shared trap,
-and 328 functions lift. Mapless analysis retains the same 533 exact identities;
+52 audited host-bound functions import and 671 functions lift. Under `omit`,
+those same 52 functions import, 336 unbound SDK bodies use the shared trap,
+and 335 functions lift; seven exact SDK bodies remain lifted because relocation-
+backed interior entry points make replacing them structurally unsafe. Mapless
+analysis retains the same 533 exact identities;
 its category evidence covers 480 automatic SDK, 165 report-only, and 78
 uncategorized/title functions because non-exact catalog evidence can still
 contribute category provenance.
 
-The local gate must exercise `keep`, `imported`, and `omit`, then repeat without
-a map using an exact local catalog. Generated targets should configure and
-build where host contracts exist. A count mismatch is evidence to investigate,
-not a reason to loosen signatures or classify by name.
+The local gate exercises `keep`, `imported`, and `omit`, then repeats without a
+map using an exact local catalog. Build and Run use the same shared core as the
+CLI and GUI, directly from the reviewed schema-v2 project. The selected OneTri
+target must explicitly use `imported` and contain its reviewed title-host
+profile. The gate rejects faults, unreviewed reached approximations, missing or
+out-of-order boot milestones, zero framebuffers, and incomplete frame runs. A
+count mismatch is evidence to investigate, not a reason to loosen signatures
+or classify by name.
 
 Run the complete gate with a reusable work root outside both repositories:
 
@@ -193,25 +199,49 @@ Run the complete gate with a reusable work root outside both repositories:
 python tools/run_onetri_acceptance.py \
   --porpoise /path/to/porpoise \
   --dtk /path/to/patched/dtk \
-  --elf /path/to/onetri.elf \
-  --map /path/to/onetri.map \
+  --project /path/to/reviewed-recovery.porpoise.json \
   --work /path/to/onetri-acceptance \
-  --catalog /path/to/onetri-sdk-catalog.json \
-  --libporpoise /path/to/libPorpoise
+  --libporpoise /path/to/libPorpoise \
+  --dvd-root /path/to/extracted-disc \
+  --meson /path/to/meson \
+  --cc /path/to/x64-gcc \
+  --cxx /path/to/x64-g++ \
+  --trace-frame-limit 3 \
+  --frame-limit 300
 ```
 
-All seven paths above are required. `--catalog` must name an existing exact
-catalog unless `--build-catalog` is supplied with `--catalog-tool` naming
-`/path/to/porpoise_sdk_catalog.py`. `--cc` and `--cxx` may
-select the C and C++ compilers for the generated-project build; `--meson` may
-select Meson. Each invocation creates and reports a unique `onetri-run-*`
-child, so a prior successful or interrupted run does not have to be deleted.
-The Porpoise repository, `libPorpoise` checkout, and work root must be mutually
-non-containing paths. The tool validates the map-backed counts, all three SDK
-policies, exact map/mapless identity parity, transactional generation, and a
-release build of the `keep`, `imported`, and `omit` targets against the supplied
-`libPorpoise` checkout. It leaves the proprietary inputs and every derived
-artifact outside version control.
+The project is authoritative for the ELF, CodeWarrior map, exact catalog,
+generated output, SDK policy, and reviewed host profile. Legacy `--elf`,
+`--map`, and `--catalog` options remain accepted as path assertions, but cannot
+override it. `--build-catalog` still requires `--catalog-tool` and writes only
+to the catalog path already named by the project. `--cc` and `--cxx` are an
+optional pair; the shared preflight validates their target, family, version,
+runtime, and mixed C/C++ link compatibility. `--build-type` defaults to
+`debugoptimized`. `--trace` may select an external JSONL path; otherwise the
+unique `onetri-run-*` child owns it. `--trace-frame-limit` defaults to three:
+that bounded run verifies ordered milestones, nonempty framebuffers, faults,
+and reached approximations without producing a multi-gigabyte trace.
+An explicit trace destination must be disjoint from the work root, reviewed
+project root, both repositories, and every OneTri input/output path; the gate
+checks both containment directions before invoking Build/Run. The work root is
+likewise rejected if it contains, or is contained by, any external material.
+
+Each invocation creates and reports a unique evidence directory, while the
+managed build cache beside the project remains reusable. The Porpoise
+repository, `libPorpoise` checkout, work root, reviewed project, proprietary
+inputs, DVD root, and derived artifacts must remain disjoint as documented by
+the tool. The final shared `--run` performs generation, dependency binding,
+configure, compile, DLL/runtime staging, and execution of the `imported`
+target. It first performs the bounded strict traced run, then reuses the managed
+build for the untraced sustained run selected by `--frame-limit` (300 by
+default). The traced run must reach `PADRead` after `PrintIntro`, proving that
+startup entered the controller loop. The second process must complete its frame
+limit without a runtime fault. The gate sets the test-only
+`PORPOISE_REJECT_APPROXIMATIONS=1` process
+environment for both runs, so a dynamically reached non-exact site faults even
+without JSONL and the sustained run independently proves that no later
+unreviewed approximation was reached. Normal product runs leave this behavior
+disabled. All OneTri material remains outside version control.
 
 Related documents:
 

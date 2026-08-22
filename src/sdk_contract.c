@@ -5,6 +5,8 @@
 struct PorpoiseSdkContract {
     const char *host_callable;
     const char *canonical_name;
+    const char *required_canonical_identity;
+    PorpoiseSdkContractCategory category;
     PorpoiseSdkAbiValue result;
     size_t argument_count;
     PorpoiseSdkAbiValue arguments[PORPOISE_SDK_CONTRACT_MAX_ARGUMENTS];
@@ -17,7 +19,17 @@ struct PorpoiseSdkContract {
 #define SDK_FPR(value_type, index) \
     { (value_type), PORPOISE_ABI_REGISTER_FPR, (index) }
 #define SDK_CONTRACT(callable, canonical, result_value, count, ...) \
-    { (callable), (canonical), result_value, (count), {__VA_ARGS__} }
+    { \
+        (callable), (canonical), NULL, \
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN, \
+        result_value, (count), {__VA_ARGS__} \
+    }
+#define SDK_EXACT_CONTRACT( \
+    callable, canonical, identity, contract_category, result_value, count, ...) \
+    { \
+        (callable), (canonical), (identity), (contract_category), \
+        result_value, (count), {__VA_ARGS__} \
+    }
 
 static const PorpoiseSdkContract sdk_contracts[] = {
     SDK_CONTRACT(
@@ -68,6 +80,149 @@ static const PorpoiseSdkContract sdk_contracts[] = {
         SDK_GPR(PORPOISE_ABI_POINTER, 3U), 2U,
         SDK_GPR(PORPOISE_ABI_POINTER, 3U),
         SDK_GPR(PORPOISE_ABI_U32, 4U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_begin_adapter", "GXBegin",
+        "gx.a/GXGeometry.c/GXBegin",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 3U,
+        SDK_GPR(PORPOISE_ABI_U32, 3U),
+        SDK_GPR(PORPOISE_ABI_U32, 4U),
+        SDK_GPR(PORPOISE_ABI_U16, 5U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_clear_vtx_desc_adapter", "GXClearVtxDesc",
+        "gx.a/GXAttr.c/GXClearVtxDesc",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 0U, SDK_VOID),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_vtx_desc_adapter", "GXSetVtxDesc",
+        "gx.a/GXAttr.c/GXSetVtxDesc",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 2U,
+        SDK_GPR(PORPOISE_ABI_U32, 3U),
+        SDK_GPR(PORPOISE_ABI_U32, 4U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_vtx_attr_fmt_adapter",
+        "GXSetVtxAttrFmt", "gx.a/GXAttr.c/GXSetVtxAttrFmt",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 5U,
+        SDK_GPR(PORPOISE_ABI_U32, 3U),
+        SDK_GPR(PORPOISE_ABI_U32, 4U),
+        SDK_GPR(PORPOISE_ABI_U32, 5U),
+        SDK_GPR(PORPOISE_ABI_U32, 6U),
+        SDK_GPR(PORPOISE_ABI_U8, 7U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_invalidate_vtx_cache_adapter",
+        "GXInvalidateVtxCache", "gx.a/GXAttr.c/GXInvalidateVtxCache",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 0U, SDK_VOID),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_num_tex_gens_adapter",
+        "GXSetNumTexGens", "gx.a/GXAttr.c/GXSetNumTexGens",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 1U, SDK_GPR(PORPOISE_ABI_U8, 3U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_num_chans_adapter", "GXSetNumChans",
+        "gx.a/GXLight.c/GXSetNumChans",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 1U, SDK_GPR(PORPOISE_ABI_U8, 3U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_invalidate_tex_all_adapter",
+        "GXInvalidateTexAll", "gx.a/GXTexture.c/GXInvalidateTexAll",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 0U, SDK_VOID),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_tev_op_adapter", "GXSetTevOp",
+        "gx.a/GXTev.c/GXSetTevOp",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 2U,
+        SDK_GPR(PORPOISE_ABI_U32, 3U),
+        SDK_GPR(PORPOISE_ABI_U32, 4U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_tev_order_adapter", "GXSetTevOrder",
+        "gx.a/GXTev.c/GXSetTevOrder",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 4U,
+        SDK_GPR(PORPOISE_ABI_U32, 3U),
+        SDK_GPR(PORPOISE_ABI_U32, 4U),
+        SDK_GPR(PORPOISE_ABI_U32, 5U),
+        SDK_GPR(PORPOISE_ABI_U32, 6U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_num_tev_stages_adapter",
+        "GXSetNumTevStages", "gx.a/GXTev.c/GXSetNumTevStages",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 1U, SDK_GPR(PORPOISE_ABI_U8, 3U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_color_update_adapter",
+        "GXSetColorUpdate", "gx.a/GXPixel.c/GXSetColorUpdate",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 1U, SDK_GPR(PORPOISE_ABI_U8, 3U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_z_mode_adapter", "GXSetZMode",
+        "gx.a/GXPixel.c/GXSetZMode",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 3U,
+        SDK_GPR(PORPOISE_ABI_U8, 3U),
+        SDK_GPR(PORPOISE_ABI_U32, 4U),
+        SDK_GPR(PORPOISE_ABI_U8, 5U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_pixel_fmt_adapter", "GXSetPixelFmt",
+        "gx.a/GXPixel.c/GXSetPixelFmt",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 2U,
+        SDK_GPR(PORPOISE_ABI_U32, 3U),
+        SDK_GPR(PORPOISE_ABI_U32, 4U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_viewport_adapter", "GXSetViewport",
+        "gx.a/GXTransform.c/GXSetViewport",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 6U,
+        SDK_FPR(PORPOISE_ABI_F32, 1U),
+        SDK_FPR(PORPOISE_ABI_F32, 2U),
+        SDK_FPR(PORPOISE_ABI_F32, 3U),
+        SDK_FPR(PORPOISE_ABI_F32, 4U),
+        SDK_FPR(PORPOISE_ABI_F32, 5U),
+        SDK_FPR(PORPOISE_ABI_F32, 6U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_scissor_adapter", "GXSetScissor",
+        "gx.a/GXTransform.c/GXSetScissor",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 4U,
+        SDK_GPR(PORPOISE_ABI_U32, 3U),
+        SDK_GPR(PORPOISE_ABI_U32, 4U),
+        SDK_GPR(PORPOISE_ABI_U32, 5U),
+        SDK_GPR(PORPOISE_ABI_U32, 6U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_disp_copy_src_adapter",
+        "GXSetDispCopySrc", "gx.a/GXFrameBuf.c/GXSetDispCopySrc",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 4U,
+        SDK_GPR(PORPOISE_ABI_U16, 3U),
+        SDK_GPR(PORPOISE_ABI_U16, 4U),
+        SDK_GPR(PORPOISE_ABI_U16, 5U),
+        SDK_GPR(PORPOISE_ABI_U16, 6U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_get_y_scale_factor_adapter",
+        "GXGetYScaleFactor", "gx.a/GXFrameBuf.c/GXGetYScaleFactor",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_FPR(PORPOISE_ABI_F32, 1U), 2U,
+        SDK_GPR(PORPOISE_ABI_U16, 3U),
+        SDK_GPR(PORPOISE_ABI_U16, 4U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_disp_copy_y_scale_adapter",
+        "GXSetDispCopyYScale", "gx.a/GXFrameBuf.c/GXSetDispCopyYScale",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_GPR(PORPOISE_ABI_U32, 3U), 1U,
+        SDK_FPR(PORPOISE_ABI_F32, 1U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_set_disp_copy_gamma_adapter",
+        "GXSetDispCopyGamma", "gx.a/GXFrameBuf.c/GXSetDispCopyGamma",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 1U, SDK_GPR(PORPOISE_ABI_U32, 3U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_gx_draw_done_adapter", "GXDrawDone",
+        "gx.a/GXMisc.c/GXDrawDone",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 0U, SDK_VOID),
     SDK_CONTRACT(
         "porpoise_libporpoise_gx_set_draw_done_callback_adapter",
         "GXSetDrawDoneCallback", SDK_GPR(PORPOISE_ABI_POINTER, 3U), 1U,
@@ -237,6 +392,10 @@ static const PorpoiseSdkContract sdk_contracts[] = {
         "porpoise_libporpoise_dvd_get_command_block_status_adapter",
         "DVDGetCommandBlockStatus", SDK_GPR(PORPOISE_ABI_S32, 3U), 1U,
         SDK_GPR(PORPOISE_ABI_POINTER, 3U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_dvd_init_adapter", "DVDInit",
+        "dvd.a/dvd.c/DVDInit", PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 0U, SDK_VOID),
     SDK_CONTRACT(
         "porpoise_libporpoise_dvd_open_adapter", "DVDOpen",
         SDK_GPR(PORPOISE_ABI_S32, 3U), 2U,
@@ -279,6 +438,10 @@ static const PorpoiseSdkContract sdk_contracts[] = {
         SDK_GPR(PORPOISE_ABI_POINTER, 3U),
         SDK_GPR(PORPOISE_ABI_POINTER, 4U),
         SDK_GPR(PORPOISE_ABI_S32, 5U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_os_init_adapter", "OSInit",
+        "os.a/OS.c/OSInit", PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 0U, SDK_VOID),
     SDK_CONTRACT(
         "porpoise_libporpoise_os_receive_message_adapter",
         "OSReceiveMessage", SDK_GPR(PORPOISE_ABI_S32, 3U), 3U,
@@ -314,16 +477,44 @@ static const PorpoiseSdkContract sdk_contracts[] = {
     SDK_CONTRACT(
         "porpoise_libporpoise_os_wakeup_thread_adapter", "OSWakeupThread",
         SDK_VOID, 1U, SDK_GPR(PORPOISE_ABI_POINTER, 3U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_demo_pad_init_adapter", "DEMOPadInit",
+        "demo.a/DEMOPad.c/DEMOPadInit", PORPOISE_SDK_CONTRACT_DEMO,
+        SDK_VOID, 0U, SDK_VOID),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_pad_read_adapter", "PADRead",
+        "pad.a/Pad.c/PADRead",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_GPR(PORPOISE_ABI_U32, 3U), 1U,
+        SDK_GPR(PORPOISE_ABI_POINTER, 3U)),
     SDK_CONTRACT(
         "porpoise_libporpoise_vi_configure_adapter", "VIConfigure",
         SDK_VOID, 1U, SDK_GPR(PORPOISE_ABI_POINTER, 3U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_vi_init_adapter", "VIInit",
+        "vi.a/vi.c/VIInit", PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 0U, SDK_VOID),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_vi_set_black_adapter", "VISetBlack",
+        "vi.a/vi.c/VISetBlack", PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 1U, SDK_GPR(PORPOISE_ABI_U8, 3U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_vi_flush_adapter", "VIFlush",
+        "vi.a/vi.c/VIFlush", PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 0U, SDK_VOID),
     SDK_CONTRACT(
         "porpoise_libporpoise_vi_set_next_frame_buffer_adapter",
         "VISetNextFrameBuffer", SDK_VOID, 1U,
-        SDK_GPR(PORPOISE_ABI_POINTER, 3U))
+        SDK_GPR(PORPOISE_ABI_POINTER, 3U)),
+    SDK_EXACT_CONTRACT(
+        "porpoise_libporpoise_vi_wait_for_retrace_adapter",
+        "VIWaitForRetrace", "vi.a/vi.c/VIWaitForRetrace",
+        PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN,
+        SDK_VOID, 0U, SDK_VOID)
 };
 
 #undef SDK_CONTRACT
+#undef SDK_EXACT_CONTRACT
 #undef SDK_FPR
 #undef SDK_GPR
 #undef SDK_VOID
@@ -372,6 +563,23 @@ const PorpoiseSdkContract *porpoise_sdk_contract_find_by_host_callable(
     return NULL;
 }
 
+const PorpoiseSdkContract *porpoise_sdk_contract_find_by_canonical_identity(
+    const char *canonical_identity) {
+    size_t index;
+
+    if (canonical_identity == NULL || canonical_identity[0] == '\0') {
+        return NULL;
+    }
+    for (index = 0U; index < porpoise_sdk_contract_count(); index++) {
+        const char *required =
+            sdk_contracts[index].required_canonical_identity;
+        if (required != NULL && strcmp(required, canonical_identity) == 0) {
+            return &sdk_contracts[index];
+        }
+    }
+    return NULL;
+}
+
 const char *porpoise_sdk_contract_canonical_name(
     const PorpoiseSdkContract *contract) {
     return contract != NULL ? contract->canonical_name : NULL;
@@ -379,9 +587,8 @@ const char *porpoise_sdk_contract_canonical_name(
 
 PorpoiseSdkContractCategory porpoise_sdk_contract_category(
     const PorpoiseSdkContract *contract) {
-    return contract != NULL
-               ? PORPOISE_SDK_CONTRACT_NINTENDO_DOLPHIN
-               : PORPOISE_SDK_CONTRACT_OTHER;
+    return contract != NULL ? contract->category
+                            : PORPOISE_SDK_CONTRACT_OTHER;
 }
 
 PorpoiseSdkHostBindingKind porpoise_sdk_contract_host_binding_kind(
@@ -421,6 +628,20 @@ const PorpoiseSdkAbiValue *porpoise_sdk_contract_argument_at(
 bool porpoise_sdk_contract_allows_automatic_import(
     const PorpoiseSdkContract *contract) {
     return contract != NULL;
+}
+
+bool porpoise_sdk_contract_accepts_canonical_identity(
+    const PorpoiseSdkContract *contract,
+    const char *canonical_identity) {
+    if (contract == NULL) {
+        return false;
+    }
+    if (contract->required_canonical_identity == NULL) {
+        return true;
+    }
+    return canonical_identity != NULL && canonical_identity[0] != '\0' &&
+           strcmp(contract->required_canonical_identity,
+                  canonical_identity) == 0;
 }
 
 bool porpoise_sdk_contract_binding_matches(

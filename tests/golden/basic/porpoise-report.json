@@ -19,13 +19,9 @@
   ],
   "instructions": [
     {"file": "no_entry.s", "line": 6, "address": 2147487744, "mnemonic": "addi", "status": "lowered", "semantic_test": true, "detail": ""},
-    {"file": "no_entry.s", "line": 7, "address": 2147487748, "mnemonic": "blr", "status": "approximate", "semantic_test": false, "detail": "C call-stack return does not dispatch an arbitrary guest LR target"}
+    {"file": "no_entry.s", "line": 7, "address": 2147487748, "mnemonic": "blr", "status": "lowered", "semantic_test": false, "detail": ""}
   ],
-  "approximations": [
-    {"file": "no_entry.s", "line": 7, "address": 2147487748, "mnemonic": "blr"}
-  ],
-  "diagnostics": [
-    {"severity": "warning", "file": "no_entry.s", "line": 7, "address": 2147487748, "message": "blr instruction uses approximate host semantics"}
-  ],
-  "summary": {"files": 1, "functions": 1, "data_words": 0, "data_objects": 0, "anonymous_contributions": 0, "anonymous_explicit_bytes": 0, "data_fixups": 0, "data_spans": 0, "initialized_data_bytes": 0, "zero_fill_data_bytes": 0, "data_chunks": 0, "lowered": 1, "host_equivalent_noop": 0, "approximate": 1, "unsupported": 0}
+  "approximations": [  ],
+  "diagnostics": [  ],
+  "summary": {"files": 1, "functions": 1, "data_words": 0, "data_objects": 0, "anonymous_contributions": 0, "anonymous_explicit_bytes": 0, "data_fixups": 0, "data_spans": 0, "initialized_data_bytes": 0, "zero_fill_data_bytes": 0, "data_chunks": 0, "lowered": 2, "host_equivalent_noop": 0, "approximate": 0, "unsupported": 0}
 }

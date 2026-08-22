@@ -27,6 +27,7 @@ porpoise_core_sources = files(
   'src/analysis.c',
   'src/abi.c',
   'src/asm_data.c',
+  'src/build.c',
   'src/lower.c',
   'src/lower_integer.c',
   'src/lower_memory.c',
@@ -35,6 +36,7 @@ porpoise_core_sources = files(
   'src/operation.c',
   'src/options.c',
   'src/program.c',
+  'src/process.c',
   'src/project.c',
   'src/project_report.c',
   'src/project_publish.c',
@@ -42,12 +44,14 @@ porpoise_core_sources = files(
   'src/recovery_annotation.c',
   'src/recovery_cache.c',
   'src/recovery_project.c',
+  'src/recovery_title_host.c',
   'src/recovery_runner.c',
   'src/relocation.c',
   'src/report.c',
   'src/session.c',
   'src/sha256.c',
   'src/sdk_contract.c',
+  'src/sdk_guest_layout.c',
   'src/sdk_catalog.c',
   'src/signature.c',
   'src/symbol_map.c',
@@ -241,12 +245,14 @@ install_data(
 
 install_data(
   'runtime/include/porpoise_lifted.h',
+  'runtime/include/porpoise_ppc_fp.h',
   'runtime/include/porpoise_libporpoise_adapter.h',
   'runtime/include/porpoise_title_host.h',
   install_dir: get_option('datadir') / 'porpoise' / 'runtime' / 'include',
 )
 install_data(
   'runtime/src/porpoise_lifted.c',
+  'runtime/src/porpoise_ppc_fp.c',
   'runtime/src/porpoise_libporpoise_adapter.c',
   'runtime/src/porpoise_libporpoise_ai.c',
   'runtime/src/porpoise_libporpoise_ar.c',
@@ -259,16 +265,23 @@ install_data(
   'runtime/src/porpoise_libporpoise_guest_os.c',
   'runtime/src/porpoise_libporpoise_message_queue.c',
   'runtime/src/porpoise_libporpoise_os_report.c',
+  'runtime/src/porpoise_libporpoise_presentation.cpp',
+  'runtime/src/porpoise_libporpoise_presentation_private.h',
   'runtime/src/porpoise_libporpoise_builtins_private.h',
   'runtime/src/porpoise_libporpoise_private.h',
   install_dir: get_option('datadir') / 'porpoise' / 'runtime' / 'src',
+)
+
+runtime_lifted_sources = files(
+  'runtime/src/porpoise_lifted.c',
+  'runtime/src/porpoise_ppc_fp.c',
 )
 
 runtime_test = executable(
   'test_runtime',
   [
     'tests/test_runtime.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
   ],
   include_directories: include_directories('runtime/include'),
   dependencies: math_dep,
@@ -279,18 +292,29 @@ scalar_fp_runtime_test = executable(
   'test_scalar_fp_runtime',
   [
     'tests/test_scalar_fp_runtime.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
   ],
   include_directories: include_directories('runtime/include'),
   dependencies: math_dep,
 )
 test('scalar-fp-runtime', scalar_fp_runtime_test)
 
+ppc_fp_runtime_test = executable(
+  'test_ppc_fp_runtime',
+  [
+    'tests/test_ppc_fp_runtime.c',
+    'runtime/src/porpoise_ppc_fp.c',
+  ],
+  include_directories: include_directories('runtime/include'),
+  c_args: ['-Werror'],
+)
+test('ppc-fp-runtime', ppc_fp_runtime_test)
+
 psq_runtime_test = executable(
   'test_psq_runtime',
   [
     'tests/test_psq_runtime.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
   ],
   include_directories: include_directories('runtime/include'),
   dependencies: math_dep,
@@ -301,7 +325,7 @@ system_runtime_test = executable(
   'test_system_runtime',
   [
     'tests/test_system_runtime.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
   ],
   include_directories: include_directories('runtime/include'),
   dependencies: math_dep,
@@ -313,7 +337,7 @@ libporpoise_adapter_test = executable(
   'test_libporpoise_adapter',
   [
     'tests/test_libporpoise_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_adapter.c',
     'runtime/src/porpoise_libporpoise_guest_os.c',
     'runtime/src/porpoise_libporpoise_ar.c',
@@ -335,7 +359,7 @@ test('libporpoise-adapter', libporpoise_adapter_test)
 
 libporpoise_vi_framebuffer_adapter_sources = [
   'tests/test_libporpoise_vi_framebuffer_adapter.c',
-  'runtime/src/porpoise_lifted.c',
+  runtime_lifted_sources,
   'runtime/src/porpoise_libporpoise_adapter.c',
   'runtime/src/porpoise_libporpoise_guest_os.c',
   'runtime/src/porpoise_libporpoise_ar.c',
@@ -343,6 +367,7 @@ libporpoise_vi_framebuffer_adapter_sources = [
   'tests/fixtures/libporpoise_stub/src/os_stub.c',
   'tests/fixtures/libporpoise_stub/src/gx_stub.c',
   'tests/fixtures/libporpoise_stub/src/dispatch_stub.c',
+  'tests/fixtures/libporpoise_stub/src/presentation_bridge_stub.c',
 ]
 
 libporpoise_vi_framebuffer_adapter_test = executable(
@@ -355,7 +380,11 @@ libporpoise_vi_framebuffer_adapter_test = executable(
     'tests/fixtures/libporpoise_stub/private',
   ),
   dependencies: [math_dep, threads_dep],
-  c_args: ['-Werror', '-DLIBPORPOISE_PORT'],
+  c_args: [
+    '-Werror',
+    '-DLIBPORPOISE_PORT',
+    '-DPORPOISE_HAVE_LIBPORPOISE_PRESENTATION_STATS_BRIDGE=1',
+  ],
 )
 test(
   'libporpoise-vi-framebuffer-adapter',
@@ -375,6 +404,7 @@ libporpoise_vi_missing_framebuffer_contract_adapter_test = executable(
   c_args: [
     '-Werror',
     '-DLIBPORPOISE_PORT',
+    '-DPORPOISE_HAVE_LIBPORPOISE_PRESENTATION_STATS_BRIDGE=1',
     '-DPORPOISE_STUB_DISABLE_VI_NEXT_FRAMEBUFFER_GUEST_ADDRESS_CONTRACT',
   ],
 )
@@ -387,7 +417,7 @@ libporpoise_xfb_vi_ordering_test = executable(
   'test_libporpoise_xfb_vi_ordering',
   [
     'tests/test_libporpoise_xfb_vi_ordering.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_adapter.c',
     'runtime/src/porpoise_libporpoise_guest_os.c',
     'runtime/src/porpoise_libporpoise_ar.c',
@@ -417,7 +447,7 @@ libporpoise_pointer_tokens_test = executable(
   'test_libporpoise_pointer_tokens',
   [
     'tests/test_libporpoise_pointer_tokens.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_adapter.c',
     'runtime/src/porpoise_libporpoise_guest_os.c',
     'runtime/src/porpoise_libporpoise_ar.c',
@@ -445,7 +475,7 @@ libporpoise_ai_init_adapter_test = executable(
   'test_libporpoise_ai_init_adapter',
   [
     'tests/test_libporpoise_ai_init_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_ai.c',
     'tests/fixtures/libporpoise_stub/src/ai_stub.c',
   ],
@@ -466,7 +496,7 @@ libporpoise_ar_adapter_test = executable(
   'test_libporpoise_ar_adapter',
   [
     'tests/test_libporpoise_ar_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_ar.c',
     'tests/fixtures/libporpoise_stub/src/ar_allocator_stub.c',
   ],
@@ -484,7 +514,7 @@ libporpoise_gx_init_adapter_test = executable(
   'test_libporpoise_gx_init_adapter',
   [
     'tests/test_libporpoise_gx_init_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_adapter.c',
     'runtime/src/porpoise_libporpoise_guest_os.c',
     'runtime/src/porpoise_libporpoise_ar.c',
@@ -510,7 +540,7 @@ test(
 
 libporpoise_gx_boundary_adapter_sources = [
   'tests/test_libporpoise_gx_boundary_adapter.c',
-  'runtime/src/porpoise_lifted.c',
+  runtime_lifted_sources,
   'runtime/src/porpoise_libporpoise_adapter.c',
   'runtime/src/porpoise_libporpoise_guest_os.c',
   'runtime/src/porpoise_libporpoise_ar.c',
@@ -652,7 +682,7 @@ libporpoise_gx_values_adapter_test = executable(
   'test_libporpoise_gx_values_adapter',
   [
     'tests/test_libporpoise_gx_values_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_adapter.c',
     'runtime/src/porpoise_libporpoise_guest_os.c',
     'runtime/src/porpoise_libporpoise_ar.c',
@@ -682,7 +712,7 @@ libporpoise_gx_objects_adapter_test = executable(
   'test_libporpoise_gx_objects_adapter',
   [
     'tests/test_libporpoise_gx_objects_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_adapter.c',
     'runtime/src/porpoise_libporpoise_guest_os.c',
     'runtime/src/porpoise_libporpoise_ar.c',
@@ -732,7 +762,7 @@ libporpoise_arena_adapter_test = executable(
   'test_libporpoise_arena_adapter',
   [
     'tests/test_libporpoise_arena_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_adapter.c',
     'runtime/src/porpoise_libporpoise_guest_os.c',
     'runtime/src/porpoise_libporpoise_ar.c',
@@ -757,7 +787,7 @@ libporpoise_arq_adapter_test = executable(
   'test_libporpoise_arq_adapter',
   [
     'tests/test_libporpoise_arq_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_adapter.c',
     'runtime/src/porpoise_libporpoise_guest_os.c',
     'runtime/src/porpoise_libporpoise_ar.c',
@@ -781,7 +811,7 @@ libporpoise_card_adapter_test = executable(
   'test_libporpoise_card_adapter',
   [
     'tests/test_libporpoise_card_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_card.c',
   ],
   include_directories: include_directories(
@@ -798,7 +828,7 @@ libporpoise_dsp_adapter_test = executable(
   'test_libporpoise_dsp_adapter',
   [
     'tests/test_libporpoise_dsp_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_adapter.c',
     'runtime/src/porpoise_libporpoise_guest_os.c',
     'runtime/src/porpoise_libporpoise_ar.c',
@@ -822,7 +852,7 @@ libporpoise_thread_queue_adapter_test = executable(
   'test_libporpoise_thread_queue_adapter',
   [
     'tests/test_libporpoise_thread_queue_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_guest_os.c',
     'tests/fixtures/libporpoise_stub/src/thread_registry_link_stub.c',
   ],
@@ -839,7 +869,7 @@ libporpoise_thread_carrier_adapter_test = executable(
   'test_libporpoise_thread_carrier_adapter',
   [
     'tests/test_libporpoise_thread_carrier_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_adapter.c',
     'runtime/src/porpoise_libporpoise_guest_os.c',
     'runtime/src/porpoise_libporpoise_ar.c',
@@ -871,7 +901,7 @@ libporpoise_message_queue_adapter_test = executable(
   'test_libporpoise_message_queue_adapter',
   [
     'tests/test_libporpoise_message_queue_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_message_queue.c',
   ],
   include_directories: include_directories('runtime/include', 'runtime/src'),
@@ -887,7 +917,7 @@ libporpoise_os_report_adapter_test = executable(
   'test_libporpoise_os_report_adapter',
   [
     'tests/test_libporpoise_os_report_adapter.c',
-    'runtime/src/porpoise_lifted.c',
+    runtime_lifted_sources,
     'runtime/src/porpoise_libporpoise_os_report.c',
   ],
   include_directories: include_directories(
@@ -969,6 +999,19 @@ sdk_contract_test = executable(
 )
 test('sdk-contract', sdk_contract_test)
 
+sdk_guest_layout_test = executable(
+  'test_sdk_guest_layout',
+  'tests/test_sdk_guest_layout.c',
+  include_directories: [porpoise_inc, include_directories('src')],
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test(
+  'sdk-guest-layout',
+  sdk_guest_layout_test,
+  args: [meson.project_source_root()],
+)
+
 sdk_catalog_test = executable(
   'test_sdk_catalog',
   'tests/test_sdk_catalog.c',
@@ -1047,6 +1090,57 @@ test(
   recovery_project_test,
   args: [meson.project_source_root()],
 )
+
+recovery_title_host_test = executable(
+  'test_recovery_title_host',
+  'tests/test_recovery_title_host.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+test(
+  'recovery-title-host',
+  recovery_title_host_test,
+  args: [meson.project_source_root()],
+)
+
+build_core_test = executable(
+  'test_build_core',
+  'tests/test_build.c',
+  include_directories: porpoise_inc,
+  link_with: porpoise_core,
+  c_args: porpoise_compile_args,
+)
+cc_command = cc.cmd_array()
+meson_program = find_program('meson')
+test(
+  'build-core',
+  build_core_test,
+  args: [
+    meson.project_source_root(),
+    meson.current_build_dir(),
+    meson_program.full_path(),
+    cc_command[cc_command.length() - 1],
+  ],
+  timeout: 900,
+)
+
+if host_machine.system() != 'windows'
+  process_service_test = executable(
+    'test_process_service',
+    'tests/test_process.c',
+    include_directories: [porpoise_inc, include_directories('src')],
+    dependencies: threads_dep,
+    link_with: porpoise_core,
+    c_args: porpoise_compile_args,
+  )
+  test(
+    'process-service',
+    process_service_test,
+    args: [meson.current_build_dir()],
+    timeout: 60,
+  )
+endif
 
 options_project_test = executable(
   'test_options_project',
@@ -1189,6 +1283,12 @@ test(
 
 compat_libporpoise = get_option('libporpoise_compat_path')
 if compat_libporpoise != ''
+  add_languages('cpp', native: false, required: true)
+  compat_cpp = meson.get_compiler('cpp')
+  compat_cc_command = cc.cmd_array()
+  compat_cpp_command = compat_cpp.cmd_array()
+  compat_meson = find_program('meson', required: true)
+
   test(
     'libporpoise-compatibility-smoke',
     python,
@@ -1202,5 +1302,30 @@ if compat_libporpoise != ''
       '--cc',
     ] + cc.cmd_array(),
     timeout: 180,
+  )
+
+  # This opt-in gate is intentionally absent from ordinary builds. It drives
+  # the public Build/Run core against a real external checkout, links a mixed
+  # C/C++ synthetic title that calls stable libPorpoise arena APIs, executes
+  # it, and verifies that the managed cache remains runnable when reused.
+  libporpoise_build_run_smoke = executable(
+    'test_libporpoise_build_run_smoke',
+    'tests/test_libporpoise_build_run.c',
+    include_directories: porpoise_inc,
+    link_with: porpoise_core,
+    c_args: porpoise_compile_args,
+  )
+  test(
+    'libporpoise-real-build-run-smoke',
+    libporpoise_build_run_smoke,
+    args: [
+      meson.project_source_root(),
+      meson.current_build_dir(),
+      compat_libporpoise,
+      compat_meson.full_path(),
+      compat_cc_command[compat_cc_command.length() - 1],
+      compat_cpp_command[compat_cpp_command.length() - 1],
+    ],
+    timeout: 900,
   )
 endif

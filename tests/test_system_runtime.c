@@ -246,6 +246,25 @@ static void test_state_and_explicit_faults(void)
         UINT32_C(0xA5A50000)));
     CHECK(state.msr == UINT32_C(0xA5A50000));
 
+    state.msr = 0U;
+    CHECK(porpoise_msr_transition_is_exact(&state, 0U));
+    CHECK(porpoise_msr_transition_is_exact(&state, PORPOISE_MSR_EE));
+    CHECK(porpoise_msr_transition_is_exact(&state, PORPOISE_MSR_FP));
+    CHECK(porpoise_msr_transition_is_exact(&state, PORPOISE_MSR_PR));
+    CHECK(porpoise_msr_transition_is_exact(&state, PORPOISE_MSR_RI));
+    CHECK(porpoise_msr_transition_is_exact(
+        &state,
+        PORPOISE_MSR_EE | PORPOISE_MSR_FP | PORPOISE_MSR_RI));
+    CHECK(!porpoise_msr_transition_is_exact(&state, UINT32_C(0x00000001)));
+    state.msr = PORPOISE_MSR_EE | UINT32_C(0x00000001);
+    CHECK(porpoise_msr_transition_is_exact(
+        &state,
+        PORPOISE_MSR_FP | UINT32_C(0x00000001)));
+    CHECK(!porpoise_msr_transition_is_exact(&state, PORPOISE_MSR_FP));
+    state.msr = PORPOISE_MSR_PR;
+    CHECK(!porpoise_msr_transition_is_exact(&state, PORPOISE_MSR_PR));
+    CHECK(!porpoise_msr_transition_is_exact(NULL, 0U));
+
     CHECK(!porpoise_illegal_instruction(
         &state,
         UINT32_C(0x80001008),

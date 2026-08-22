@@ -177,7 +177,7 @@ static const OpcodeSpec OPCODES[] = {
     {"b", OP_B, PORPOISE_LOWERED, false, 0},
     {"bl", OP_BL, PORPOISE_LOWERED, true, 0},
     {"bla", OP_BL, PORPOISE_LOWERED, true, 0},
-    {"blr", OP_BLR, PORPOISE_APPROXIMATE, false, 0},
+    {"blr", OP_BLR, PORPOISE_LOWERED, false, 0},
     {"blrl", OP_BLRL, PORPOISE_LOWERED, true, 0},
     {"bctr", OP_BCTR, PORPOISE_LOWERED, false, 0},
     {"bctrl", OP_BCTRL, PORPOISE_LOWERED, true, 0},
@@ -190,12 +190,12 @@ static const OpcodeSpec OPCODES[] = {
     {"bgt", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, false, 1},
     {"ble", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, false, 0x101},
     {"ble+", OP_CONDITIONAL_BRANCH, PORPOISE_LOWERED, true, 0x101},
-    {"beqlr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, 2},
-    {"bnelr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, -2},
-    {"bltlr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, 0},
-    {"bgelr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, 0x100},
-    {"bgtlr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, 1},
-    {"blelr", OP_CONDITIONAL_RETURN, PORPOISE_APPROXIMATE, true, 0x101},
+    {"beqlr", OP_CONDITIONAL_RETURN, PORPOISE_LOWERED, true, 2},
+    {"bnelr", OP_CONDITIONAL_RETURN, PORPOISE_LOWERED, true, -2},
+    {"bltlr", OP_CONDITIONAL_RETURN, PORPOISE_LOWERED, true, 0},
+    {"bgelr", OP_CONDITIONAL_RETURN, PORPOISE_LOWERED, true, 0x100},
+    {"bgtlr", OP_CONDITIONAL_RETURN, PORPOISE_LOWERED, true, 1},
+    {"blelr", OP_CONDITIONAL_RETURN, PORPOISE_LOWERED, true, 0x101},
     {"bdnz", OP_BDNZ, PORPOISE_LOWERED, false, 0},
     {"bdz", OP_BDZ, PORPOISE_LOWERED, true, 0},
     {"mflr", OP_MFLR, PORPOISE_LOWERED, false, 0},
@@ -266,10 +266,10 @@ static const OpcodeSpec OPCODES[] = {
     {"ps_msub", OP_PAIRED_TERNARY, PORPOISE_APPROXIMATE, true, PAIRED_MSUB},
     {"ps_nmadd", OP_PAIRED_TERNARY, PORPOISE_APPROXIMATE, true, PAIRED_NMADD},
     {"ps_nmsub", OP_PAIRED_TERNARY, PORPOISE_APPROXIMATE, true, PAIRED_NMSUB},
-    {"ps_madds0", OP_PAIRED_SCALAR_MADD, PORPOISE_APPROXIMATE, true, 0},
-    {"ps_madds1", OP_PAIRED_SCALAR_MADD, PORPOISE_APPROXIMATE, true, 1},
-    {"ps_muls0", OP_PAIRED_SCALAR_MULTIPLY, PORPOISE_APPROXIMATE, true, 0},
-    {"ps_muls1", OP_PAIRED_SCALAR_MULTIPLY, PORPOISE_APPROXIMATE, true, 1},
+    {"ps_madds0", OP_PAIRED_SCALAR_MADD, PORPOISE_LOWERED, true, 0},
+    {"ps_madds1", OP_PAIRED_SCALAR_MADD, PORPOISE_LOWERED, true, 1},
+    {"ps_muls0", OP_PAIRED_SCALAR_MULTIPLY, PORPOISE_LOWERED, true, 0},
+    {"ps_muls1", OP_PAIRED_SCALAR_MULTIPLY, PORPOISE_LOWERED, true, 1},
     {"ps_sum0", OP_PAIRED_SUM, PORPOISE_APPROXIMATE, true, 0},
     {"ps_sum1", OP_PAIRED_SUM, PORPOISE_APPROXIMATE, true, 1},
     {"ps_merge00", OP_PAIRED_MERGE, PORPOISE_LOWERED, true, PAIRED_MERGE_00},
@@ -289,7 +289,8 @@ static const OpcodeSpec OPCODES[] = {
     {"dcbtst", OP_HOST_NOOP, PORPOISE_HOST_NOOP, false, 1},
     {"icbi", OP_HOST_NOOP, PORPOISE_HOST_NOOP, false, 1},
     {"fres", OP_RECIPROCAL_APPROX, PORPOISE_APPROXIMATE, false, 0},
-    {"frsqrte", OP_RECIPROCAL_APPROX, PORPOISE_APPROXIMATE, false, 1}
+    {"frsqrte", OP_RECIPROCAL_APPROX, PORPOISE_LOWERED, true, 1},
+    {"frsqrte.", OP_RECIPROCAL_APPROX, PORPOISE_LOWERED, true, 1}
 };
 
 static const OpcodeSpec *find_opcode(const char *mnemonic) {
@@ -591,6 +592,61 @@ bool file_printf(FILE *output, const char *format, ...) {
     return result >= 0;
 }
 
+static bool file_write_c_string_literal(FILE *output, const char *value) {
+    const unsigned char *cursor =
+        (const unsigned char *)(value != NULL ? value : "");
+
+    if (fputc('"', output) == EOF) return false;
+    while (*cursor != '\0') {
+        if (*cursor == '"' || *cursor == '\\') {
+            if (fputc('\\', output) == EOF ||
+                fputc((int)*cursor, output) == EOF) return false;
+        } else if (*cursor == '\n') {
+            if (fputs("\\n", output) == EOF) return false;
+        } else if (*cursor == '\r') {
+            if (fputs("\\r", output) == EOF) return false;
+        } else if (*cursor == '\t') {
+            if (fputs("\\t", output) == EOF) return false;
+        } else if (*cursor >= 0x20U && *cursor < 0x7FU) {
+            if (fputc((int)*cursor, output) == EOF) return false;
+        } else if (fprintf(output, "\\%03o", (unsigned int)*cursor) < 0) {
+            return false;
+        }
+        cursor++;
+    }
+    return fputc('"', output) != EOF;
+}
+
+static bool emit_direct_import_call(
+    FILE *output,
+    const PorpoiseAbiFunction *imported,
+    uint32_t call_site,
+    const char *indent) {
+    char c_name[PORPOISE_NAME_CAPACITY];
+
+    porpoise_sanitize_identifier(imported->symbol, c_name, sizeof(c_name));
+    if (!file_printf(
+            output,
+            "%sporpoise_trace_call_enter(state, UINT32_C(0x%08lX), "
+            "\"imported\", ",
+            indent,
+            (unsigned long)call_site) ||
+        !file_write_c_string_literal(output, imported->symbol) ||
+        !file_printf(
+            output,
+            ");\n%sporpoise_import_%s(state);\n"
+            "%sporpoise_trace_call_exit(state, UINT32_C(0x%08lX), "
+            "\"imported\", ",
+            indent,
+            c_name,
+            indent,
+            (unsigned long)call_site) ||
+        !file_write_c_string_literal(output, imported->symbol)) {
+        return false;
+    }
+    return file_printf(output, ");\n");
+}
+
 static bool opcode_records(const char *mnemonic) {
     size_t length = strlen(mnemonic);
     return length != 0U && mnemonic[length - 1U] == '.';
@@ -650,13 +706,30 @@ static bool function_item_has_preceding_label(
            function->items[item_index - 1U].kind == PORPOISE_ASM_LABEL;
 }
 
+static bool function_item_is_address_taken(
+    const PorpoiseFunction *function,
+    size_t item_index) {
+    size_t entry_index;
+
+    for (entry_index = 0U;
+         entry_index < function->address_taken_entry_count;
+         entry_index++) {
+        if (function->address_taken_entries[
+                entry_index].instruction_item_index == item_index) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool function_item_needs_entry_label(
     const PorpoiseFunction *function,
     size_t item_index) {
     size_t alias_index;
     const PorpoiseAsmItem *item = &function->items[item_index];
     if (item->kind != PORPOISE_ASM_INSTRUCTION) return false;
-    if (function_item_has_preceding_label(function, item_index)) return true;
+    if (function_item_has_preceding_label(function, item_index) ||
+        function_item_is_address_taken(function, item_index)) return true;
     for (alias_index = 0U; alias_index < function->alias_count; alias_index++) {
         if (function->aliases[alias_index].instruction_item_index == item_index)
             return true;
@@ -685,7 +758,7 @@ static bool emit_function_entry_dispatch(
     for (item_index = 0U; item_index < function->item_count; item_index++) {
         const PorpoiseAsmItem *item = &function->items[item_index];
         if (item->kind != PORPOISE_ASM_INSTRUCTION ||
-            !function_item_has_preceding_label(function, item_index) ||
+            !function_item_needs_entry_label(function, item_index) ||
             function_has_alias_address(function, item->address)) continue;
         if (!opened) {
             if (!file_printf(output, "    switch (state->pc) {\n")) return false;
@@ -719,7 +792,8 @@ bool emit_branch_target(
     if (parse_unsigned(target, &target_address)) {
         if ((target_address & UINT32_C(3)) != 0U) return false;
         if (!file_printf(output,
-            "    if (!porpoise_call_address(state, UINT32_C(0x%08lX))) return;\n",
+            "    if (!%s(state, UINT32_C(0x%08lX))) return;\n",
+            link ? "porpoise_call_address" : "porpoise_branch_address",
             (unsigned long)target_address)) return false;
         if (link)
             return file_printf(output, "    if (porpoise_state_should_stop(state)) return;\n");
@@ -739,7 +813,8 @@ bool emit_branch_target(
             program, source, function, function->section, target,
             &callee, &alias, &target_address)) {
         if (!file_printf(output,
-            "    if (!porpoise_call_address(state, UINT32_C(0x%08lX))) return;\n",
+            "    if (!%s(state, UINT32_C(0x%08lX))) return;\n",
+            link ? "porpoise_call_address" : "porpoise_branch_address",
             (unsigned long)target_address)) return false;
         if (link) return file_printf(output, "    if (porpoise_state_should_stop(state)) return;\n");
         return file_printf(output, "    return;\n");
@@ -748,16 +823,16 @@ bool emit_branch_target(
             program, target, &callee, &target_address, &target_item_index)) {
         (void)target_item_index;
         if (!file_printf(output,
-            "    if (!porpoise_call_address(state, UINT32_C(0x%08lX))) return;\n",
+            "    if (!%s(state, UINT32_C(0x%08lX))) return;\n",
+            link ? "porpoise_call_address" : "porpoise_branch_address",
             (unsigned long)target_address)) return false;
         if (link) return file_printf(output, "    if (porpoise_state_should_stop(state)) return;\n");
         return file_printf(output, "    return;\n");
     }
     imported = porpoise_abi_find_import(abi, target);
     if (imported != NULL) {
-        char c_name[PORPOISE_NAME_CAPACITY];
-        porpoise_sanitize_identifier(imported->symbol, c_name, sizeof(c_name));
-        if (!file_printf(output, "    porpoise_import_%s(state);\n", c_name)) return false;
+        if (!emit_direct_import_call(
+                output, imported, item->address, "    ")) return false;
         if (link)
             return file_printf(output, "    if (porpoise_state_should_stop(state)) return;\n");
         return file_printf(output, "    return;\n");
@@ -789,7 +864,7 @@ bool emit_conditional_target(
     if (parse_unsigned(target, &target_address)) {
         if ((target_address & UINT32_C(3)) != 0U) return false;
         return file_printf(output,
-            "    if (%s) { (void)porpoise_call_address(state, UINT32_C(0x%08lX)); return; }\n",
+            "    if (%s) { (void)porpoise_branch_address(state, UINT32_C(0x%08lX)); return; }\n",
             condition, (unsigned long)target_address);
     }
     if (function_resolve_local_label(function, target, &target_item_index)) {
@@ -800,22 +875,22 @@ bool emit_conditional_target(
             program, source, function, function->section, target,
             &callee, &alias, &target_address)) {
         return file_printf(output,
-            "    if (%s) { (void)porpoise_call_address(state, UINT32_C(0x%08lX)); return; }\n",
+            "    if (%s) { (void)porpoise_branch_address(state, UINT32_C(0x%08lX)); return; }\n",
             condition, (unsigned long)target_address);
     }
     if (porpoise_program_resolve_unique_label(
             program, target, &callee, &target_address, &target_item_index)) {
         (void)target_item_index;
         return file_printf(output,
-            "    if (%s) { (void)porpoise_call_address(state, UINT32_C(0x%08lX)); return; }\n",
+            "    if (%s) { (void)porpoise_branch_address(state, UINT32_C(0x%08lX)); return; }\n",
             condition, (unsigned long)target_address);
     }
     imported = porpoise_abi_find_import(abi, target);
     if (imported != NULL) {
-        char c_name[PORPOISE_NAME_CAPACITY];
-        porpoise_sanitize_identifier(imported->symbol, c_name, sizeof(c_name));
-        return file_printf(output, "    if (%s) { porpoise_import_%s(state); return; }\n",
-                           condition, c_name);
+        if (!file_printf(output, "    if (%s) {\n", condition) ||
+            !emit_direct_import_call(
+                output, imported, item->address, "        ")) return false;
+        return file_printf(output, "        return;\n    }\n");
     }
     porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, source->relative_path,
                              item->source_line, item->address,
@@ -990,6 +1065,16 @@ int porpoise_lower_function(
                             (unsigned long)item->address)) {
                         return PORPOISE_EXIT_IO;
                     }
+                    if (raw_instruction.status == PORPOISE_APPROXIMATE &&
+                        !file_printf(
+                            output,
+                            "    porpoise_trace_approximate(state, "
+                            "UINT32_C(0x%08lX), \"%s\");\n"
+                            "    if (porpoise_state_has_fault(state)) return;\n",
+                            (unsigned long)item->address,
+                            item->mnemonic)) {
+                        return PORPOISE_EXIT_IO;
+                    }
                     if (!porpoise_raw_word_emit(
                             output,
                             &raw_instruction,
@@ -1119,6 +1204,20 @@ int porpoise_lower_function(
                         (unsigned long)item->address)) {
                     return PORPOISE_EXIT_IO;
                 }
+                if (system_instruction.status == PORPOISE_APPROXIMATE &&
+                    !(system_instruction.operation ==
+                          PORPOISE_SYSTEM_WRITE_STORAGE &&
+                      system_instruction.storage ==
+                          PORPOISE_SYSTEM_STORAGE_MSR) &&
+                    !file_printf(
+                        output,
+                        "    porpoise_trace_approximate(state, "
+                        "UINT32_C(0x%08lX), \"%s\");\n"
+                        "    if (porpoise_state_has_fault(state)) return;\n",
+                        (unsigned long)item->address,
+                        item->mnemonic)) {
+                    return PORPOISE_EXIT_IO;
+                }
                 if (!porpoise_system_emit(
                         output,
                         &system_instruction,
@@ -1140,11 +1239,7 @@ int porpoise_lower_function(
             }
             if (spec->status == PORPOISE_HOST_NOOP) detail = "documented host-equivalent no-op";
             if (spec->status == PORPOISE_APPROXIMATE) {
-                if (spec->operation == OP_BLR) {
-                    detail = "C call-stack return does not dispatch an arbitrary guest LR target";
-                } else if (spec->operation == OP_CONDITIONAL_RETURN) {
-                    detail = "taken LR branch returns through the C call stack instead of dispatching the arbitrary guest LR target";
-                } else if (spec->operation == OP_FRSP) {
+                if (spec->operation == OP_FRSP) {
                     detail = "runtime duplicates lane 0 into architecturally undefined destination lane 1 for deterministic compatibility";
                 } else if (spec->operation == OP_FLOAT_FMA) {
                     detail = "finite arithmetic uses host C99 fma and does not reproduce all PPC rounding and exception semantics";
@@ -1183,6 +1278,23 @@ int porpoise_lower_function(
             }
             if (!file_printf(output, "    state->pc = UINT32_C(0x%08lX);\n",
                              (unsigned long)item->address)) return PORPOISE_EXIT_IO;
+            if (spec->status == PORPOISE_APPROXIMATE &&
+                spec->operation != OP_PSQ_DFORM &&
+                spec->operation != OP_PSQ_INDEXED &&
+                spec->operation != OP_FLOAT_BINARY &&
+                spec->operation != OP_FLOAT_FMA &&
+                spec->operation != OP_PAIRED_BINARY &&
+                spec->operation != OP_PAIRED_TERNARY &&
+                spec->operation != OP_PAIRED_SCALAR_MADD &&
+                spec->operation != OP_PAIRED_SCALAR_MULTIPLY &&
+                spec->operation != OP_PAIRED_SUM &&
+                !file_printf(
+                    output,
+                    "    porpoise_trace_approximate(state, "
+                    "UINT32_C(0x%08lX), \"%s\");\n"
+                    "    if (porpoise_state_has_fault(state)) return;\n",
+                    (unsigned long)item->address,
+                    item->mnemonic)) return PORPOISE_EXIT_IO;
             {
                 size_t diagnostic_count = diagnostics->count;
                 emitted = emit_instruction(output, spec, program, source, function, item, abi, diagnostics);

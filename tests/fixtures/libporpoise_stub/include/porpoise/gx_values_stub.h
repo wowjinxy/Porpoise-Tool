@@ -23,6 +23,27 @@ typedef enum PorpoiseStubGXValueCall {
     PORPOISE_STUB_GX_SET_FOG,
     PORPOISE_STUB_GX_SET_FOG_RANGE_ADJ,
     PORPOISE_STUB_GX_SET_TEV_INDIRECT,
+    PORPOISE_STUB_GX_SET_DIRTY_STATE,
+    PORPOISE_STUB_GX_SEND_FLUSH_PRIM,
+    PORPOISE_STUB_GX_CLEAR_VTX_DESC,
+    PORPOISE_STUB_GX_SET_VTX_DESC,
+    PORPOISE_STUB_GX_SET_VTX_ATTR_FMT,
+    PORPOISE_STUB_GX_INVALIDATE_VTX_CACHE,
+    PORPOISE_STUB_GX_SET_NUM_TEX_GENS,
+    PORPOISE_STUB_GX_SET_NUM_CHANS,
+    PORPOISE_STUB_GX_INVALIDATE_TEX_ALL,
+    PORPOISE_STUB_GX_SET_TEV_OP,
+    PORPOISE_STUB_GX_SET_TEV_ORDER,
+    PORPOISE_STUB_GX_SET_NUM_TEV_STAGES,
+    PORPOISE_STUB_GX_SET_COLOR_UPDATE,
+    PORPOISE_STUB_GX_SET_Z_MODE,
+    PORPOISE_STUB_GX_SET_PIXEL_FMT,
+    PORPOISE_STUB_GX_SET_VIEWPORT,
+    PORPOISE_STUB_GX_SET_SCISSOR,
+    PORPOISE_STUB_GX_SET_DISP_COPY_SRC,
+    PORPOISE_STUB_GX_GET_Y_SCALE_FACTOR,
+    PORPOISE_STUB_GX_SET_DISP_COPY_Y_SCALE,
+    PORPOISE_STUB_GX_SET_DISP_COPY_GAMMA,
     PORPOISE_STUB_GX_VALUE_CALL_COUNT
 } PorpoiseStubGXValueCall;
 
@@ -38,6 +59,11 @@ size_t PorpoiseStubGXValueLastByteCount(void);
 uint8_t PorpoiseStubGXValueLastByte(unsigned int index);
 void PorpoiseStubGXValueSetProjectionOutput(const float values[7]);
 void PorpoiseStubGXValueSetViewportOutput(const float values[6]);
+void PorpoiseStubGXValueSetYScaleFactorOutput(float value);
+void PorpoiseStubGXValueSetDispCopyYScaleOutput(uint32_t value);
+void PorpoiseStubGXValueSetBeginPreamble(
+    uint32_t dirty_state,
+    int flush_ready);
 
 #ifdef __cplusplus
 }

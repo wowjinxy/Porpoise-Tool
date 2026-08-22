@@ -3,6 +3,10 @@
 
 #include "porpoise_libporpoise_gx_headers.h"
 
+#include <dolphin/gx/GXData.h>
+#include <dolphin/gx/GXGeometry.h>
+#include <simulator/sim_gx_CommandProcessor.h>
+
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -134,6 +138,341 @@ static int porpoise_gx_read_color(
     color->b = raw[2];
     color->a = raw[3];
     return 1;
+}
+
+static int porpoise_gx_scalar_call_begin(PorpoisePpcState *state)
+{
+    return state != NULL && !porpoise_state_should_stop(state) &&
+           porpoise_libporpoise_gx_require_active(state) &&
+           porpoise_libporpoise_gx_flush_pending(state);
+}
+
+static int porpoise_gx_scalar_read_bool(
+    PorpoisePpcState *state,
+    unsigned int register_index,
+    const char *description,
+    GXBool *value_out)
+{
+    uint8_t value;
+
+    if (state == NULL || value_out == NULL) {
+        return 0;
+    }
+    value = (uint8_t)state->gpr[register_index];
+    if (value > 1U) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_ARGUMENT,
+            state->gpr[register_index],
+            description);
+        return 0;
+    }
+    *value_out = value != 0U ? GX_TRUE : GX_FALSE;
+    return 1;
+}
+
+void porpoise_libporpoise_gx_begin_adapter(PorpoisePpcState *state)
+{
+    uint32_t primitive;
+    uint32_t format;
+    uint32_t vertex_count;
+    uint8_t command[3];
+
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+
+    primitive = state->gpr[3];
+    format = state->gpr[4];
+    vertex_count = state->gpr[5];
+    if (primitive < UINT32_C(0x80) ||
+        primitive > UINT32_C(0xB8) ||
+        (primitive & UINT32_C(0x07)) != 0U) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_ARGUMENT,
+            primitive,
+            "GXBegin primitive is not a supported GX primitive opcode");
+        return;
+    }
+    if (format > UINT32_C(7)) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_ARGUMENT,
+            format,
+            "GXBegin vertex format index is out of range");
+        return;
+    }
+    if (vertex_count > UINT32_C(0xFFFF)) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_ARGUMENT,
+            vertex_count,
+            "GXBegin vertex count exceeds 16 bits");
+        return;
+    }
+
+#if defined(SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION) && \
+    SIM_GX_COMMAND_PROCESSOR_CANONICAL_BYTES_API_VERSION >= 1
+    if (gx == NULL) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_INVALID_STATE,
+            state->pc,
+            "GXBegin requires initialized native GX state");
+        return;
+    }
+
+    /* Mirror only GXBegin's native state preamble. Calling native GXBegin
+     * would emit a host-endian partial primitive before the lifted guest
+     * writes its canonical vertex payload. */
+    if (gx->dirtyState != 0U) {
+        __GXSetDirtyState();
+    }
+    if (!GX_CHECK_FLUSH(gx)) {
+        __GXSendFlushPrim();
+    }
+
+    command[0] = (uint8_t)(primitive | format);
+    command[1] = (uint8_t)(vertex_count >> 8);
+    command[2] = (uint8_t)vertex_count;
+    if (!porpoise_libporpoise_gx_queue_canonical_bytes(
+            command, sizeof(command))) {
+        porpoise_state_set_fault(
+            state,
+            PORPOISE_FAULT_HOST_IO,
+            state->pc,
+            "libPorpoise rejected the canonical GXBegin command");
+    }
+#else
+    (void)command;
+    porpoise_state_set_fault(
+        state,
+        PORPOISE_FAULT_UNSUPPORTED_OPERATION,
+        state->pc,
+        "GXBegin requires libPorpoise canonical FIFO bytes API v1");
+#endif
+}
+
+void porpoise_libporpoise_gx_clear_vtx_desc_adapter(
+    PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXClearVtxDesc();
+}
+
+void porpoise_libporpoise_gx_set_vtx_desc_adapter(PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXSetVtxDesc(
+        (GXAttr)state->gpr[3],
+        (GXAttrType)state->gpr[4]);
+}
+
+void porpoise_libporpoise_gx_set_vtx_attr_fmt_adapter(
+    PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXSetVtxAttrFmt(
+        (GXVtxFmt)state->gpr[3],
+        (GXAttr)state->gpr[4],
+        (GXCompCnt)state->gpr[5],
+        (GXCompType)state->gpr[6],
+        (u8)state->gpr[7]);
+}
+
+void porpoise_libporpoise_gx_invalidate_vtx_cache_adapter(
+    PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXInvalidateVtxCache();
+}
+
+void porpoise_libporpoise_gx_set_num_tex_gens_adapter(
+    PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXSetNumTexGens((u8)state->gpr[3]);
+}
+
+void porpoise_libporpoise_gx_set_num_chans_adapter(PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXSetNumChans((u8)state->gpr[3]);
+}
+
+void porpoise_libporpoise_gx_invalidate_tex_all_adapter(
+    PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXInvalidateTexAll();
+}
+
+void porpoise_libporpoise_gx_set_tev_op_adapter(PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXSetTevOp(
+        (GXTevStageID)state->gpr[3],
+        (GXTevMode)state->gpr[4]);
+}
+
+void porpoise_libporpoise_gx_set_tev_order_adapter(PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXSetTevOrder(
+        (GXTevStageID)state->gpr[3],
+        (GXTexCoordID)state->gpr[4],
+        (GXTexMapID)state->gpr[5],
+        (GXChannelID)state->gpr[6]);
+}
+
+void porpoise_libporpoise_gx_set_num_tev_stages_adapter(
+    PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXSetNumTevStages((u8)state->gpr[3]);
+}
+
+void porpoise_libporpoise_gx_set_color_update_adapter(
+    PorpoisePpcState *state)
+{
+    GXBool enable;
+
+    if (!porpoise_gx_scalar_call_begin(state) ||
+        !porpoise_gx_scalar_read_bool(
+            state,
+            3U,
+            "GXSetColorUpdate has an invalid enable flag",
+            &enable)) {
+        return;
+    }
+    GXSetColorUpdate(enable);
+}
+
+void porpoise_libporpoise_gx_set_z_mode_adapter(PorpoisePpcState *state)
+{
+    GXBool compare_enable;
+    GXBool update_enable;
+
+    if (!porpoise_gx_scalar_call_begin(state) ||
+        !porpoise_gx_scalar_read_bool(
+            state,
+            3U,
+            "GXSetZMode has an invalid compare-enable flag",
+            &compare_enable) ||
+        !porpoise_gx_scalar_read_bool(
+            state,
+            5U,
+            "GXSetZMode has an invalid update-enable flag",
+            &update_enable)) {
+        return;
+    }
+    GXSetZMode(
+        compare_enable,
+        (GXCompare)state->gpr[4],
+        update_enable);
+}
+
+void porpoise_libporpoise_gx_set_pixel_fmt_adapter(PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXSetPixelFmt(
+        (GXPixelFmt)state->gpr[3],
+        (GXZFmt16)state->gpr[4]);
+}
+
+void porpoise_libporpoise_gx_set_viewport_adapter(PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXSetViewport(
+        (f32)porpoise_fpr_get_f64(state, 1U, 0U),
+        (f32)porpoise_fpr_get_f64(state, 2U, 0U),
+        (f32)porpoise_fpr_get_f64(state, 3U, 0U),
+        (f32)porpoise_fpr_get_f64(state, 4U, 0U),
+        (f32)porpoise_fpr_get_f64(state, 5U, 0U),
+        (f32)porpoise_fpr_get_f64(state, 6U, 0U));
+}
+
+void porpoise_libporpoise_gx_set_scissor_adapter(PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXSetScissor(
+        (u32)state->gpr[3],
+        (u32)state->gpr[4],
+        (u32)state->gpr[5],
+        (u32)state->gpr[6]);
+}
+
+void porpoise_libporpoise_gx_set_disp_copy_src_adapter(
+    PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXSetDispCopySrc(
+        (u16)state->gpr[3],
+        (u16)state->gpr[4],
+        (u16)state->gpr[5],
+        (u16)state->gpr[6]);
+}
+
+void porpoise_libporpoise_gx_get_y_scale_factor_adapter(
+    PorpoisePpcState *state)
+{
+    f32 result;
+
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    result = GXGetYScaleFactor(
+        (u16)state->gpr[3],
+        (u16)state->gpr[4]);
+    porpoise_fpr_set_f64(state, 1U, 0U, (double)result);
+}
+
+void porpoise_libporpoise_gx_set_disp_copy_y_scale_adapter(
+    PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    state->gpr[3] = (uint32_t)GXSetDispCopyYScale(
+        (f32)porpoise_fpr_get_f64(state, 1U, 0U));
+}
+
+void porpoise_libporpoise_gx_set_disp_copy_gamma_adapter(
+    PorpoisePpcState *state)
+{
+    if (!porpoise_gx_scalar_call_begin(state)) {
+        return;
+    }
+    GXSetDispCopyGamma((GXGamma)state->gpr[3]);
 }
 
 void porpoise_libporpoise_gx_call_display_list_adapter(

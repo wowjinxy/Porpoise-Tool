@@ -160,6 +160,7 @@ static void free_function(PorpoiseFunction *function) {
         free(function->aliases[index].section);
     }
     free(function->aliases);
+    free(function->address_taken_entries);
 }
 
 static void free_file(PorpoiseSourceFile *file) {

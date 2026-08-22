@@ -51,6 +51,8 @@ const PorpoiseSdkContract *porpoise_sdk_contract_find_by_canonical_name(
     const char *canonical_name);
 const PorpoiseSdkContract *porpoise_sdk_contract_find_by_host_callable(
     const char *host_callable);
+const PorpoiseSdkContract *porpoise_sdk_contract_find_by_canonical_identity(
+    const char *canonical_identity);
 const char *porpoise_sdk_contract_canonical_name(
     const PorpoiseSdkContract *contract);
 PorpoiseSdkContractCategory porpoise_sdk_contract_category(
@@ -70,6 +72,17 @@ const PorpoiseSdkAbiValue *porpoise_sdk_contract_argument_at(
     size_t index);
 bool porpoise_sdk_contract_allows_automatic_import(
     const PorpoiseSdkContract *contract);
+
+/*
+ * Return whether an exact catalog identity is permitted to select this
+ * built-in contract automatically. Most established contracts accept any
+ * exact catalog owner with the audited canonical symbol. Stateful startup
+ * contracts instead carry one exact archive/object/symbol identity and fail
+ * closed for every other catalog entry.
+ */
+bool porpoise_sdk_contract_accepts_canonical_identity(
+    const PorpoiseSdkContract *contract,
+    const char *canonical_identity);
 
 /*
  * This compatibility predicate checks the host binding, header, and register

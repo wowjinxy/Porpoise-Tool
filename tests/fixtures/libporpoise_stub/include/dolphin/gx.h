@@ -35,21 +35,42 @@ typedef u32 GXIndTexMtxID;
 typedef u32 GXIndTexStageID;
 typedef u32 GXIndTexWrap;
 typedef u32 GXProjectionType;
+typedef s32 GXPrimitive;
+typedef s32 GXAttrType;
+typedef s32 GXCompCnt;
+typedef s32 GXCompType;
+typedef s32 GXVtxFmt;
+typedef s32 GXCompare;
+typedef s32 GXGamma;
+typedef s32 GXPixelFmt;
+typedef s32 GXZFmt16;
+typedef s32 GXTevMode;
+typedef s32 GXTexCoordID;
 typedef s32 GXBlendMode;
 typedef s32 GXBlendFactor;
 typedef s32 GXLogicOp;
 typedef u32 GXTevKColorID;
 typedef u32 GXTevRegID;
-typedef u32 GXTevStageID;
+typedef s32 GXTevStageID;
 typedef u32 GXLightID;
-typedef u32 GXAttr;
-typedef u32 GXChannelID;
+typedef s32 GXAttr;
+typedef s32 GXChannelID;
 typedef u32 GXTexWrapMode;
 typedef u32 GXTexFilter;
 typedef u32 GXAnisotropy;
-typedef u32 GXTexMapID;
+typedef s32 GXTexMapID;
 typedef u32 GXTlutFmt;
 typedef u32 GXTlut;
+
+struct __GXData_struct {
+    uint32_t dirtyState;
+    GXBool flushReady;
+};
+
+extern struct __GXData_struct *gx;
+#define GX_CHECK_FLUSH(gx_value) ((gx_value)->flushReady)
+void __GXSetDirtyState(void);
+void __GXSendFlushPrim(void);
 
 typedef enum GXTexFmt {
     GX_TF_I4 = 0x0,
@@ -207,6 +228,7 @@ typedef struct GXTlutObj {
 GXFifoObj *GXInit(void *base, u32 size);
 #ifndef PORPOISE_STUB_SPLIT_GX_HEADER_VIEW
 GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback callback);
+void GXDrawDone(void);
 #endif
 void GXSetCopyFilter(
     GXBool use_aa,
@@ -314,6 +336,40 @@ void GXSetTevIndirect(
     GXBool add_previous,
     GXBool indirect_lod,
     GXIndTexAlphaSel alpha);
+void GXClearVtxDesc(void);
+void GXSetVtxDesc(GXAttr attr, GXAttrType type);
+void GXSetVtxAttrFmt(
+    GXVtxFmt format,
+    GXAttr attr,
+    GXCompCnt count,
+    GXCompType type,
+    u8 fraction);
+void GXInvalidateVtxCache(void);
+void GXSetNumTexGens(u8 count);
+void GXSetNumChans(u8 count);
+void GXInvalidateTexAll(void);
+void GXSetTevOp(GXTevStageID stage, GXTevMode mode);
+void GXSetTevOrder(
+    GXTevStageID stage,
+    GXTexCoordID coordinate,
+    GXTexMapID map,
+    GXChannelID color);
+void GXSetNumTevStages(u8 count);
+void GXSetColorUpdate(u8 enable);
+void GXSetZMode(u8 compare, GXCompare function, u8 update);
+void GXSetPixelFmt(GXPixelFmt pixel_format, GXZFmt16 depth_format);
+void GXSetViewport(
+    f32 left,
+    f32 top,
+    f32 width,
+    f32 height,
+    f32 near_z,
+    f32 far_z);
+void GXSetScissor(u32 left, u32 top, u32 width, u32 height);
+void GXSetDispCopySrc(u16 left, u16 top, u16 width, u16 height);
+f32 GXGetYScaleFactor(u16 efb_height, u16 xfb_height);
+u32 GXSetDispCopyYScale(f32 scale);
+void GXSetDispCopyGamma(GXGamma gamma);
 
 #ifdef __cplusplus
 }

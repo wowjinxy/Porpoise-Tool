@@ -96,14 +96,22 @@ _BUILTIN_SDK_CONTRACTS = frozenset(
         "DVDConvertPathToEntrynum",
         "DVDFastOpen",
         "DVDGetCommandBlockStatus",
+        "DVDInit",
         "DVDOpen",
         "DVDReadPrio",
+        "DEMOPadInit",
+        "GXBegin",
         "GXCallDisplayList",
+        "GXClearVtxDesc",
         "GXCopyDisp",
         "GXCopyTex",
+        "GXDrawDone",
+        "GXGetYScaleFactor",
         "GXGetProjectionv",
         "GXGetViewportv",
         "GXInit",
+        "GXInvalidateTexAll",
+        "GXInvalidateVtxCache",
         "GXLoadLightObjImm",
         "GXLoadNrmMtxImm",
         "GXLoadPosMtxImm",
@@ -113,25 +121,41 @@ _BUILTIN_SDK_CONTRACTS = frozenset(
         "GXSetArray",
         "GXSetChanAmbColor",
         "GXSetChanMatColor",
+        "GXSetColorUpdate",
         "GXSetCopyClear",
         "GXSetCopyFilter",
+        "GXSetDispCopyGamma",
         "GXSetDispCopyDst",
+        "GXSetDispCopySrc",
+        "GXSetDispCopyYScale",
         "GXSetDrawDoneCallback",
         "GXSetFog",
         "GXSetFogRangeAdj",
         "GXSetIndTexMtx",
+        "GXSetNumChans",
+        "GXSetNumTevStages",
+        "GXSetNumTexGens",
+        "GXSetPixelFmt",
         "GXSetProjection",
+        "GXSetScissor",
         "GXSetTevColor",
         "GXSetTevColorS10",
         "GXSetTevIndirect",
         "GXSetTevKColor",
+        "GXSetTevOp",
+        "GXSetTevOrder",
         "GXSetTexCopyDst",
+        "GXSetViewport",
+        "GXSetVtxAttrFmt",
+        "GXSetVtxDesc",
+        "GXSetZMode",
         "OSAllocFromArenaHi",
         "OSAllocFromArenaLo",
         "OSExitThread",
         "OSGetArenaHi",
         "OSGetArenaLo",
         "OSGetCurrentThread",
+        "OSInit",
         "OSInitMessageQueue",
         "OSReceiveMessage",
         "OSReport",
@@ -142,10 +166,51 @@ _BUILTIN_SDK_CONTRACTS = frozenset(
         "OSSleepThread",
         "OSSuspendThread",
         "OSWakeupThread",
+        "PADRead",
         "VIConfigure",
+        "VIFlush",
+        "VIInit",
+        "VISetBlack",
         "VISetNextFrameBuffer",
+        "VIWaitForRetrace",
     }
 )
+
+# Specialized adapters that depend on audited guest/native state ownership
+# accept only the exact archive/object/symbol owners below. In particular,
+# these names must never acquire a contract through the ordinary SDK-leaf
+# fallback below.
+_BUILTIN_EXACT_SDK_CONTRACTS = {
+    "demo.a/DEMOPad.c/DEMOPadInit": "DEMOPadInit",
+    "dvd.a/dvd.c/DVDInit": "DVDInit",
+    "gx.a/GXAttr.c/GXClearVtxDesc": "GXClearVtxDesc",
+    "gx.a/GXAttr.c/GXInvalidateVtxCache": "GXInvalidateVtxCache",
+    "gx.a/GXAttr.c/GXSetNumTexGens": "GXSetNumTexGens",
+    "gx.a/GXAttr.c/GXSetVtxAttrFmt": "GXSetVtxAttrFmt",
+    "gx.a/GXAttr.c/GXSetVtxDesc": "GXSetVtxDesc",
+    "gx.a/GXFrameBuf.c/GXGetYScaleFactor": "GXGetYScaleFactor",
+    "gx.a/GXFrameBuf.c/GXSetDispCopyGamma": "GXSetDispCopyGamma",
+    "gx.a/GXFrameBuf.c/GXSetDispCopySrc": "GXSetDispCopySrc",
+    "gx.a/GXFrameBuf.c/GXSetDispCopyYScale": "GXSetDispCopyYScale",
+    "gx.a/GXGeometry.c/GXBegin": "GXBegin",
+    "gx.a/GXLight.c/GXSetNumChans": "GXSetNumChans",
+    "gx.a/GXMisc.c/GXDrawDone": "GXDrawDone",
+    "gx.a/GXPixel.c/GXSetColorUpdate": "GXSetColorUpdate",
+    "gx.a/GXPixel.c/GXSetPixelFmt": "GXSetPixelFmt",
+    "gx.a/GXPixel.c/GXSetZMode": "GXSetZMode",
+    "gx.a/GXTev.c/GXSetNumTevStages": "GXSetNumTevStages",
+    "gx.a/GXTev.c/GXSetTevOp": "GXSetTevOp",
+    "gx.a/GXTev.c/GXSetTevOrder": "GXSetTevOrder",
+    "gx.a/GXTexture.c/GXInvalidateTexAll": "GXInvalidateTexAll",
+    "gx.a/GXTransform.c/GXSetScissor": "GXSetScissor",
+    "gx.a/GXTransform.c/GXSetViewport": "GXSetViewport",
+    "os.a/OS.c/OSInit": "OSInit",
+    "pad.a/Pad.c/PADRead": "PADRead",
+    "vi.a/vi.c/VIFlush": "VIFlush",
+    "vi.a/vi.c/VIInit": "VIInit",
+    "vi.a/vi.c/VISetBlack": "VISetBlack",
+    "vi.a/vi.c/VIWaitForRetrace": "VIWaitForRetrace",
+}
 
 _DTK_VERSION_PATTERN = re.compile(
     r"\bdtk(?:\.exe)?\s+(\d+)\.(\d+)\.(\d+)(?:\s+[0-9a-fA-F]+)?\b",
@@ -445,9 +510,14 @@ def _builtin_contract_for_identity(
     canonical_identity: str,
     category: str,
 ) -> str | None:
+    exact_contract = _BUILTIN_EXACT_SDK_CONTRACTS.get(canonical_identity)
+    if exact_contract is not None:
+        return exact_contract
+    leaf = canonical_identity.rsplit("/", 1)[-1]
+    if leaf in _BUILTIN_EXACT_SDK_CONTRACTS.values():
+        return None
     if category != "nintendo_dolphin":
         return None
-    leaf = canonical_identity.rsplit("/", 1)[-1]
     return leaf if leaf in _BUILTIN_SDK_CONTRACTS else None
 
 

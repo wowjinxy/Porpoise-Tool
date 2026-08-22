@@ -198,6 +198,60 @@ static void test_raw_float_transfers(void)
     CHECK(memory.bytes[45] == 0xA5U);
 }
 
+static void test_exact_transfer_classification(void)
+{
+    static const uint32_t reference_binary32[] = {
+        UINT32_C(0x00000000),
+        UINT32_C(0x80000000),
+        UINT32_C(0x00000001),
+        UINT32_C(0x007FFFFF),
+        UINT32_C(0x3F800000),
+        UINT32_C(0x7F7FFFFF),
+        UINT32_C(0x7F800000),
+        UINT32_C(0xFF800000),
+        UINT32_C(0x7FC12345),
+        UINT32_C(0x7F812345),
+    };
+    PorpoisePpcState state;
+    size_t index;
+
+    porpoise_state_init(&state, NULL);
+    state.gqr[0] = 0U;
+    CHECK(porpoise_psq_transfer_is_exact(&state, 1U, 0U, 0U, 0));
+    CHECK(porpoise_psq_transfer_is_exact(&state, 1U, 1U, 0U, 0));
+
+    for (index = 0U;
+         index < sizeof(reference_binary32) / sizeof(reference_binary32[0]);
+         index++) {
+        size_t next = (index + 1U) %
+                      (sizeof(reference_binary32) /
+                       sizeof(reference_binary32[0]));
+        state.fpr[1].lane_bits[0] =
+            porpoise_binary32_to_binary64_bits(reference_binary32[index]);
+        state.fpr[1].lane_bits[1] =
+            porpoise_binary32_to_binary64_bits(reference_binary32[next]);
+        CHECK(porpoise_psq_transfer_is_exact(&state, 1U, 0U, 0U, 1));
+        CHECK(porpoise_psq_transfer_is_exact(&state, 1U, 1U, 0U, 1));
+    }
+
+    state.fpr[1].lane_bits[0] = UINT64_C(0x3FF0000000000001);
+    state.fpr[1].lane_bits[1] = UINT64_C(0x3FF0000000000000);
+    CHECK(!porpoise_psq_transfer_is_exact(&state, 1U, 0U, 0U, 1));
+    state.fpr[1].lane_bits[0] = UINT64_C(0x3FF0000000000000);
+    state.fpr[1].lane_bits[1] = UINT64_C(0x3FF0000000000001);
+    CHECK(!porpoise_psq_transfer_is_exact(&state, 1U, 0U, 0U, 1));
+    CHECK(porpoise_psq_transfer_is_exact(&state, 1U, 1U, 0U, 1));
+
+    state.gqr[1] = load_gqr(4U, 0U) | store_gqr(5U, 0U);
+    CHECK(!porpoise_psq_transfer_is_exact(&state, 1U, 0U, 1U, 0));
+    CHECK(!porpoise_psq_transfer_is_exact(&state, 1U, 0U, 1U, 1));
+    CHECK(!porpoise_psq_transfer_is_exact(NULL, 1U, 0U, 0U, 0));
+    CHECK(!porpoise_psq_transfer_is_exact(&state, 32U, 0U, 0U, 0));
+    CHECK(!porpoise_psq_transfer_is_exact(&state, 1U, 2U, 0U, 0));
+    CHECK(!porpoise_psq_transfer_is_exact(&state, 1U, 0U, 8U, 0));
+    CHECK(!porpoise_psq_transfer_is_exact(&state, 1U, 0U, 0U, 2));
+}
+
 static void test_integer_loads(void)
 {
     TestMemory memory;
@@ -580,6 +634,7 @@ static void test_validation_and_atomic_faults(void)
 int main(void)
 {
     test_raw_float_transfers();
+    test_exact_transfer_classification();
     test_integer_loads();
     test_integer_stores();
     test_nonfinite_store_policy();
