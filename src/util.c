@@ -23,6 +23,7 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#include <wchar.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #define PORPOISE_MKDIR(path) _mkdir(path)
@@ -613,28 +614,261 @@ bool porpoise_copy_file(const char *source, const char *destination, PorpoiseDia
     }
 }
 
-bool porpoise_remove_tree(const char *path, PorpoiseDiagnostics *diagnostics) {
-    DIR *directory;
-    const struct dirent *entry;
 #ifdef _WIN32
-    DWORD attributes = GetFileAttributesA(path);
-    if (attributes == INVALID_FILE_ATTRIBUTES) {
-        if (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND) return true;
-        porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, path, 0U, 0U,
-                                 "cannot inspect path before removal");
-        return false;
+static WCHAR *porpoise_windows_extended_path(const char *path) {
+    WCHAR *converted = NULL;
+    WCHAR *absolute = NULL;
+    WCHAR *extended = NULL;
+    DWORD absolute_length;
+    size_t absolute_capacity;
+    size_t absolute_size;
+    size_t prefix_size;
+    size_t skip = 0U;
+    int converted_size;
+    UINT code_page = CP_UTF8;
+    DWORD conversion_flags = MB_ERR_INVALID_CHARS;
+    size_t index;
+
+    if (path == NULL || path[0] == '\0') return NULL;
+    converted_size = MultiByteToWideChar(
+        code_page, conversion_flags, path, -1, NULL, 0);
+    if (converted_size <= 0) {
+        code_page = CP_ACP;
+        conversion_flags = 0U;
+        converted_size = MultiByteToWideChar(
+            code_page, conversion_flags, path, -1, NULL, 0);
     }
-    if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
-        int result = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0U ? PORPOISE_RMDIR(path) : remove(path);
-        if (result != 0) {
-            porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, path, 0U, 0U,
-                                     "cannot remove filesystem link: %s", strerror(errno));
-            return false;
+    if (converted_size <= 0) return NULL;
+    converted = (WCHAR *)malloc((size_t)converted_size * sizeof(*converted));
+    if (converted == NULL || MultiByteToWideChar(
+            code_page, conversion_flags, path, -1, converted,
+            converted_size) != converted_size) {
+        free(converted);
+        return NULL;
+    }
+
+    absolute_capacity = PORPOISE_PATH_CAPACITY + 1U;
+    absolute = (WCHAR *)malloc(absolute_capacity * sizeof(*absolute));
+    if (absolute == NULL) {
+        free(converted);
+        return NULL;
+    }
+    absolute_length = GetFullPathNameW(
+        converted, (DWORD)absolute_capacity, absolute, NULL);
+    free(converted);
+    if (absolute_length == 0U || absolute_length >= absolute_capacity) {
+        free(absolute);
+        return NULL;
+    }
+    for (index = 0U; index < (size_t)absolute_length; index++) {
+        if (absolute[index] == L'/') absolute[index] = L'\\';
+    }
+
+    if ((size_t)absolute_length >= 4U &&
+        (wcsncmp(absolute, L"\\\\?\\", 4U) == 0 ||
+         wcsncmp(absolute, L"\\\\.\\", 4U) == 0)) {
+        prefix_size = 0U;
+    } else if ((size_t)absolute_length >= 2U &&
+               absolute[0] == L'\\' && absolute[1] == L'\\') {
+        prefix_size = 8U;
+        skip = 2U;
+    } else {
+        prefix_size = 4U;
+    }
+    absolute_size = (size_t)absolute_length - skip;
+    if (absolute_size > SIZE_MAX - prefix_size - 1U) {
+        free(absolute);
+        return NULL;
+    }
+    extended = (WCHAR *)malloc(
+        (prefix_size + absolute_size + 1U) * sizeof(*extended));
+    if (extended == NULL) {
+        free(absolute);
+        return NULL;
+    }
+    if (prefix_size == 8U) {
+        memcpy(extended, L"\\\\?\\UNC\\", prefix_size * sizeof(*extended));
+    } else if (prefix_size == 4U) {
+        memcpy(extended, L"\\\\?\\", prefix_size * sizeof(*extended));
+    }
+    memcpy(
+        extended + prefix_size, absolute + skip,
+        (absolute_size + 1U) * sizeof(*extended));
+    free(absolute);
+    return extended;
+}
+
+static char *porpoise_windows_diagnostic_path(const WCHAR *path) {
+    char *converted;
+    int converted_size = WideCharToMultiByte(
+        CP_UTF8, 0U, path, -1, NULL, 0, NULL, NULL);
+    if (converted_size <= 0) return NULL;
+    converted = (char *)malloc((size_t)converted_size);
+    if (converted == NULL || WideCharToMultiByte(
+            CP_UTF8, 0U, path, -1, converted, converted_size,
+            NULL, NULL) != converted_size) {
+        free(converted);
+        return NULL;
+    }
+    return converted;
+}
+
+static bool porpoise_windows_remove_error(
+    PorpoiseDiagnostics *diagnostics,
+    const WCHAR *path,
+    const char *fallback_path,
+    const char *operation,
+    DWORD error) {
+    char *display_path = porpoise_windows_diagnostic_path(path);
+    porpoise_diagnostics_add(
+        diagnostics, PORPOISE_SEVERITY_ERROR,
+        display_path != NULL ? display_path : fallback_path, 0U, 0U,
+        "%s: Windows error %lu", operation, (unsigned long)error);
+    free(display_path);
+    return false;
+}
+
+static bool porpoise_windows_remove_tree_wide(
+    const WCHAR *path,
+    const char *fallback_path,
+    PorpoiseDiagnostics *diagnostics) {
+    DWORD attributes = GetFileAttributesW(path);
+    DWORD error;
+    bool is_directory;
+    bool is_link;
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
+            return true;
+        return porpoise_windows_remove_error(
+            diagnostics, path, fallback_path,
+            "cannot inspect path before removal", error);
+    }
+    is_directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0U;
+    is_link = (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U;
+    if (is_link) {
+        BOOL removed = is_directory
+            ? RemoveDirectoryW(path) : DeleteFileW(path);
+        if (!removed) {
+            return porpoise_windows_remove_error(
+                diagnostics, path, fallback_path,
+                "cannot remove filesystem link", GetLastError());
         }
         return true;
     }
-    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0U) {
+    if (!is_directory) {
+        if (!DeleteFileW(path)) {
+            return porpoise_windows_remove_error(
+                diagnostics, path, fallback_path,
+                "cannot remove file", GetLastError());
+        }
+        return true;
+    }
+    {
+        WIN32_FIND_DATAW entry;
+        HANDLE search;
+        WCHAR *pattern;
+        size_t path_size = wcslen(path);
+        bool separator =
+            path_size != 0U && path[path_size - 1U] != L'\\';
+        size_t child_prefix_size = path_size + (separator ? 1U : 0U);
+        size_t pattern_size = child_prefix_size + 2U;
+        if (pattern_size < path_size) {
+            return porpoise_windows_remove_error(
+                diagnostics, path, fallback_path,
+                "directory path is too long to remove", ERROR_BUFFER_OVERFLOW);
+        }
+        pattern = (WCHAR *)malloc(pattern_size * sizeof(*pattern));
+        if (pattern == NULL) {
+            return porpoise_windows_remove_error(
+                diagnostics, path, fallback_path,
+                "cannot allocate directory removal path",
+                ERROR_NOT_ENOUGH_MEMORY);
+        }
+        memcpy(pattern, path, path_size * sizeof(*pattern));
+        if (separator) pattern[path_size] = L'\\';
+        pattern[child_prefix_size] = L'*';
+        pattern[child_prefix_size + 1U] = L'\0';
+        search = FindFirstFileW(pattern, &entry);
+        free(pattern);
+        if (search == INVALID_HANDLE_VALUE) {
+            error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND) {
+                return porpoise_windows_remove_error(
+                    diagnostics, path, fallback_path,
+                    "cannot open directory for removal", error);
+            }
+        } else {
+            bool ok = true;
+            do {
+                WCHAR *child;
+                size_t name_size;
+                size_t child_size;
+                if (wcscmp(entry.cFileName, L".") == 0 ||
+                    wcscmp(entry.cFileName, L"..") == 0) continue;
+                name_size = wcslen(entry.cFileName);
+                child_size = child_prefix_size + name_size + 1U;
+                if (child_size < child_prefix_size) {
+                    ok = porpoise_windows_remove_error(
+                        diagnostics, path, fallback_path,
+                        "directory child path is too long to remove",
+                        ERROR_BUFFER_OVERFLOW);
+                    break;
+                }
+                child = (WCHAR *)malloc(child_size * sizeof(*child));
+                if (child == NULL) {
+                    ok = porpoise_windows_remove_error(
+                        diagnostics, path, fallback_path,
+                        "cannot allocate directory child removal path",
+                        ERROR_NOT_ENOUGH_MEMORY);
+                    break;
+                }
+                memcpy(child, path, path_size * sizeof(*child));
+                if (separator) child[path_size] = L'\\';
+                memcpy(
+                    child + child_prefix_size, entry.cFileName,
+                    (name_size + 1U) * sizeof(*child));
+                ok = porpoise_windows_remove_tree_wide(
+                    child, fallback_path, diagnostics);
+                free(child);
+                if (!ok) break;
+            } while (FindNextFileW(search, &entry));
+            error = GetLastError();
+            FindClose(search);
+            if (!ok) return false;
+            if (error != ERROR_NO_MORE_FILES) {
+                return porpoise_windows_remove_error(
+                    diagnostics, path, fallback_path,
+                    "cannot enumerate directory for removal", error);
+            }
+        }
+    }
+    if (!RemoveDirectoryW(path)) {
+        return porpoise_windows_remove_error(
+            diagnostics, path, fallback_path,
+            "cannot remove directory", GetLastError());
+    }
+    return true;
+}
+
+bool porpoise_remove_tree(const char *path, PorpoiseDiagnostics *diagnostics) {
+    WCHAR *extended = porpoise_windows_extended_path(path);
+    bool removed;
+    if (extended == NULL) {
+        porpoise_diagnostics_add(
+            diagnostics, PORPOISE_SEVERITY_ERROR, path, 0U, 0U,
+            "cannot convert path for Windows removal");
+        return false;
+    }
+    removed = porpoise_windows_remove_tree_wide(
+        extended, path, diagnostics);
+    free(extended);
+    return removed;
+}
 #else
+bool porpoise_remove_tree(const char *path, PorpoiseDiagnostics *diagnostics) {
+    DIR *directory;
+    const struct dirent *entry;
     struct stat status;
     if (lstat(path, &status) != 0) {
         if (errno == ENOENT) return true;
@@ -643,7 +877,6 @@ bool porpoise_remove_tree(const char *path, PorpoiseDiagnostics *diagnostics) {
         return false;
     }
     if (!S_ISDIR(status.st_mode)) {
-#endif
         if (remove(path) != 0) {
             porpoise_diagnostics_add(diagnostics, PORPOISE_SEVERITY_ERROR, path, 0U, 0U,
                                      "cannot remove file: %s", strerror(errno));
@@ -676,6 +909,7 @@ bool porpoise_remove_tree(const char *path, PorpoiseDiagnostics *diagnostics) {
     }
     return true;
 }
+#endif
 
 bool porpoise_move_path(const char *source, const char *destination, PorpoiseDiagnostics *diagnostics) {
     unsigned int attempt;
